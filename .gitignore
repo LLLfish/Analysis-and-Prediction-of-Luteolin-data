@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data
+*.csv
+*.json
+*.npz
+*.sdf
+*.pdb
+*.graphml
+
+# Output directories
+framework_output/
+features/
+
+# IDE
+.vscode/
+.idea/
+
+# Wheel files
+*.whl
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# Environment
+.env
+venv/
+env/

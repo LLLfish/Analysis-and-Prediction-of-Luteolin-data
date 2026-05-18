@@ -10,6 +10,7 @@ __pycache__/
 *.sdf
 *.pdb
 *.graphml
+*.md
 
 # Output directories
 framework_output/

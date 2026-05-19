@@ -367,9 +367,12 @@ class LuteolinDataCollector:
                 'chembl_id': self.raw_data.get('chembl', {}).get('chembl_id', 'CHEMBL151'),
                 'molecular_formula': props.get('Molecular_Formula', 'C15H10O6'),
                 'molecular_weight': float(props.get('Molecular_Weight', 286.24)),
-                'smiles': props.get('Canonical_SMILES', ''),
-                'inchi': props.get('InChI', ''),
-                'inchikey': props.get('InChIKey', ''),
+                'smiles': (props.get('Canonical_SMILES', '')
+                           or props.get('SMILES_Absolute', '')
+                           or props.get('SMILES_Connectivity', '')
+                           or 'C1=CC(=C(C=C1C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O)O'),
+                'inchi': props.get('InChI', '') or props.get('InChI_Standard', ''),
+                'inchikey': props.get('InChIKey', '') or props.get('InChIKey_Standard', ''),
             }
             logger.info("Compound data cleaned")
 

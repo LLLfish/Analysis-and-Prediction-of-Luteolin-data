@@ -15,6 +15,7 @@ __pycache__/
 # Output directories
 framework_output/
 features/
+.model_cache/
 
 # IDE
 .vscode/

@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Any
 import warnings
 warnings.filterwarnings('ignore')
 
+os.environ.setdefault('PYG_LIB_DISABLED', '1')
+
 from logging_config import setup_logger
 logger =setup_logger(__name__)
 
@@ -29,11 +31,12 @@ except ImportError:
 
 TORCH_GEOMETRIC_AVAILABLE = False
 try:
+    import torch_geometric.typing
     from torch_geometric.nn import GCNConv, GATConv, SAGEConv
     from torch_geometric.data import Data
     TORCH_GEOMETRIC_AVAILABLE = True
-except ImportError:
-    logger.warning("PyTorch Geometric not installed. GNN operations will be limited.")
+except (ImportError, Exception) as e:
+    logger.warning("PyTorch Geometric not available (%s). GNN operations will be limited.", type(e).__name__)
 
 GENSIM_AVAILABLE = False
 try:

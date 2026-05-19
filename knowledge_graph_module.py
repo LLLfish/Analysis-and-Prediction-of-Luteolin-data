@@ -64,14 +64,21 @@ class KnowledgeGraph:
             self.triples.append((compound, relation, target))
             logger.debug("Added triple: (%s, %s, %s)", compound, relation, target)
         except Exception as e:
-            logger.error("Failed to add triple: %", e)
+            logger.error("Failed to add triple: %s", e)
 
-    def build_from_data(self, compound_data: Dict, target_data: Dict, ppi_data: Dict = None):
+    def build_from_data(self, compound_data: Dict, target_data, ppi_data=None):
         logger.info("Building knowledge graph from data...")
         try:
-            compound_name = compound_data.get('name', 'Luteolin')
-            targets = target_data.get('targets', [])
+            compound_name = compound_data.get('name', 'Luteolin') if isinstance(compound_data, dict) else 'Luteolin'
+            if isinstance(target_data, dict):
+                targets = target_data.get('targets', [])
+            elif isinstance(target_data, list):
+                targets = target_data
+            else:
+                targets = []
             for target in targets:
+                if not isinstance(target, dict):
+                    continue
                 target_name = target.get('target_name', '') or target.get('gene_symbol', '')
                 if not target_name:
                     continue
@@ -80,13 +87,20 @@ class KnowledgeGraph:
                 if gene_symbol:
                     self.add_compound_target_interaction(compound_name, gene_symbol, "targets")
             if ppi_data:
-                interactions = ppi_data.get('interactions', [])
+                if isinstance(ppi_data, dict):
+                    interactions = ppi_data.get('interactions', [])
+                elif isinstance(ppi_data, list):
+                    interactions = ppi_data
+                else:
+                    interactions = []
                 for interaction in interactions:
-                    preferredName_A = interaction.get('preferredName_A', '')
-                    preferredName_B = interaction.get('preferredName_B', '')
+                    if not isinstance(interaction, dict):
+                        continue
+                    gene1 = interaction.get('preferredName_A', '')
+                    gene2 = interaction.get('preferredName_B', '')
                     if gene1 and gene2:
                         score = float(interaction.get('score', 0))
-                        self.graph.add_edge(gene1, gene2ge2, relation="interacts_with", weight=score)
+                        self.graph.add_edge(gene1, gene2, relation="interacts_with", weight=score)
             logger.info("Knowledge graph built: %d nodes, %d edges",
                        self.graph.number_of_nodes(), self.graph.number_of_edges())
         except Exception as e:

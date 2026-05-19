@@ -133,6 +133,8 @@ class NetworkPharmacologyFramework:
 
         logger.info("Extracting protein features...")
         protein_sequence = "MNSFELKQVNGLDLRLLKPVLSSKESWFKGKQGKKKPKKISKAKIVNGKQIFLSKEL"
+        if self.protein_extractor:
+            self.protein_extractor.load_esm_model(timeout=120)
         protein_features = self.protein_extractor.extract_all_features(protein_sequence, "sample_protein") if self.protein_extractor else {}
 
         logger.info("Extracting GNN features...")
@@ -270,9 +272,11 @@ END
         if self.kg_module:
             try:
                 kg_data = {'compound': compound_data, 'targets': target_data, 'proteins': protein_data}
-                self.kg_module.build_from_data(compound_data, target_data)
+                self.kg_module.build_from_data(compound_data, target_data, interaction_data)
                 stats = self.kg_module.compute_graph_statistics()
-                kg_results = {'graph': {'stats': stats}}
+                nodes = list(self.kg_module.graph.nodes())[:50]
+                edges = [(u, v) for u, v in self.kg_module.graph.edges()][:100]
+                kg_results = {'graph': {'stats': stats, 'nodes': nodes, 'edges': edges}}
             except Exception as e:
                 logger.error("Knowledge graph analysis failed: %s", e)
                 kg_results = {'graph': {'stats': {'num_nodes': 0, 'num_edges': 0}}}
@@ -373,8 +377,49 @@ END
             return float(obj)
         return str(obj)
 
+    def _clean_previous_output(self):
+        dirs_to_clean = [
+            os.path.join(self.output_dir, "data"),
+            os.path.join(self.output_dir, "ligand"),
+            os.path.join(self.output_dir, "protein"),
+            os.path.join(self.output_dir, "cnn"),
+            os.path.join(self.output_dir, "gnn"),
+            os.path.join(self.output_dir, "transformer"),
+            os.path.join(self.output_dir, "docking"),
+            os.path.join(self.output_dir, "knowledge_graph"),
+            os.path.join(self.output_dir, "output"),
+        ]
+        files_to_clean = [
+            os.path.join(self.output_dir, "framework_results.json"),
+        ]
+        import shutil
+        for d in dirs_to_clean:
+            if os.path.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
+        for f in files_to_clean:
+            if os.path.exists(f):
+                os.remove(f)
+        logger.info("Previous output cleaned")
+        sub_dirs = {
+            "data": ["raw", "processed"],
+            "ligand": ["structures", "descriptors"],
+            "protein": ["structures", "embeddings"],
+            "cnn": [],
+            "gnn": [],
+            "transformer": [],
+            "docking": [],
+            "knowledge_graph": [],
+            "output": ["images"],
+        }
+        for parent, subs in sub_dirs.items():
+            parent_dir = os.path.join(self.output_dir, parent)
+            os.makedirs(parent_dir, exist_ok=True)
+            for sub in subs:
+                os.makedirs(os.path.join(parent_dir, sub), exist_ok=True)
+
     def run_full_pipeline(self) -> Dict[str, Any]:
         logger.info("Starting full pipeline execution...")
+        self._clean_previous_output()
         start_time = datetime.now()
 
         dataset = self.run_data_collection()

@@ -12,6 +12,9 @@ logger = setup_logger(__name__)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+logger.info("HuggingFace endpoint: %s", os.environ.get("HF_ENDPOINT"))
+
 TORCH_AVAILABLE = False
 try:
     import torch
@@ -21,30 +24,75 @@ except ImportError:
 
 _TRANSFORMERS_AVAILABLE = False
 try:
-    from transformers import AutoModel, AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer
     import transformers
     transformers.logging.set_verbosity_error()
     _TRANSFORMERS_AVAILABLE = True
 except ImportError:
     logger.warning("Transformers not installed. ESM-2 features will be unavailable.")
 
+_MODELSCOPE_AVAILABLE = False
+try:
+    from modelscope import snapshot_download
+    _MODELSCOPE_AVAILABLE = True
+except ImportError:
+    pass
+
 
 class ProteinFeatureExtractor:
-    def __init__(self, output_dir: str = "", esm_model_name: str = "facebook/esm2_t33_650M_UR50D", device: str = "auto"):
+    """Protein feature extractor with ESM-2 model support.
+
+    ESM-2 Model Selection Guide:
+        | Model                          | Params | Size   | Embed Dim | Use Case                  |
+        |--------------------------------|--------|--------|-----------|---------------------------|
+        | facebook/esm2_t6_8M_UR50D     | 8M     | ~30MB  | 320       | Default, fast screening    |
+        | facebook/esm2_t12_35M_UR50D   | 35M    | ~130MB | 480       | Balanced accuracy/speed    |
+        | facebook/esm2_t33_650M_UR50D  | 650M   | ~2.6GB | 1280      | High accuracy, GPU needed  |
+
+    Switch model example:
+        # Use larger model for better accuracy:
+        extractor = ProteinFeatureExtractor(esm_model_name="facebook/esm2_t33_650M_UR50D")
+
+        # Or add as fallback:
+        extractor.add_fallback_model(
+            "facebook/esm2_t33_650M_UR50D",
+            "AI-ModelScope/esm2_t33_650M_UR50D"
+        )
+
+    Download sources (in order):
+        1. ModelScope (国内优先): pip install modelscope
+        2. HuggingFace Mirror: https://hf-mirror.com
+        3. HuggingFace (original): set HF_ENDPOINT="" to use
+    """
+
+    def __init__(self, output_dir: str = "", esm_model_name: str = "facebook/esm2_t6_8M_UR50D", device: str = "auto"):
         if not output_dir:
             output_dir = os.path.join(_BASE_DIR, "features", "protein")
         self.output_dir = os.path.abspath(output_dir)
         os.makedirs(os.path.join(self.output_dir, "structures"), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "embeddings"), exist_ok=True)
         self.esm_model_name = esm_model_name
+        self._model_cache_dir = os.path.join(_BASE_DIR, ".model_cache")
+        os.makedirs(self._model_cache_dir, exist_ok=True)
         self.device = self._get_device(device) if TORCH_AVAILABLE else "cpu"
         self.sequence = None
         self.protein_name = None
         self.features = {}
         self.esm_model = None
         self.esm_tokenizer = None
+        self._fallback_models = []
+        self._modelscope_models = {
+            "facebook/esm2_t6_8M_UR50D": "AI-ModelScope/esm2_t6_8M_UR50D",
+        }
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is required for protein feature extraction")
+
+    def add_fallback_model(self, model_name: str, modelscope_name: str = ""):
+        if model_name not in self._fallback_models and model_name != self.esm_model_name:
+            self._fallback_models.append(model_name)
+            if modelscope_name:
+                self._modelscope_models[model_name] = modelscope_name
+            logger.info("Added fallback model: %s (modelscope: %s)", model_name, modelscope_name or "N/A")
 
     def _get_device(self, device: str) -> str:
         if device == "auto":
@@ -55,21 +103,113 @@ class ProteinFeatureExtractor:
             return "cpu"
         return device
 
-    def load_esm_model(self) -> bool:
+    def load_esm_model(self, timeout: int = 120) -> bool:
         if not _TRANSFORMERS_AVAILABLE:
             logger.error("Transformers library not installed")
             return False
-        try:
-            logger.info("Loading ESM-2 model: %s", self.esm_model_name)
-            self.esm_tokenizer = AutoTokenizer.from_pretrained(self.esm_model_name)
-            self.esm_model = AutoModel.from_pretrained(self.esm_model_name)
-            self.esm_model.to(self.device)
-            self.esm_model.eval()
-            logger.info("ESM-2 model loaded successfully")
-            return True
-        except Exception as e:
-            logger.error("Error loading ESM-2 model: %s", e)
+        models_to_try = [self.esm_model_name] + self._fallback_models
+        for model_name in models_to_try:
+            try:
+                logger.info("Loading ESM-2 model: %s (cache: %s)", model_name, self._model_cache_dir)
+                try:
+                    local_dir = os.path.join(self._model_cache_dir, model_name.replace("/", "--"))
+                    self.esm_tokenizer = AutoTokenizer.from_pretrained(local_dir, local_files_only=True)
+                    self.esm_model = AutoModel.from_pretrained(local_dir, local_files_only=True)
+                    logger.info("ESM-2 model loaded from local cache: %s", model_name)
+                except Exception:
+                    loaded = self._download_from_modelscope(model_name, timeout)
+                    if not loaded:
+                        loaded = self._download_from_hf(model_name, timeout)
+                    if not loaded:
+                        raise RuntimeError(f"Failed to download {model_name} from all sources")
+
+                self.esm_model.to(self.device)
+                self.esm_model.eval()
+                logger.info("ESM-2 model loaded successfully: %s", model_name)
+                return True
+            except Exception as e:
+                if model_name == self.esm_model_name:
+                    logger.warning("Primary ESM-2 model failed (%s), trying fallback...", e)
+                else:
+                    logger.warning("Fallback model %s also failed: %s", model_name, e)
+        logger.error("All ESM-2 models failed to load, using rule-based features only")
+        return False
+
+    def _download_from_hf(self, model_name: str, timeout: int = 120) -> bool:
+        hf_endpoint = os.environ.get("HF_ENDPOINT", "huggingface.co")
+        logger.info("Downloading from HuggingFace (%s): %s", hf_endpoint, model_name)
+        import threading
+        result = {"success": False, "error": None, "local_dir": None}
+
+        def _download():
+            try:
+                local_dir = os.path.join(self._model_cache_dir, model_name.replace("/", "--"))
+                if os.path.exists(os.path.join(local_dir, "config.json")):
+                    logger.info("Found cached model at: %s", local_dir)
+                else:
+                    from huggingface_hub import snapshot_download
+                    snapshot_download(
+                        model_name,
+                        local_dir=local_dir,
+                        local_dir_use_symlinks=False
+                    )
+                    logger.info("Model downloaded to: %s", local_dir)
+                self.esm_tokenizer = AutoTokenizer.from_pretrained(local_dir, local_files_only=True)
+                self.esm_model = AutoModel.from_pretrained(local_dir, local_files_only=True)
+                result["success"] = True
+                result["local_dir"] = local_dir
+            except Exception as e:
+                result["error"] = e
+
+        dl_thread = threading.Thread(target=_download, daemon=True)
+        dl_thread.start()
+        dl_thread.join(timeout=timeout)
+
+        if dl_thread.is_alive():
+            logger.warning("HuggingFace download timed out (%ds): %s", timeout, model_name)
             return False
+        if not result["success"]:
+            logger.warning("HuggingFace download failed: %s", result["error"])
+            return False
+        return True
+
+    def _download_from_modelscope(self, model_name: str, timeout: int = 120) -> bool:
+        if not _MODELSCOPE_AVAILABLE:
+            logger.info("ModelScope not installed, skipping")
+            return False
+        ms_model = self._modelscope_models.get(model_name)
+        if not ms_model:
+            logger.info("No ModelScope mapping for %s", model_name)
+            return False
+        logger.info("Trying ModelScope: %s -> %s", model_name, ms_model)
+        import threading
+        result = {"success": False, "error": None}
+
+        def _download():
+            try:
+                local_dir = os.path.join(self._model_cache_dir, "ms--" + ms_model.replace("/", "--"))
+                if os.path.exists(os.path.join(local_dir, "config.json")):
+                    logger.info("Found cached ModelScope model at: %s", local_dir)
+                else:
+                    cache_dir = snapshot_download(ms_model, cache_dir=self._model_cache_dir)
+                    logger.info("ModelScope model downloaded to: %s", cache_dir)
+                self.esm_tokenizer = AutoTokenizer.from_pretrained(local_dir, local_files_only=True)
+                self.esm_model = AutoModel.from_pretrained(local_dir, local_files_only=True)
+                result["success"] = True
+            except Exception as e:
+                result["error"] = e
+
+        dl_thread = threading.Thread(target=_download, daemon=True)
+        dl_thread.start()
+        dl_thread.join(timeout=timeout)
+
+        if dl_thread.is_alive():
+            logger.warning("ModelScope download timed out (%ds): %s", timeout, model_name)
+            return False
+        if not result["success"]:
+            logger.warning("ModelScope download failed: %s", result["error"])
+            return False
+        return True
 
     def load_sequence(self, sequence: str, protein_name: str = "protein") -> bool:
         sequence = sequence.upper().replace(" ", "").replace("\n", "").replace("\t", "")
@@ -174,7 +314,8 @@ class ProteinFeatureExtractor:
         result = {'name': protein_name, 'success': False}
         if not self.load_sequence(sequence, protein_name):
             return result
-        self.load_esm_model()
+        if self.esm_model is None:
+            self.load_esm_model()
         self.extract_sequence_features()
         self.calculate_physicochemical_properties()
         self.predict_secondary_structure()

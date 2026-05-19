@@ -15,7 +15,7 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _RDKIT_AVAILABLE = False
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors, rdDistGeom
     from rdkit.Chem import Draw
     from rdkit import DataStructs
     from rdkit.Chem.Draw import rdMolDraw2D
@@ -68,13 +68,22 @@ class LigandFeatureExtractor:
             logger.error("No molecule loaded")
             return None
         try:
-            params = AllChem.EmbedMultipleConfs(self.mol, numConformers=num_conformers)
-            if params < 1:
-                logger.warning("No conformers generated, trying ETKDG")
-                params = rdDistGeom.EmbedMultipleConfs(self.mol, numConformers=num_conformers)
+            params = rdDistGeom.EmbedParameters()
+            params.numConfs = num_conformers
+            params.randomSeed = 42
+            params.maxAttempts = 0
+            params.useRandomCoords = False
+            conf_ids = rdDistGeom.EmbedMultipleConfs(self.mol, num_conformers, params)
+            if len(conf_ids) < 1:
+                logger.warning("No conformers generated with ETKDGv3, trying legacy ETKDG")
+                try:
+                    conf_ids = rdDistGeom.EmbedMultipleConfs(self.mol, num_conformers, 42)
+                except Exception:
+                    logger.error("Legacy conformer generation also failed")
+                    return None
             AllChem.MMFFOptimizeMoleculeConfs(self.mol)
             self.mol_3d = Chem.Mol(self.mol)
-            logger.info("Generated %d conformers", num_conformers)
+            logger.info("Generated %d conformers", len(conf_ids))
             return self.mol_3d
         except Exception as e:
             logger.error("3D conformation generation failed: %s", e)
@@ -117,7 +126,13 @@ class LigandFeatureExtractor:
             return None
         graph = {}
         try:
-            conf = self.mol.GetConformer()
+            conf_id = -1
+            try:
+                conf = self.mol.GetConformer(conf_id)
+            except Exception:
+                AllChem.Compute2DCoords(self.mol)
+                conf = self.mol.GetConformer()
+                logger.info("Using 2D coordinates (3D conformer unavailable)")
             atoms = []
             for atom in self.mol.GetAtoms():
                 pos = conf.GetAtomPosition(atom.GetIdx())

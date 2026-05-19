@@ -101,7 +101,7 @@ matplotlib: 3.7.2
 
 ```bash
 # 如果使用了conda虚拟环境
-conda activate luteolin
+conda activate [环境名]
 
 # 运行完整分析流程
 python main.py
@@ -120,18 +120,17 @@ python main.py
 9. **报告生成** — 生成综合 HTML 报告和可视化图表
 
 ### 查看结果
-
+系统使用html静态生成，请在运行完成后再进行查看
 运行完成后，打开项目目录下的 `output_dashboard.html`：
 
 ```
-/
-└── output_dashboard.html     ← 用浏览器打开此文件
+ output_dashboard.html     ← 用浏览器打开此文件
 ```
 
 也可以直接查看输出目录中的文件：
 
 ```
-/framework_output/
+./framework_output/
 ├── output/
 │   └── report.html           ← 综合报告
 ├── data/                     ← 原始与处理后数据
@@ -143,7 +142,7 @@ python main.py
 ### 输出目录结构
 
 ```
-framework_output/
+./framework_output/
 ├── data/                          # 数据采集结果
 │   ├── raw/                       # PubChem, ChEMBL, UniProt 等原始数据
 │   └── processed/                 # 清洗后的 CSV/JSON 数据
@@ -171,7 +170,7 @@ framework_output/
 
 ### 输出 Dashboard 内容
 
-`output_dashboard.html` 包含以下模块：
+`output_dashboard.html` 应包含以下模块：
 
 | 模块 | 内容说明 |
 |------|----------|

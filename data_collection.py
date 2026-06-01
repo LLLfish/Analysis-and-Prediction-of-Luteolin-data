@@ -1,4 +1,4 @@
-"""
+﻿"""
 木犀草素(Luteolin)数据清理与统一生物数据集构建
 Data Cleaning and Unified Dataset Construction for Luteolin
 
@@ -17,6 +17,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from logging_config import setup_logger
+from target_scoring import classify_target, normalize_organism
 logger = setup_logger(__name__)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +61,31 @@ class LuteolinDataCollector:
         except FileNotFoundError:
             logger.warning("Offline data file not found: %s", json_path)
             self._init_fallback_data()
+        self.gene_mapping = {
+            **self._default_gene_mapping(),
+            **getattr(self, "gene_mapping", {}),
+        }
+
+    def _default_gene_mapping(self) -> Dict[str, str]:
+        return {
+            "aldo-keto reductase family 1 member b1": "AKR1B1",
+            "tyrosinase": "TYR",
+            "cyclin-dependent kinase 5": "CDK5",
+            "cyclin-dependent kinase 1": "CDK1",
+            "cyclin-dependent kinase 6": "CDK6",
+            "cyclin-dependent kinase 2": "CDK2",
+            "glycogen synthase kinase-3": "GSK3B",
+            "serine/threonine-protein kinase pim-1": "PIM1",
+            "fatty acid synthase": "FASN",
+            "dna topoisomerase 1": "TOP1",
+            "dna topoisomerase 2-alpha": "TOP2A",
+            "lactoylglutathione lyase": "GLO1",
+            "tyrosine-protein kinase lck": "LCK",
+            "adenosine receptor a1": "ADORA1",
+            "enoyl-acyl-carrier protein reductase": "ENR",
+            "3-oxoacyl-acyl-carrier protein reductase": "KAR",
+            "serine protease 1": "PRSS1",
+        }
 
     def fetch_pubchem_data(self) -> Dict[str, Any]:
         logger.info("Step 1: Fetching data from PubChem...")
@@ -395,15 +421,20 @@ class LuteolinDataCollector:
                         uniprot_id = protein_data[gene_symbol].get('uniprot_id', '')
                     elif gene_symbol in self.offline_proteins:
                         uniprot_id = self.offline_proteins[gene_symbol].get('uniprot_id', '')
+                    organism = normalize_organism(target.get('organism', 'Homo sapiens'))
+                    target_class = classify_target(target)
                     cleaned_targets.append({
                         'target_chembl_id': target_id,
                         'target_name': target.get('target_name', ''),
                         'gene_symbol': gene_symbol,
                         'uniprot_id': uniprot_id,
-                        'organism': target.get('organism', 'Homo sapiens'),
+                        'organism': organism,
                         'activity_type': target.get('activity_type', ''),
                         'activity_value': target.get('activity_value'),
-                        'activity_unit': target.get('activity_unit', '')
+                        'activity_unit': target.get('activity_unit', ''),
+                        'pchembl_value': target.get('pchembl_value'),
+                        'target_class': target_class,
+                        'is_valid_target': target_class != 'non_protein_or_unchecked'
                     })
             cleaned_data['targets'] = cleaned_targets
             logger.info("Targets cleaned: %d unique targets", len(cleaned_targets))
@@ -427,10 +458,9 @@ class LuteolinDataCollector:
             targets_df = pd.DataFrame(self.processed_data['targets'])
             targets_df.to_csv(os.path.join(processed_dir, "targets.csv"),
                             index=False, encoding='utf-8-sig')
-        if self.processed_data['proteins']:
-            proteins_df = pd.DataFrame(self.processed_data['proteins'])
-            proteins_df.to_csv(os.path.join(processed_dir, "proteins.csv"),
-                             index=False, encoding='utf-8-sig')
+        proteins_df = pd.DataFrame(self.processed_data['proteins'])
+        proteins_df.to_csv(os.path.join(processed_dir, "proteins.csv"),
+                    index=False, encoding='utf-8-sig')
         if self.processed_data['interactions']:
             interactions_df = pd.DataFrame(self.processed_data['interactions'])
             interactions_df.to_csv(os.path.join(processed_dir, "interactions.csv"),
@@ -463,7 +493,7 @@ class LuteolinDataCollector:
         gene_symbols = []
         for t in targets:
             gene = t.get('gene_symbol', '') or self._map_target_to_gene(t.get('target_name', ''))
-            if gene:
+            if gene and normalize_organism(t.get('organism')) == 'Homo sapiens':
                 gene_symbols.append(gene)
         gene_symbols = list(set(gene_symbols))
         self.fetch_uniprot_data(gene_symbols)

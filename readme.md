@@ -183,6 +183,38 @@ framework_output/
 | 活性类型 | 按活性类型统计的靶点数量列表 |
 | 数据下载 | CSV/JSON/LOG 文件的下载链接 |
 
+### 分子对接配置
+
+框架会优先尝试调用 AutoDock Vina；如果没有安装 Vina、Open Babel，或没有提供可用的 PDBQT 受体文件，则自动使用 RDKit 描述符进行可复现的结合能估算，并在结果中标记 `method=rdkit_descriptor_fallback`。
+
+```bash
+# 可选：指定 Vina 可执行文件
+set VINA_PATH=C:\tools\vina\vina.exe
+
+# 可选：指定真实靶点受体结构
+set VINA_RECEPTOR_PDBQT=D:\targets\receptor.pdbqt
+
+python main.py
+```
+
+结合能统一采用 AutoDock Vina 的负值约定，正值会被自动纠正为负值，避免出现不合理的 `> 8.0 kcal/mol` 报告结果。
+
+### 模块测试
+
+项目提供轻量测试脚本，不访问网络、不下载 ESM 模型，主要验证数据清洗、配体特征、GNN/CNN、Transformer、分子对接、知识图谱和输出报告入口：
+
+```bash
+python test_modules.py
+```
+
+### 靶点优先级与调研
+
+靶点优先级已从单纯按活性原始值排序，调整为综合评分：低 IC50/Ki/Kd/EC50 更高分，pChEMBL、人源蛋白、基因映射与靶点有效性共同影响排名。传统网络药理学方法对比见 `target_priority_research.md`。
+
+### 3D 可视化
+
+运行特征提取后，系统会在 `framework_output/ligand/structures/` 下生成 `luteolin.pdb`、`luteolin.sdf` 和 `luteolin_2d.png`。Dashboard 中会用 3Dmol.js 展示木犀草素球棍模型；若配置真实 Vina 受体和对接成功，对接姿态会输出到 `framework_output/docking/results/vina_pose.pdbqt`。
+
 ---
 
 ## ESM-2 模型配置

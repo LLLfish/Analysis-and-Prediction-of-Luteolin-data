@@ -131,8 +131,10 @@ class KnowledgeGraph:
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             logger.info("Saved knowledge graph: %s", filepath)
+            return filepath
         except Exception as e:
             logger.error("Failed to save graph: %s", e)
+            return ""
 
     def load_graph(self, filename: str = "knowledge_graph.json"):
         filepath = os.path.join(self.output_dir, "graph", filename)
@@ -144,6 +146,32 @@ class KnowledgeGraph:
                 logger.info("Loaded knowledge graph: %s", filepath)
         except Exception as e:
             logger.error("Failed to load graph: %s", e)
+
+    def save_triples(self, filename: str = "knowledge_graph_triples.tsv") -> str:
+        filepath = os.path.join(self.output_dir, "graph", filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            for head, relation, tail in self.triples:
+                f.write(f"{head}\t{relation}\t{tail}\n")
+        logger.info("Saved knowledge graph triples: %s", filepath)
+        return filepath
+
+    def to_dgl_graph(self) -> Optional[Any]:
+        if not _DGL_KE_AVAILABLE or self.graph is None:
+            return None
+        try:
+            nodes = list(self.graph.nodes())
+            node_to_id = {node: idx for idx, node in enumerate(nodes)}
+            src = []
+            dst = []
+            for u, v in self.graph.edges():
+                src.append(node_to_id[u])
+                dst.append(node_to_id[v])
+            dgl_graph = dgl.graph((src, dst), num_nodes=len(nodes))
+            logger.info("Converted knowledge graph to DGL graph: %d nodes, %d edges", len(nodes), len(src))
+            return dgl_graph
+        except Exception as e:
+            logger.error("DGL graph conversion failed: %s", e)
+            return None
 
 
 class KGEmbedder:
@@ -159,11 +187,11 @@ class KGEmbedder:
         if not _PYKEEN_AVAILABLE:
             return None
         try:
-            tf = TriplesFactory.from_labeled_triples(triples)
+            tf = TriplesFactory.from_labeled_triples(np.array(triples, dtype=str))
             result = pipeline(
                 training=tf,
                 model='RotatE',
-                training_kwargs=dict(num_epochs=100, batch_size=64),
+                training_kwargs=dict(num_epochs=int(os.environ.get("PYKEEN_EPOCHS", "10")), batch_size=64),
                 optimizer_kwargs=dict(lr=0.01)
             )
             self.model = result.model

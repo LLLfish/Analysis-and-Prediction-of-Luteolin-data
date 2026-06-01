@@ -1,4 +1,4 @@
-"""
+﻿"""
 网络药理学混合人工智能框架 - 主脚本
 Integrated Network Pharmacology Hybrid AI Framework
 """
@@ -78,11 +78,13 @@ except ImportError as e:
     _module_imports['DockingValidator'] = False
 
 try:
-    from knowledge_graph_module import KnowledgeGraph
+    from knowledge_graph_module import KnowledgeGraph, KGEmbedder
     _module_imports['KnowledgeGraph'] = True
+    _module_imports['KGEmbedder'] = True
 except ImportError as e:
     logger.warning("knowledge_graph_module import failed: %s", e)
     _module_imports['KnowledgeGraph'] = False
+    _module_imports['KGEmbedder'] = False
 
 try:
     from output_module import OutputGenerator
@@ -100,20 +102,33 @@ class NetworkPharmacologyFramework:
         self.output_dir = os.path.abspath(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
 
-        self.data_collector = LuteolinDataCollector(output_dir=os.path.join(self.output_dir, "data"))
-        self.gnn_encoder = GraphEncoder() if _module_imports.get('GraphEncoder') else None
-        self.gnn_analyzer = NetworkAnalyzer(output_dir=os.path.join(self.output_dir, "gnn")) if _module_imports.get('NetworkAnalyzer') else None
-        self.cnn_module = MolecularCNN(output_dir=os.path.join(self.output_dir, "cnn")) if _module_imports.get('MolecularCNN') else None
-        self.protein_extractor = ProteinFeatureExtractor(output_dir=os.path.join(self.output_dir, "protein")) if _module_imports.get('ProteinFeatureExtractor') else None
-        self.ligand_extractor = LigandFeatureExtractor(output_dir=os.path.join(self.output_dir, "ligand")) if _module_imports.get('LigandFeatureExtractor') else None
-        self.transformer_module = FeatureFusion(output_dir=os.path.join(self.output_dir, "transformer")) if _module_imports.get('FeatureFusion') else None
-        self.docking_module = DockingValidator(output_dir=os.path.join(self.output_dir, "docking")) if _module_imports.get('DockingValidator') else None
-        self.kg_module = KnowledgeGraph(output_dir=os.path.join(self.output_dir, "knowledge_graph")) if _module_imports.get('KnowledgeGraph') else None
-        self.output_module = OutputGenerator(output_dir=os.path.join(self.output_dir, "output")) if _module_imports.get('OutputGenerator') else None
+        self.data_collector = self._safe_component(globals().get('LuteolinDataCollector'), 'LuteolinDataCollector', output_dir=os.path.join(self.output_dir, "data"))
+        self.gnn_encoder = self._safe_component(globals().get('GraphEncoder'), 'GraphEncoder')
+        self.gnn_analyzer = self._safe_component(globals().get('NetworkAnalyzer'), 'NetworkAnalyzer', output_dir=os.path.join(self.output_dir, "gnn"))
+        self.cnn_module = self._safe_component(globals().get('MolecularCNN'), 'MolecularCNN', output_dir=os.path.join(self.output_dir, "cnn"))
+        self.protein_extractor = self._safe_component(globals().get('ProteinFeatureExtractor'), 'ProteinFeatureExtractor', output_dir=os.path.join(self.output_dir, "protein"))
+        self.ligand_extractor = self._safe_component(globals().get('LigandFeatureExtractor'), 'LigandFeatureExtractor', output_dir=os.path.join(self.output_dir, "ligand"))
+        self.transformer_module = self._safe_component(globals().get('FeatureFusion'), 'FeatureFusion', output_dir=os.path.join(self.output_dir, "transformer"))
+        self.docking_module = self._safe_component(globals().get('DockingValidator'), 'DockingValidator', output_dir=os.path.join(self.output_dir, "docking"))
+        self.kg_module = self._safe_component(globals().get('KnowledgeGraph'), 'KnowledgeGraph', output_dir=os.path.join(self.output_dir, "knowledge_graph"))
+        self.kg_embedder = self._safe_component(globals().get('KGEmbedder'), 'KGEmbedder', output_dir=os.path.join(self.output_dir, "knowledge_graph", "embeddings"))
+        self.output_module = self._safe_component(globals().get('OutputGenerator'), 'OutputGenerator', output_dir=os.path.join(self.output_dir, "output"))
 
         self.results = {}
 
+    def _safe_component(self, cls, import_key: str, *args, **kwargs):
+        if cls is None or not _module_imports.get(import_key):
+            return None
+        try:
+            return cls(*args, **kwargs)
+        except Exception as e:
+            logger.warning("%s initialization skipped: %s", import_key, e)
+            return None
+
     def run_data_collection(self) -> Dict[str, Any]:
+        if not self.data_collector:
+            logger.error("Data collector is unavailable")
+            return {}
         dataset = self.data_collector.run_pipeline()
         self.results['data_collection'] = dataset
         compound_name = dataset.get('compound', {}).get('name', 'N/A')
@@ -236,23 +251,37 @@ ATOM      4  O   ALA A   1      23.600  20.200  22.000  1.00  0.00           O
 ATOM      5  CB  ALA A   1      26.400  20.200  23.800  1.00  0.00           C
 END
 """
-        pdb_file = os.path.join(self.output_dir, "docking", "receptors", "receptor.pdb")
-        os.makedirs(os.path.dirname(pdb_file), exist_ok=True)
-        with open(pdb_file, 'w') as f:
-            f.write(pdb_content)
+        pdb_file = os.environ.get("VINA_RECEPTOR_PDBQT") or os.environ.get("VINA_RECEPTOR_PDB")
+        if not pdb_file:
+            pdb_file = os.path.join(self.output_dir, "docking", "receptors", "receptor.pdb")
+            os.makedirs(os.path.dirname(pdb_file), exist_ok=True)
+            with open(pdb_file, 'w', encoding='utf-8') as f:
+                f.write(pdb_content)
 
         docking_results = {}
         if self.docking_module:
             try:
                 self.docking_module.prepare_protein(pdb_file)
+                docking_center = [0.0, 0.0, 0.0]
                 if RDKIT_AVAILABLE and smiles:
                     mol = Chem.MolFromSmiles(smiles)
                     if mol:
                         mol = Chem.AddHs(mol)
                         AllChem.EmbedMolecule(mol, randomSeed=42)
+                        AllChem.MMFFOptimizeMolecule(mol)
                         self.docking_module.prepare_ligand(mol)
-                vina_output = {'status': 'simulated', 'binding_affinity': -7.5, 'docking_modes': [{'mode': 1, 'affinity': -7.5}]}
+                        try:
+                            conf = mol.GetConformer()
+                            coords = [
+                                [conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
+                                for i in range(mol.GetNumAtoms())
+                            ]
+                            docking_center = [sum(axis) / len(coords) for axis in zip(*coords)]
+                        except Exception:
+                            docking_center = [0.0, 0.0, 0.0]
+                vina_output = self.docking_module.run_vina(center=docking_center)
                 docking_results = self.docking_module.validate_docking(vina_output)
+                self.docking_module.save_results(docking_results)
             except Exception as e:
                 logger.error("Docking failed: %s", e)
                 docking_results = {'status': 'error', 'error': str(e)}
@@ -274,9 +303,27 @@ END
                 kg_data = {'compound': compound_data, 'targets': target_data, 'proteins': protein_data}
                 self.kg_module.build_from_data(compound_data, target_data, interaction_data)
                 stats = self.kg_module.compute_graph_statistics()
+                graph_path = self.kg_module.save_graph()
+                triples_path = self.kg_module.save_triples()
+                dgl_available = self.kg_module.to_dgl_graph() is not None
+                kg_embedding_status = {'attempted': False, 'available': False}
+                if os.environ.get("RUN_PYKEEN", "0") == "1" and self.kg_embedder and self.kg_module.triples:
+                    kg_embedding_status['attempted'] = True
+                    model = self.kg_embedder.train_pykeen(self.kg_module.triples)
+                    kg_embedding_status['available'] = model is not None
                 nodes = list(self.kg_module.graph.nodes())[:50]
                 edges = [(u, v) for u, v in self.kg_module.graph.edges()][:100]
-                kg_results = {'graph': {'stats': stats, 'nodes': nodes, 'edges': edges}}
+                kg_results = {
+                    'graph': {
+                        'stats': stats,
+                        'nodes': nodes,
+                        'edges': edges,
+                        'graph_path': graph_path,
+                        'triples_path': triples_path,
+                        'dgl_available': dgl_available,
+                        'kg_embedding': kg_embedding_status
+                    }
+                }
             except Exception as e:
                 logger.error("Knowledge graph analysis failed: %s", e)
                 kg_results = {'graph': {'stats': {'num_nodes': 0, 'num_edges': 0}}}
@@ -289,6 +336,7 @@ END
     def run_output_generation(self) -> Dict[str, Any]:
         feature_extraction = self.results.get('feature_extraction', {})
         gnn_results = feature_extraction.get('gnn', {})
+        ligand_results = feature_extraction.get('ligand', {})
         docking_results = self.results.get('docking', {})
         knowledge_graph_results = self.results.get('knowledge_graph', {})
         compound_data = self.results.get('data_collection', {}).get('compound', {})
@@ -302,6 +350,7 @@ END
                     'compound': compound_data,
                     'docking': docking_results,
                     'gnn': gnn_results,
+                    'ligand': ligand_results,
                     'knowledge_graph': knowledge_graph_results
                 }
                 report = self.output_module.generate_summary_report(summary_input)
@@ -407,8 +456,8 @@ END
             "cnn": [],
             "gnn": [],
             "transformer": [],
-            "docking": [],
-            "knowledge_graph": [],
+            "docking": ["structures", "receptors", "results"],
+            "knowledge_graph": ["graph"],
             "output": ["images"],
         }
         for parent, subs in sub_dirs.items():

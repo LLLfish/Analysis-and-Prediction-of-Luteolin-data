@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import html
 import numpy as np
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -8,6 +9,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from logging_config import setup_logger
+from target_scoring import organism_distribution, rank_targets, score_target
 logger = setup_logger(__name__)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +56,7 @@ class OutputGenerator:
             'docking_summary': results.get('docking', {}),
             'gnn_summary': self._summarize_gnn(results.get('gnn', {})),
             'knowledge_graph_summary': results.get('knowledge_graph', {}),
+            'ligand_summary': results.get('ligand', {}),
             'data_quality': {},
             'targets_raw': results.get('targets', []),
         }
@@ -106,22 +109,8 @@ class OutputGenerator:
         graph_edges = gs.get('graph_edges', 0) or kg.get('graph', {}).get('stats', {}).get('num_edges', 0)
         graph_relations = kg.get('graph', {}).get('stats', {}).get('num_relations', 0)
 
-        gene_scores = {}
-        for t in report.get('targets_raw', []):
-            g = t.get('gene_symbol', '')
-            if g:
-                try:
-                    score = abs(float(t.get('activity_value', 0))) if t.get('activity_value') else 0
-                    gene_scores[g] = max(gene_scores.get(g, 0), score)
-                except (ValueError, TypeError):
-                    pass
-        sorted_targets = sorted(gene_scores.items(), key=lambda x: x[1], reverse=True)[:10]
-
-        organism_dist = {}
-        for t in report.get('targets_raw', []):
-            org = t.get('organism', 'Unknown') or 'Unknown'
-            organism_dist[org] = organism_dist.get(org, 0) + 1
-        sorted_organisms = sorted(organism_dist.items(), key=lambda x: x[1], reverse=True)[:10]
+        ranked_targets = rank_targets(report.get('targets_raw', []), limit=10)
+        sorted_organisms = organism_distribution(report.get('targets_raw', []), limit=10)
 
         activity_types = {}
         for t in report.get('targets_raw', []):
@@ -130,12 +119,17 @@ class OutputGenerator:
         sorted_activities = sorted(activity_types.items(), key=lambda x: x[1], reverse=True)[:8]
 
         target_rows = ""
-        for i, (gene, score) in enumerate(sorted_targets, 1):
-            target_rows += f'<tr><td>{i}</td><td>{gene}</td><td>{score:.4f}</td></tr>\n'
+        for i, (label, score, target) in enumerate(ranked_targets, 1):
+            activity = f"{target.get('activity_type', '')} {target.get('activity_value', '')} {target.get('activity_unit', '')}".strip()
+            target_rows += (
+                f"<tr><td>{i}</td><td>{html.escape(label)}</td>"
+                f"<td>{html.escape(str(target.get('organism', 'Unknown')))}</td>"
+                f"<td>{html.escape(activity)}</td><td>{score:.4f}</td></tr>\n"
+            )
 
         org_rows = ""
         for org, count in sorted_organisms:
-            org_rows += f'<li><strong>{org}</strong>: {count} targets</li>\n'
+            org_rows += f'<li><strong>{html.escape(org)}</strong>: {count} targets</li>\n'
 
         act_rows = ""
         for at, count in sorted_activities:
@@ -145,6 +139,7 @@ class OutputGenerator:
         chart_organism = self._generate_chart_base64('organism', report)
         chart_activity = self._generate_chart_base64('activity', report)
         chart_kg_network = self._generate_chart_base64('kg_network', report)
+        molecule_3d_html = self._build_molecule_viewer_html()
 
         html_content = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -180,6 +175,8 @@ class OutputGenerator:
         .chart-card {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }}
         .chart-card img {{ max-width: 100%; height: auto; border-radius: 5px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
         .chart-title {{ margin-top: 10px; font-weight: 600; color: #2e86c1; font-size: 1em; }}
+        .viewer-3d {{ width: 100%; height: 420px; border: 1px solid #dbe4ee; border-radius: 8px; background: #ffffff; position: relative; overflow: hidden; }}
+        .viewer-note {{ color: #667085; font-size: 0.9em; margin-top: 8px; }}
         .list-styled {{ list-style: none; margin: 15px 0; }}
         .list-styled li {{ padding: 10px 15px; background: #f8f9fa; margin-bottom: 8px; border-radius: 5px; border-left: 4px solid #2e86c1; }}
         .data-files {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 15px 0; }}
@@ -247,7 +244,7 @@ class OutputGenerator:
         <div class="section">
             <h2>靶点优先级分析</h2>
             <table>
-                <thead><tr><th>排名</th><th>基因符号</th><th>活性得分</th></tr></thead>
+                <thead><tr><th>排名</th><th>靶点</th><th>物种</th><th>活性</th><th>综合得分</th></tr></thead>
                 <tbody>{target_rows}</tbody>
             </table>
         </div>
@@ -272,6 +269,11 @@ class OutputGenerator:
                     <div class="chart-title">知识图谱网络可视化</div>
                 </div>
             </div>
+        </div>
+
+        <div class="section">
+            <h2>木犀草素 3D 模型</h2>
+            {molecule_3d_html}
         </div>
 
         <div class="section">
@@ -327,6 +329,34 @@ class OutputGenerator:
 
         return dashboard_path
 
+    def _build_molecule_viewer_html(self) -> str:
+        pdb_path = os.path.abspath(os.path.join(self.output_dir, "..", "ligand", "structures", "luteolin.pdb"))
+        if not os.path.exists(pdb_path):
+            return '<p class="viewer-note">未找到配体 3D 结构文件；运行特征提取后会生成 luteolin.pdb。</p>'
+        try:
+            with open(pdb_path, "r", encoding="utf-8") as f:
+                pdb_block = f.read()
+            pdb_json = json.dumps(pdb_block)
+            return f'''
+            <div id="luteolin-3d-viewer" class="viewer-3d"></div>
+            <p class="viewer-note">球棍模型来自 RDKit 生成的木犀草素三维构象；如果提供真实靶点 PDBQT，分子对接姿态会写入 docking/results。</p>
+            <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+            <script>
+                (function() {{
+                    if (!window.$3Dmol) return;
+                    const element = document.getElementById('luteolin-3d-viewer');
+                    const viewer = $3Dmol.createViewer(element, {{ backgroundColor: 'white' }});
+                    viewer.addModel({pdb_json}, 'pdb');
+                    viewer.setStyle({{}}, {{ stick: {{ radius: 0.16 }}, sphere: {{ scale: 0.28 }} }});
+                    viewer.zoomTo();
+                    viewer.render();
+                }})();
+            </script>
+            '''
+        except Exception as e:
+            logger.warning("3D molecule viewer generation failed: %s", e)
+            return '<p class="viewer-note">3D 模型加载失败，请查看 ligand/structures/luteolin.pdb。</p>'
+
     def _generate_chart_base64(self, chart_type: str, report: Dict[str, Any]) -> str:
         if not MATPLOTLIB_AVAILABLE:
             return ""
@@ -335,25 +365,17 @@ class OutputGenerator:
             import base64
 
             if chart_type == 'target_priority':
-                gene_scores = {}
-                for t in report.get('targets_raw', []):
-                    g = t.get('gene_symbol', '')
-                    if g:
-                        try:
-                            score = abs(float(t.get('activity_value', 0))) if t.get('activity_value') else 0
-                            gene_scores[g] = max(gene_scores.get(g, 0), score)
-                        except (ValueError, TypeError):
-                            pass
-                if not gene_scores:
+                ranked = rank_targets(report.get('targets_raw', []), limit=15)
+                if not ranked:
                     return ""
-                sorted_genes = sorted(gene_scores.items(), key=lambda x: x[1], reverse=True)[:15]
                 fig, ax = plt.subplots(figsize=(8, 5))
-                genes, scores = zip(*sorted_genes)
-                colors = plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(genes)))
-                bars = ax.barh(range(len(genes)), scores, color=colors, edgecolor='white', linewidth=0.5)
-                ax.set_yticks(range(len(genes)))
-                ax.set_yticklabels(genes, fontsize=9)
-                ax.set_xlabel('Activity Score', fontsize=10)
+                labels = [item[0] for item in ranked]
+                scores = [item[1] for item in ranked]
+                colors = plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(labels)))
+                bars = ax.barh(range(len(labels)), scores, color=colors, edgecolor='white', linewidth=0.5)
+                ax.set_yticks(range(len(labels)))
+                ax.set_yticklabels(labels, fontsize=9)
+                ax.set_xlabel('Priority Score', fontsize=10)
                 ax.set_title('Target Priority Distribution', fontsize=13, fontweight='bold', pad=10)
                 ax.invert_yaxis()
                 for bar, s in zip(bars, scores):
@@ -364,13 +386,9 @@ class OutputGenerator:
                 plt.tight_layout()
 
             elif chart_type == 'organism':
-                organism_dist = {}
-                for t in report.get('targets_raw', []):
-                    org = t.get('organism', 'Unknown') or 'Unknown'
-                    organism_dist[org] = organism_dist.get(org, 0) + 1
-                if not organism_dist:
+                sorted_orgs = organism_distribution(report.get('targets_raw', []), limit=10)
+                if not sorted_orgs:
                     return ""
-                sorted_orgs = sorted(organism_dist.items(), key=lambda x: x[1], reverse=True)[:10]
                 fig, ax = plt.subplots(figsize=(8, 5))
                 orgs, counts = zip(*sorted_orgs)
                 colors = plt.cm.Set2(np.linspace(0, 1, len(orgs)))
@@ -511,22 +529,17 @@ class OutputGenerator:
         try:
             images_dir = os.path.join(self.output_dir, "images")
             targets = data.get('targets', [])
-            gene_scores = {}
-            for t in targets:
-                g = t.get('gene_symbol', '')
-                if g:
-                    score = abs(float(t.get('activity_value', 0))) if t.get('activity_value') else 0
-                    gene_scores[g] = max(gene_scores.get(g, 0), score)
-            if gene_scores:
-                sorted_genes = sorted(gene_scores.items(), key=lambda x: x[1], reverse=True)[:15]
+            ranked = rank_targets(targets, limit=15)
+            if ranked:
                 fig, ax = plt.subplots(figsize=(10, 6))
-                genes, scores = zip(*sorted_genes) if sorted_genes else ([], [])
-                bars = ax.bar(range(len(genes)), scores, color='steelblue', edgecolor='navy')
-                ax.set_xticks(range(len(genes)))
-                ax.set_xticklabels(genes, rotation=45, ha='right')
+                labels = [item[0] for item in ranked]
+                scores = [item[1] for item in ranked]
+                bars = ax.bar(range(len(labels)), scores, color='steelblue', edgecolor='navy')
+                ax.set_xticks(range(len(labels)))
+                ax.set_xticklabels(labels, rotation=45, ha='right')
                 ax.set_title('Target Priority Score', fontsize=14, fontweight='bold')
-                ax.set_xlabel('Gene Symbol')
-                ax.set_ylabel('Activity Score')
+                ax.set_xlabel('Target')
+                ax.set_ylabel('Priority Score')
                 for bar, s in zip(bars, scores):
                     ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(scores)*0.01,
                             f'{s:.2f}', ha='center', va='bottom', fontsize=8)
@@ -542,13 +555,10 @@ class OutputGenerator:
         try:
             images_dir = os.path.join(self.output_dir, "images")
             fig, ax = plt.subplots(figsize=(10, 6))
-            target_types = {}
-            for t in data.get('targets', []):
-                org = t.get('organism', 'Unknown') or 'Unknown'
-                target_types[org] = target_types.get(org, 0) + 1
-            if target_types:
-                orgs = list(target_types.keys())[:10]
-                counts = [target_types[o] for o in orgs]
+            org_distribution = organism_distribution(data.get('targets', []), limit=10)
+            if org_distribution:
+                orgs = [item[0] for item in org_distribution]
+                counts = [item[1] for item in org_distribution]
                 colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(orgs)))
                 path_bars = ax.barh(range(len(orgs)), counts, color=colors, edgecolor='black')
                 ax.set_yticks(range(len(orgs)))

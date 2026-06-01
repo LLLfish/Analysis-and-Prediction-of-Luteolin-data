@@ -44,6 +44,15 @@ seaborn>=0.12.0
 #   安装: pip install dgl
 #   或: conda install -c dglteam dgl
 #
+# pykeen: 知识图谱嵌入训练 (knowledge_graph_module.py 中可选使用)
+#   安装: pip install pykeen
+#
+# biopython: PDB 结构解析 (docking_module.py 中可选使用)
+#   安装: pip install biopython
+#
+# openbabel: PDB/PDBQT 格式转换 (docking_module.py 中可选使用)
+#   建议: conda install -c conda-forge openbabel
+#
 # PyTorch Geometric 扩展 (图神经网络):
 #   pip install torch_geometric
 #   或从 https://data.pyg.org/whl/ 下载对应版本的预编译轮子

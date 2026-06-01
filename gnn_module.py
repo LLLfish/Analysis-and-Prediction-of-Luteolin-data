@@ -68,7 +68,7 @@ class GNNModel(nn.Module):
         self.layers = nn.ModuleList()
         self.layers.append(GNNLayer(in_dim, hidden_dim, dropout))
         for _ in range(num_layers - 2):
-            self.layers.append(GNNLayer(hidden_dimhidden_dim, dropout))
+            self.layers.append(GNNLayer(hidden_dim, hidden_dim, dropout))
         self.layers.append(GNNLayer(hidden_dim, out_dim, dropout))
 
     def forward(self, x, edge_index):
@@ -95,7 +95,7 @@ class GraphEncoder:
                 G.add_edge(bond['begin'], bond['end'], type=bond['type'])
 
             node_features = []
-            for node in G.nodes(datarrue):
+            for node in G.nodes(data=True):
                 feat = [node[1].get('atomic_num', 0) / 100.0]
                 node_features.append(feat)
             x = torch.tensor(node_features, dtype=torch.float)
@@ -106,7 +106,10 @@ class GraphEncoder:
                 edge_index = torch.zeros((2, 0), dtype=torch.long)
 
             logger.info("Encoded graph: %d nodes, %d edges", x.shape[0], edge_index.shape[1])
-            return {'x': x, 'edge_index': edge_index, 'graph': G}
+            result = {'x': x, 'edge_index': edge_index, 'graph': G}
+            if TORCH_GEOMETRIC_AVAILABLE:
+                result['pyg_data'] = Data(x=x, edge_index=edge_index)
+            return result
         except Exception as e:
             logger.error("Graph encoding failed: %s", e)
             return None
@@ -144,7 +147,7 @@ class DeepWalkEmbedder:
                     embeddings[i] = model.wv[str(node)]
             logger.info("DeepWalk embeddings: %d nodes x %d dims", len(nodes), self.dimensions)
             return embeddings
-        except Bution as e:
+        except Exception as e:
             logger.error("DeepWalk failed: %s", e)
             return None
 

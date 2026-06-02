@@ -3,11 +3,16 @@
 Integrated Network Pharmacology Hybrid AI Framework
 """
 
+# Suppress transformers optional dependency notices (lightning, haiku, etc. — not needed for ESM-2)
 import os
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+
 import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, List
+
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -240,56 +245,79 @@ class NetworkPharmacologyFramework:
 
         return fusion_results
 
+    _DOCKING_TARGETS = [
+        {"gene": "CDK2",  "pdb_id": "1AQ1", "chain": "A", "name": "Cyclin-dependent kinase 2"},
+        {"gene": "CDK6",  "pdb_id": "1XO2", "chain": "A", "name": "Cyclin-dependent kinase 6"},
+        {"gene": "AKT1",  "pdb_id": "3O96", "chain": "A", "name": "RAC-alpha serine/threonine kinase"},
+        {"gene": "PTEN",  "pdb_id": "1D5R", "chain": "A", "name": "Phosphatase and tensin homolog"},
+        {"gene": "PIK3CA","pdb_id": "4L23", "chain": "A", "name": "PI3K alpha catalytic subunit"},
+    ]
+
+    def _download_pdb(self, pdb_id: str):
+        cache_dir = os.path.join(self.output_dir, "docking", "receptors")
+        os.makedirs(cache_dir, exist_ok=True)
+        pdb_file = os.path.join(cache_dir, f"{pdb_id}.pdb")
+        if os.path.exists(pdb_file):
+            return pdb_file
+        try:
+            import requests
+            url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+            logger.info("Downloading PDB %s from RCSB...", pdb_id)
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            with open(pdb_file, "w", encoding="utf-8") as f:
+                f.write(r.text)
+            logger.info("Downloaded PDB %s (%d bytes)", pdb_id, len(r.text))
+            return pdb_file
+        except Exception as e:
+            logger.warning("Failed to download PDB %s: %s", pdb_id, e)
+            return None
+
     def run_docking(self, dataset: Dict[str, Any]) -> Dict[str, Any]:
-        compound = dataset.get('compound', {})
-        smiles = compound.get('smiles', 'C1=CC(=C(C1)C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O')
-
-        pdb_content = """ATOM      1  N   ALA A   1      26.500  22.500  22.500  1.00  0.00           N
-ATOM      2  CA  ALA A   1      25.900  21.100  22.500  1.00  0.00           C
-ATOM      3  C   ALA A   1      24.400  21.200  22.000  1.00  0.00           C
-ATOM      4  O   ALA A   1      23.600  20.200  22.000  1.00  0.00           O
-ATOM      5  CB  ALA A   1      26.400  20.200  23.800  1.00  0.00           C
-END
-"""
-        pdb_file = os.environ.get("VINA_RECEPTOR_PDBQT") or os.environ.get("VINA_RECEPTOR_PDB")
-        if not pdb_file:
-            pdb_file = os.path.join(self.output_dir, "docking", "receptors", "receptor.pdb")
-            os.makedirs(os.path.dirname(pdb_file), exist_ok=True)
-            with open(pdb_file, 'w', encoding='utf-8') as f:
-                f.write(pdb_content)
-
-        docking_results = {}
-        if self.docking_module:
+        compound = dataset.get("compound", {})
+        smiles = compound.get("smiles", "C1=CC(=C(C1)C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O")
+        docking_results = {"targets": {}}
+        if not self.docking_module:
+            self.results["docking"] = docking_results
+            return docking_results
+        if RDKIT_AVAILABLE and smiles:
             try:
-                self.docking_module.prepare_protein(pdb_file)
-                docking_center = [0.0, 0.0, 0.0]
-                if RDKIT_AVAILABLE and smiles:
-                    mol = Chem.MolFromSmiles(smiles)
-                    if mol:
-                        mol = Chem.AddHs(mol)
-                        AllChem.EmbedMolecule(mol, randomSeed=42)
-                        AllChem.MMFFOptimizeMolecule(mol)
-                        self.docking_module.prepare_ligand(mol)
-                        try:
-                            conf = mol.GetConformer()
-                            coords = [
-                                [conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
-                                for i in range(mol.GetNumAtoms())
-                            ]
-                            docking_center = [sum(axis) / len(coords) for axis in zip(*coords)]
-                        except Exception:
-                            docking_center = [0.0, 0.0, 0.0]
-                vina_output = self.docking_module.run_vina(center=docking_center)
-                docking_results = self.docking_module.validate_docking(vina_output)
-                self.docking_module.save_results(docking_results)
+                mol = Chem.MolFromSmiles(smiles)
+                if mol:
+                    mol = Chem.AddHs(mol)
+                    AllChem.EmbedMolecule(mol, randomSeed=42)
+                    AllChem.MMFFOptimizeMolecule(mol)
+                    self.docking_module.prepare_ligand(mol, smiles=smiles)
             except Exception as e:
-                logger.error("Docking failed: %s", e)
-                docking_results = {'status': 'error', 'error': str(e)}
-
-        self.results['docking'] = docking_results
-        logger.info("Molecular docking completed")
-
+                logger.error("Ligand preparation failed: %s", e)
+        best_affinity = 0
+        for target_cfg in self._DOCKING_TARGETS:
+            gene = target_cfg["gene"]
+            pdb_id = target_cfg["pdb_id"]
+            try:
+                pdb_file = self._download_pdb(pdb_id)
+                if not pdb_file:
+                    docking_results["targets"][gene] = {"status": "error", "error": f"PDB {pdb_id} download failed", "binding_affinity": None}
+                    continue
+                self.docking_module.prepare_protein(pdb_file, protein_name=gene)
+                pocket = self.docking_module.detect_binding_site(padding=8.0)
+                vina_output = self.docking_module.run_vina(center=pocket["center"], box_size=pocket["box_size"], exhaustiveness=16)
+                result = self.docking_module.validate_docking(vina_output)
+                result["target_name"] = target_cfg["name"]
+                result["pdb_id"] = pdb_id
+                docking_results["targets"][gene] = result
+                aff = result.get("binding_affinity")
+                if aff is not None and aff < best_affinity:
+                    best_affinity = aff
+                logger.info("Docking %s (PDB %s): best affinity = %.3f kcal/mol", gene, pdb_id, aff or 0)
+            except Exception as e:
+                logger.error("Docking failed for %s (%s): %s", gene, pdb_id, e)
+                docking_results["targets"][gene] = {"status": "error", "error": str(e), "binding_affinity": None}
+        docking_results["binding_affinity"] = best_affinity if best_affinity != 0 else None
+        self.results["docking"] = docking_results
+        logger.info("Molecular docking completed for %d targets", len(docking_results["targets"]))
         return docking_results
+
 
     def run_knowledge_graph(self, dataset: Dict[str, Any]) -> Dict[str, Any]:
         compound_data = dataset.get('compound', {})

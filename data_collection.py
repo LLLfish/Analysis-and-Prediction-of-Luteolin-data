@@ -14,7 +14,9 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings
+
+('ignore')
 
 from logging_config import setup_logger
 from target_scoring import classify_target, normalize_organism
@@ -59,12 +61,28 @@ class LuteolinDataCollector:
             self.gene_mapping = data['gene_mapping']
             self.offline_tcmsp = data.get('tcmsp', {})
         except FileNotFoundError:
-            logger.warning("Offline data file not found: %s", json_path)
+            logger.info("Offline data file not found, generating from embedded fallback: %s", json_path)
             self._init_fallback_data()
         self.gene_mapping = {
             **self._default_gene_mapping(),
             **getattr(self, "gene_mapping", {}),
         }
+        # Auto-generate offline_data.json if it does not exist yet
+        if not os.path.exists(json_path):
+            try:
+                offline_save = {
+                    'compound': self.offline_compound,
+                    'targets': self.offline_targets,
+                    'proteins': self.offline_proteins,
+                    'interactions': self.offline_interactions,
+                    'gene_mapping': self.gene_mapping,
+                    'tcmsp': self.offline_tcmsp,
+                }
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(offline_save, f, ensure_ascii=False, indent=2)
+                logger.info("Offline data file auto-generated: %s", json_path)
+            except Exception as save_err:
+                logger.warning("Failed to save offline data file: %s", save_err)
 
     def _default_gene_mapping(self) -> Dict[str, str]:
         return {
@@ -87,13 +105,80 @@ class LuteolinDataCollector:
             "serine protease 1": "PRSS1",
         }
 
+    def _fetch_pubchem_via_pubchempy(self) -> Dict[str, Any]:
+        try:
+            import pubchempy as pcp
+            c = pcp.Compound.from_cid(self.pubchem_cid)
+            if c is None:
+                raise ValueError("PubChemPy returned None")
+            result = {
+                'cid': self.pubchem_cid,
+                'name': getattr(c, 'iupac_name', self.compound_name) or self.compound_name,
+                'name_cn': self.compound_name_cn,
+                'fetch_time': datetime.now().isoformat(),
+                'source': 'pubchempy',
+                'properties': {
+                    'IUPAC_Name': getattr(c, 'iupac_name', ''),
+                    'Molecular_Formula': getattr(c, 'molecular_formula', ''),
+                    'Molecular_Weight': getattr(c, 'molecular_weight', 0),
+                    'Canonical_SMILES': getattr(c, 'canonical_smiles', ''),
+                    'Isomeric_SMILES': getattr(c, 'isomeric_smiles', ''),
+                    'InChI': getattr(c, 'inchi', ''),
+                    'InChIKey': getattr(c, 'inchikey', ''),
+                    'XLogP': getattr(c, 'xlogp', ''),
+                    'H_Bond_Donor': getattr(c, 'h_bond_donor_count', ''),
+                    'H_Bond_Acceptor': getattr(c, 'h_bond_acceptor_count', ''),
+                    'Rotatable_Bonds': getattr(c, 'rotatable_bond_count', ''),
+                    'TPSA': getattr(c, 'tpsa', ''),
+                    'Complexity': getattr(c, 'complexity', ''),
+                }
+            }
+            result['properties'] = {k: v for k, v in result['properties'].items() if v != '' and v is not None}
+            logger.info("PubChemPy: CID=%d, Formula=%s",
+                        result['cid'], result['properties'].get('Molecular_Formula', 'N/A'))
+            return result
+        except Exception as e:
+            raise RuntimeError(f"PubChemPy failed: {e}") from e
+
     def fetch_pubchem_data(self) -> Dict[str, Any]:
         logger.info("Step 1: Fetching data from PubChem...")
         try:
-            url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{self.pubchem_cid}/JSON"
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+            # Primary: try PubChemPy (richer data, same API but better parsing)
+            try:
+                result = self._fetch_pubchem_via_pubchempy()
+                self.raw_data['pubchem'] = result
+                return result
+            except Exception as py_err:
+                logger.info("PubChemPy unavailable (%s), trying direct REST API...", py_err)
+
+            # Secondary: try NCBI E-utilities (often works when PUG-REST is IP-blocked)
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LuteolinAnalyzer/1.0"}
+            eutils_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pccompound&id={self.pubchem_cid}&retmode=json"
+            eu_response = requests.get(eutils_url, headers=headers, timeout=30)
+            eu_response.raise_for_status()
+            eu_data = eu_response.json()
+            uids = eu_data.get('result', {}).get('uids', [])
+            if not uids:
+                raise ValueError("E-utilities returned no compound data")
+            summary = eu_data['result'][uids[0]]
+            result = {
+                'cid': self.pubchem_cid,
+                'name': self.compound_name,
+                'name_cn': self.compound_name_cn,
+                'fetch_time': datetime.now().isoformat(),
+                'source': 'eutils',
+                'properties': {
+                    'Molecular_Formula': summary.get('molecularformula', ''),
+                    'Molecular_Weight': float(summary.get('molecularweight', 0)),
+                    'Canonical_SMILES': summary.get('canonicalsmiles', ''),
+                    'InChIKey': summary.get('inchikey', ''),
+                }
+            }
+            self.raw_data['pubchem'] = result
+            logger.info("E-utilities: CID=%d, Formula=%s, Weight=%s",
+                        result['cid'], result['properties']['Molecular_Formula'],
+                        result['properties']['Molecular_Weight'])
+            return result
             compound = data['PC_Compounds'][0]
             props = compound.get('props', [])
             result = {
@@ -124,7 +209,7 @@ class LuteolinDataCollector:
                 "/property/CanonicalSMILES,IsomericSMILES,MolecularFormula,"
                 "MolecularWeight,InChI,InChIKey/JSON"
             )
-            smiles_response = requests.get(smiles_url, timeout=30)
+            smiles_response = requests.get(smiles_url, headers=headers, timeout=30)
             if smiles_response.status_code == 200:
                 smiles_data = smiles_response.json()
                 props = smiles_data.get('PropertyTable', {}).get('Properties', [{}])[0]
@@ -140,7 +225,7 @@ class LuteolinDataCollector:
                         result['cid'], result['properties'].get('Molecular_Formula', 'N/A'),
                         result['properties'].get('Molecular_Weight', 'N/A'))
         except Exception as e:
-            logger.warning("PubChem network error: %s, using offline data", e)
+            logger.info("PubChem network error (offline data will be used): %s", e)
             self.raw_data['pubchem'] = self.offline_compound.copy()
             self.raw_data['pubchem']['fetch_time'] = datetime.now().isoformat()
             logger.info("Offline data loaded successfully")
@@ -158,6 +243,11 @@ class LuteolinDataCollector:
             headers = {'Accept': 'application/json'}
             response = requests.get(molecule_url, headers=headers, timeout=30)
             response.raise_for_status()
+            # Verify response is actually JSON (PubChem may be blocked/redirected)
+            ct = response.headers.get("Content-Type", "")
+            if "json" not in ct and not response.text.strip().startswith("{"):
+                raise ValueError(f"PubChem returned non-JSON response (got {len(response.text)} bytes HTML). "
+                                f"PubChem may be blocked on this network; offline data will be used.")
             data = response.json()
 
             chembl_id = 'CHEMBL151'

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import logging
 import html
@@ -317,6 +317,13 @@ class OutputGenerator:
 </body>
 </html>'''
 
+
+        # Inject 3D knowledge graph
+        kg_html = self._build_3d_kg_viewer_html(report)
+        if kg_html:
+            html_content = html_content.replace('<h2>物种分布</h2>',
+                '<h2>知识图谱 3D 交互</h2>' + chr(10) + kg_html + '<h2>物种分布</h2>')
+
         dashboard_path = os.path.join(_BASE_DIR, "output_dashboard.html")
         with open(dashboard_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -328,6 +335,66 @@ class OutputGenerator:
         logger.info("Report HTML generated: %s", report_path)
 
         return dashboard_path
+
+
+    def _build_3d_kg_viewer_html(self, report) -> str:
+        kg = report.get("knowledge_graph_summary", {})
+        graph_data = kg.get("graph", {})
+        nodes = graph_data.get("nodes", [])
+        edges = graph_data.get("edges", [])
+        if not nodes:
+            return ""
+        import json, math
+        nlist = [{"id": str(n), "group": 1} for n in nodes[:50]]
+        elist = []
+        for e in edges[:100]:
+            if isinstance(e, (list, tuple)) and len(e) >= 2:
+                elist.append({"source": str(e[0]), "target": str(e[1])})
+        nj = json.dumps(nlist); lj = json.dumps(elist)
+        s = []
+        s.append("<div id=\"kg-3d-viewer\" class=\"viewer-3d\" style=\"height:500px\"></div>")
+        s.append("<p class=\"viewer-note\">3D Knowledge Graph. Drag to rotate, scroll to zoom.</p>")
+        s.append("<script src=\"https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js\"></script>")
+        s.append("<script src=\"https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js\"></script>")
+        s.append("<script>")
+        s.append("(function(){")
+        s.append("var el=document.getElementById(\"kg-3d-viewer\");")
+        s.append("var w=el.clientWidth||700,h=500;")
+        s.append("var scene=new THREE.Scene();scene.background=new THREE.Color(0xffffff);")
+        s.append("var cam=new THREE.PerspectiveCamera(45,w/h,1,1000);cam.position.set(0,0,80);")
+        s.append("var rnd=new THREE.WebGLRenderer({antialias:true});rnd.setSize(w,h);")
+        s.append("el.appendChild(rnd.domElement);")
+        s.append("var ctrl=new THREE.OrbitControls(cam,rnd.domElement);ctrl.enableDamping=true;")
+        s.append("var nd=" + nj + ";var ld=" + lj + ";")
+        s.append("var nm={};var nc=nd.length;")
+        s.append("nd.forEach(function(n,i){")
+        s.append("var phi=Math.acos(-1+2*(i+0.5)/nc);var theta=Math.sqrt(nc*Math.PI)*phi;var r=25;")
+        s.append("n.x=r*Math.cos(theta)*Math.sin(phi);n.y=r*Math.sin(theta)*Math.sin(phi);n.z=r*Math.cos(phi);")
+        s.append("nm[n.id]=n;")
+        s.append("var g=new THREE.SphereGeometry(0.6,16,16);var m=new THREE.MeshPhongMaterial({color:0x2e86c1});")
+        s.append("var sp=new THREE.Mesh(g,m);sp.position.set(n.x,n.y,n.z);scene.add(sp);")
+        s.append("var canvas=document.createElement(\"canvas\");canvas.width=256;canvas.height=64;")
+        s.append("var ctx=canvas.getContext(\"2d\");ctx.fillStyle=\"#1a5276\";ctx.font=\"bold 20px Arial\";ctx.textAlign=\"center\";")
+        s.append("ctx.fillText(n.id.substring(0,20),128,32);")
+        s.append("var tex=new THREE.CanvasTexture(canvas);var smat=new THREE.SpriteMaterial({map:tex});")
+        s.append("var sprite=new THREE.Sprite(smat);sprite.position.set(n.x,n.y+1.5,n.z);sprite.scale.set(8,2,1);")
+        s.append("scene.add(sprite);")
+        s.append("});")
+        s.append("ld.forEach(function(l){")
+        s.append("var a=nm[l.source],b=nm[l.target];if(!a||!b)return;")
+        s.append("var pts=[new THREE.Vector3(a.x,a.y,a.z),new THREE.Vector3(b.x,b.y,b.z)];")
+        s.append("var g2=new THREE.BufferGeometry().setFromPoints(pts);")
+        s.append("var m2=new THREE.LineBasicMaterial({color:0x2e86c1,transparent:true,opacity:0.25});")
+        s.append("scene.add(new THREE.Line(g2,m2));")
+        s.append("});")
+        s.append("scene.add(new THREE.AmbientLight(0x404040));")
+        s.append("var dl=new THREE.DirectionalLight(0xffffff,0.8);dl.position.set(10,20,30);scene.add(dl);")
+        s.append("function anim(){requestAnimationFrame(anim);ctrl.update();rnd.render(scene,cam);}")
+        s.append("anim();")
+        s.append("window.addEventListener(\"resize\",function(){var w2=el.clientWidth||700;cam.aspect=w2/h;cam.updateProjectionMatrix();rnd.setSize(w2,h);});")
+        s.append("})();")
+        s.append("</script>")
+        return chr(10).join(s)
 
     def _build_molecule_viewer_html(self) -> str:
         pdb_path = os.path.abspath(os.path.join(self.output_dir, "..", "ligand", "structures", "luteolin.pdb"))

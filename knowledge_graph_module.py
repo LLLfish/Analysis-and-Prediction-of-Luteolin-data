@@ -38,8 +38,8 @@ _DGL_KE_AVAILABLE = False
 try:
     import dgl
     _DGL_KE_AVAILABLE = True
-except ImportError:
-    logger.warning("DGL not installed. DGL-KE operations will be unavailable.")
+except Exception:
+    logger.warning("DGL not installed or DLL load failed. DGL-KE operations will be unavailable.")
 
 
 class KnowledgeGraph:

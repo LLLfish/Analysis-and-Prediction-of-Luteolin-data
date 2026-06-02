@@ -69,17 +69,20 @@ class LigandFeatureExtractor:
             return None
         try:
             params = rdDistGeom.EmbedParameters()
-            params.numConfs = num_conformers
             params.randomSeed = 42
-            params.maxAttempts = 0
-            params.useRandomCoords = False
-            conf_ids = rdDistGeom.EmbedMultipleConfs(self.mol, num_conformers, params)
+            try:
+                params.maxAttempts = 0
+                params.useRandomCoords = False
+                conf_ids = rdDistGeom.EmbedMultipleConfs(self.mol, num_conformers, params)
+            except AttributeError:
+                logger.info("Falling back to legacy ETKDG conformer generation")
+                conf_ids = rdDistGeom.EmbedMultipleConfs(self.mol, num_conformers, 0, 42, True, False)
             if len(conf_ids) < 1:
-                logger.warning("No conformers generated with ETKDGv3, trying legacy ETKDG")
+                logger.warning("No conformers generated with ETKDG, trying with random coords")
                 try:
                     conf_ids = rdDistGeom.EmbedMultipleConfs(self.mol, num_conformers, 42)
                 except Exception:
-                    logger.error("Legacy conformer generation also failed")
+                    logger.error("Conformer generation also failed")
                     return None
             AllChem.MMFFOptimizeMoleculeConfs(self.mol)
             self.mol_3d = Chem.Mol(self.mol)
@@ -111,7 +114,11 @@ class LigandFeatureExtractor:
             return {}
         fps = {}
         try:
-            morgan = AllChem.GetMorganFingerprintAsBitVect(self.mol, 2, nBits=2048)
+            try:
+                mg = AllChem.MorganGenerator(radius=2, numBits=2048)
+                morgan = mg.GetFingerprint(self.mol)
+            except AttributeError:
+                morgan = AllChem.GetMorganFingerprintAsBitVect(self.mol, 2, nBits=2048)
             arr = np.zeros((1,), dtype=np.int8)
             DataStructs.ConvertToNumpyArray(morgan, arr)
             fps['morgan'] = arr
@@ -194,12 +201,18 @@ class LigandFeatureExtractor:
             return None
         try:
             filepath = os.path.join(self.output_dir, "structures", filename)
+            conf_id = -1
+            try:
+                conf = mol.GetConformer(0)
+                conf_id = conf.GetId()
+            except Exception:
+                pass
             if filename.lower().endswith(".sdf"):
-                writer = Chem.SDWriter(filepath)
-                writer.write(mol)
-                writer.close()
+                block = Chem.MolToMolBlock(mol, confId=conf_id)
             else:
-                Chem.MolToPDBFile(mol, filepath)
+                block = Chem.MolToPDBBlock(mol, confId=conf_id)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(block)
             logger.info("Saved 3D molecular structure: %s", filepath)
             return filepath
         except Exception as e:

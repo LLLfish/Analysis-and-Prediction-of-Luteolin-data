@@ -61,7 +61,9 @@ class DockingValidator:
             self.ligand = mol
             self.ligand_name = ligand_name
             self.ligand_pdb_path = os.path.join(self.output_dir, "structures", f"{ligand_name}.pdb")
-            Chem.MolToPDBFile(mol, self.ligand_pdb_path)
+            pdb_block = Chem.MolToPDBBlock(mol, confId=0)
+            with open(self.ligand_pdb_path, 'w', encoding='utf-8') as f:
+                f.write(pdb_block)
             self.ligand_pdbqt_path = self._convert_to_pdbqt(
                 self.ligand_pdb_path,
                 os.path.join(self.output_dir, "structures", f"{ligand_name}.pdbqt")
@@ -109,14 +111,43 @@ class DockingValidator:
         if not OPENBABEL_AVAILABLE:
             return None
         try:
+            import tempfile
+            import shutil
+            
+            has_chinese_input = any('\u4e00' <= c <= '\u9fff' for c in input_path)
+            has_chinese_output = any('\u4e00' <= c <= '\u9fff' for c in output_path)
+            has_chinese = has_chinese_input or has_chinese_output
+            
+            if has_chinese:
+                temp_dir = tempfile.mkdtemp()
+                ext = os.path.splitext(input_path)[1]
+                temp_input = os.path.join(temp_dir, f"temp_input{ext}")
+                shutil.copy2(input_path, temp_input)
+                actual_input = temp_input
+                actual_output = os.path.join(temp_dir, "temp_output.pdbqt")
+            else:
+                actual_input = input_path
+                actual_output = output_path
+                temp_dir = None
+            
             conversion = openbabel.OBConversion()
-            in_format = os.path.splitext(input_path)[1].lstrip(".").lower() or "pdb"
+            in_format = os.path.splitext(actual_input)[1].lstrip(".").lower() or "pdb"
             conversion.SetInAndOutFormats(in_format, "pdbqt")
             molecule = openbabel.OBMol()
-            if not conversion.ReadFile(molecule, input_path):
+            if not conversion.ReadFile(molecule, actual_input):
+                if temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
                 return None
             molecule.AddHydrogens()
-            conversion.WriteFile(molecule, output_path)
+            if not conversion.WriteFile(molecule, actual_output):
+                if temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                return None
+            
+            if temp_dir:
+                shutil.copy2(actual_output, output_path)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            
             return output_path if os.path.exists(output_path) else None
         except Exception as e:
             logger.warning("Open Babel conversion failed: %s", e)

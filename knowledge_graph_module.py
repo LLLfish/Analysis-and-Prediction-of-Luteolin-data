@@ -34,12 +34,7 @@ try:
 except ImportError:
     logger.warning("PyKEEN not installed. KG embedding training will be unavailable.")
 
-_DGL_KE_AVAILABLE = False
-try:
-    import dgl
-    _DGL_KE_AVAILABLE = True
-except Exception:
-    logger.warning("DGL not installed or DLL load failed. DGL-KE operations will be unavailable.")
+
 
 
 class KnowledgeGraph:
@@ -154,25 +149,6 @@ class KnowledgeGraph:
                 f.write(f"{head}\t{relation}\t{tail}\n")
         logger.info("Saved knowledge graph triples: %s", filepath)
         return filepath
-
-    def to_dgl_graph(self) -> Optional[Any]:
-        if not _DGL_KE_AVAILABLE or self.graph is None:
-            return None
-        try:
-            nodes = list(self.graph.nodes())
-            node_to_id = {node: idx for idx, node in enumerate(nodes)}
-            src = []
-            dst = []
-            for u, v in self.graph.edges():
-                src.append(node_to_id[u])
-                dst.append(node_to_id[v])
-            dgl_graph = dgl.graph((src, dst), num_nodes=len(nodes))
-            logger.info("Converted knowledge graph to DGL graph: %d nodes, %d edges", len(nodes), len(src))
-            return dgl_graph
-        except Exception as e:
-            logger.error("DGL graph conversion failed: %s", e)
-            return None
-
 
 class KGEmbedder:
     def __init__(self, embedding_dim: int = 64, output_dir: str = ""):

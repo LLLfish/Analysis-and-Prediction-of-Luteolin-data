@@ -23,12 +23,7 @@ try:
 except ImportError:
     logger.warning("RDKit not installed. Ligand feature extraction will be limited.")
 
-_DEEPCHEM_AVAILABLE = False
-try:
-    import deepchem as dc
-    _DEEPCHEM_AVAILABLE = True
-except ImportError:
-    logger.warning("DeepChem not installed. Some features will be unavailable.")
+
 
 
 class LigandFeatureExtractor:
@@ -128,22 +123,7 @@ class LigandFeatureExtractor:
             logger.error("Fingerprint computation failed: %s", e)
         return fps
 
-    def compute_deepchem_features(self) -> Dict[str, Any]:
-        if not _DEEPCHEM_AVAILABLE or self.mol is None:
-            return {}
-        try:
-            smiles = Chem.MolToSmiles(Chem.RemoveHs(self.mol))
-            circular = dc.feat.CircularFingerprint(size=1024)
-            features = circular.featurize([smiles])
-            deepchem_features = {
-                'circular_fingerprint_1024': features[0].tolist() if len(features) else []
-            }
-            self.features['deepchem'] = deepchem_features
-            logger.info("Computed DeepChem circular fingerprint")
-            return deepchem_features
-        except Exception as e:
-            logger.error("DeepChem feature computation failed: %s", e)
-            return {}
+    
 
     def generate_molecular_graph(self) -> Optional[Dict[str, Any]]:
         if self.mol is None:
@@ -238,7 +218,6 @@ class LigandFeatureExtractor:
         self.generate_3d_conformation()
         self.compute_descriptors()
         self.compute_fingerprints()
-        self.compute_deepchem_features()
         self.generate_molecular_graph()
         self.visualize_molecule("luteolin_2d.png")
         self.export_3d_structure("luteolin.pdb")

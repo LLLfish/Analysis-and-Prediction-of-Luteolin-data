@@ -28,12 +28,7 @@ try:
 except ImportError:
     logger.warning("RDKit not installed. 3D molecule processing will be limited.")
 
-DEEPCHEM_AVAILABLE = False
-try:
-    import deepchem as dc
-    DEEPCHEM_AVAILABLE = True
-except ImportError:
-    logger.warning("DeepChem not installed. Advanced CNN features will be unavailable.")
+
 
 
 class CNN3D(nn.Module):

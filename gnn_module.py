@@ -16,8 +16,6 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TORCH_AVAILABLE = False
 try:
     import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
     TORCH_AVAILABLE = True
 except ImportError:
     logger.warning("PyTorch not installed. GNN features will be limited.")
@@ -29,14 +27,7 @@ try:
 except ImportError:
     logger.warning("NetworkX not installed. Graph operations will be limited.")
 
-TORCH_GEOMETRIC_AVAILABLE = False
-try:
-    import torch_geometric.typing
-    from torch_geometric.nn import GCNConv, GATConv, SAGEConv
-    from torch_geometric.data import Data
-    TORCH_GEOMETRIC_AVAILABLE = True
-except (ImportError, Exception) as e:
-    logger.warning("PyTorch Geometric not available (%s). GNN operations will be limited.", type(e).__name__)
+
 
 GENSIM_AVAILABLE = False
 try:
@@ -45,36 +36,6 @@ try:
 except ImportError:
     GENSIM_AVAILABLE = False
     logger.warning("Gensim not installed. Node2Vec will be unavailable.")
-
-
-class GNNLayer(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.conv = GCNConv(in_dim, out_dim)
-        self.bn = nn.BatchNorm1d(out_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, edge_index):
-        x = self.conv(x, edge_index)
-        x = self.bn(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        return x
-
-
-class GNNModel(nn.Module):
-    def __init__(self, in_dim, hidden_dim=128, out_dim=64, num_layers=3, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        self.layers.append(GNNLayer(in_dim, hidden_dim, dropout))
-        for _ in range(num_layers - 2):
-            self.layers.append(GNNLayer(hidden_dim, hidden_dim, dropout))
-        self.layers.append(GNNLayer(hidden_dim, out_dim, dropout))
-
-    def forward(self, x, edge_index):
-        for layer in self.layers:
-            x = layer(x, edge_index)
-        return x
 
 
 class GraphEncoder:
@@ -107,8 +68,6 @@ class GraphEncoder:
 
             logger.info("Encoded graph: %d nodes, %d edges", x.shape[0], edge_index.shape[1])
             result = {'x': x, 'edge_index': edge_index, 'graph': G}
-            if TORCH_GEOMETRIC_AVAILABLE:
-                result['pyg_data'] = Data(x=x, edge_index=edge_index)
             return result
         except Exception as e:
             logger.error("Graph encoding failed: %s", e)

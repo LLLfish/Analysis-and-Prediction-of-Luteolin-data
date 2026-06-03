@@ -2,7 +2,6 @@
 import json
 import logging
 import re
-import shutil
 import subprocess
 import numpy as np
 from typing import Dict, List, Optional, Any
@@ -31,15 +30,6 @@ try:
     BIOPYTHON_AVAILABLE = True
 except ImportError:
     pass
-
-OPENBABEL_AVAILABLE = False
-try:
-    from openbabel import openbabel
-    from openbabel import pybel
-    OPENBABEL_AVAILABLE = True
-except ImportError:
-    OPENBABEL_AVAILABLE = False
-    logger.warning("Open Babel not installed. Format conversion will be unavailable.")
 
 
 class DockingValidator:
@@ -74,9 +64,11 @@ class DockingValidator:
             self.ligand = mol
             self.ligand_name = ligand_name
             self.ligand_pdb_path = os.path.join(self.output_dir, "structures", f"{ligand_name}.pdb")
-            Chem.MolToPDBFile(mol, self.ligand_pdb_path)
+            pdb_block = Chem.MolToPDBBlock(mol)
+            with open(self.ligand_pdb_path, 'w', encoding='utf-8') as f:
+                f.write(pdb_block)
             self.ligand_pdbqt_path = None
-            # Generate PDBQT via RDKit (bypasses OpenBabel PDB issues)
+            # Generate PDBQT via RDKit
             if RDKIT_AVAILABLE:
                 try:
                     pdbqt_path = os.path.join(self.output_dir, "structures", f"{ligand_name}.pdbqt")
@@ -90,7 +82,7 @@ class DockingValidator:
             return False
 
     def _write_rdkit_mol_to_pdbqt(self, mol, out_path):
-        """Write ligand PDBQT matching OpenBabel column format for Vina compatibility."""
+        """Write ligand PDBQT for Vina compatibility."""
         mol = Chem.AddHs(mol, addCoords=True)
         try: AllChem.ComputeGasteigerCharges(mol)
         except Exception: pass
@@ -150,7 +142,9 @@ class DockingValidator:
         if not RDKIT_AVAILABLE:
             return None
         try:
-            mol = Chem.MolFromPDBFile(pdb_file, removeHs=False, sanitize=False)
+            with open(pdb_file, "r", encoding="utf-8", errors="ignore") as f:
+                pdb_text = f.read()
+            mol = Chem.MolFromPDBBlock(pdb_text, removeHs=False, sanitize=False)
             if mol is None:
                 return None
             to_remove = []
@@ -202,9 +196,7 @@ class DockingValidator:
             if protein_pdb.lower().endswith(".pdbqt"):
                 self.protein_pdbqt_path = self.protein_path
             else:
-                self.protein_pdbqt_path = self._convert_to_pdbqt(self.protein_path, out_pdbqt)
-                if self.protein_pdbqt_path is None and RDKIT_AVAILABLE:
-                    self.protein_pdbqt_path = self._write_protein_pdbqt_via_rdkit(self.protein_path, out_pdbqt)
+                self.protein_pdbqt_path = self._write_protein_pdbqt_via_rdkit(self.protein_path, out_pdbqt)
             from Bio.PDB import PDBParser
             parser = PDBParser(QUIET=True)
             structure = parser.get_structure(protein_name, protein_pdb)
@@ -216,46 +208,13 @@ class DockingValidator:
             logger.warning("BioPython not installed, using PDB file directly")
             self.protein_path = os.path.abspath(protein_pdb)
             out_pdbqt = os.path.join(self.output_dir, "receptors", f"{protein_name}.pdbqt")
-            self.protein_pdbqt_path = self._convert_to_pdbqt(self.protein_path, out_pdbqt)
-            if self.protein_pdbqt_path is None and RDKIT_AVAILABLE:
-                self.protein_pdbqt_path = self._write_protein_pdbqt_via_rdkit(self.protein_path, out_pdbqt)
+            self.protein_pdbqt_path = self._write_protein_pdbqt_via_rdkit(self.protein_path, out_pdbqt)
             self.protein = protein_pdb
             self.protein_name = protein_name
             return True
         except Exception as e:
             logger.error("Protein preparation failed: %s", e)
             return False
-
-    def _convert_to_pdbqt(self, input_path: str, output_path: str):
-        if input_path.lower().endswith(".pdbqt"):
-            return input_path
-        if not OPENBABEL_AVAILABLE:
-            return None
-        try:
-            with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
-                pdb_text = f.read()
-            lines_to_keep = [l for l in pdb_text.splitlines()
-                           if l.startswith(("ATOM", "HETATM", "TER", "END", "CONECT"))]
-            if not lines_to_keep:
-                logger.warning("No ATOM records found in: %s", os.path.basename(input_path))
-                return None
-            cleaned = chr(10).join(lines_to_keep)
-            conv = openbabel.OBConversion()
-            in_fmt = os.path.splitext(input_path)[1].lstrip(".").lower() or "pdb"
-            conv.SetInAndOutFormats(in_fmt, "pdbqt")
-            mol = openbabel.OBMol()
-            if not conv.ReadString(mol, cleaned):
-                logger.debug("Open Babel ReadString failed for: %s", os.path.basename(input_path))
-                return None
-            mol.AddHydrogens()
-            conv.WriteFile(mol, output_path)
-            if os.path.exists(output_path):
-                logger.info("PDBQT created: %s (%d bytes)", os.path.basename(output_path), os.path.getsize(output_path))
-                return output_path
-            return None
-        except Exception as e:
-            logger.warning("Open Babel conversion failed for %s: %s", os.path.basename(input_path), e)
-            return None
 
     def parse_vina_output(self, stdout: str) -> List[Dict[str, Any]]:
         modes = []
@@ -324,9 +283,18 @@ class DockingValidator:
 
         vina_exe = self.vina_path if os.path.exists(self.vina_path) else None
         if not vina_exe or not self.protein_pdbqt_path or not self.ligand_pdbqt_path:
+            logger.debug("Vina skipped: exe=%s, protein_pdbqt=%s, ligand_pdbqt=%s",
+                         bool(vina_exe), bool(self.protein_pdbqt_path), bool(self.ligand_pdbqt_path))
             return self.estimate_binding_affinity()
         out_path = os.path.join(self.output_dir, "results", "vina_pose.pdbqt")
         log_path = os.path.join(self.output_dir, "results", "vina.log")
+
+        pdbqt_protein_size = os.path.getsize(self.protein_pdbqt_path) if os.path.exists(self.protein_pdbqt_path) else 0
+        pdbqt_ligand_size = os.path.getsize(self.ligand_pdbqt_path) if os.path.exists(self.ligand_pdbqt_path) else 0
+        logger.info("Vina input: protein_pdbqt=%s (%d bytes), ligand_pdbqt=%s (%d bytes)",
+                    os.path.basename(self.protein_pdbqt_path), pdbqt_protein_size,
+                    os.path.basename(self.ligand_pdbqt_path), pdbqt_ligand_size)
+
         command = [
             vina_exe,
             "--receptor", self.protein_pdbqt_path,
@@ -337,6 +305,7 @@ class DockingValidator:
             "--num_modes", str(num_modes),
             "--out", out_path,
         ]
+        logger.debug("Vina command: %s", " ".join(command))
         try:
             completed = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
             with open(log_path, "w", encoding="utf-8") as f:
@@ -345,11 +314,15 @@ class DockingValidator:
                 f.write(completed.stderr)
             modes = self.parse_vina_output(completed.stdout)
             if completed.returncode != 0 or not modes:
-                logger.warning("AutoDock Vina failed or returned no modes; using descriptor estimate.")
+                logger.warning("Vina failed: returncode=%d, modes=%d, stderr=%.200s",
+                               completed.returncode, len(modes),
+                               completed.stderr.strip() if completed.stderr else "(empty)")
                 fallback = self.estimate_binding_affinity()
                 fallback["vina_returncode"] = completed.returncode
                 fallback["vina_log"] = log_path
                 return fallback
+            logger.info("Vina succeeded: %d modes, best affinity=%.3f",
+                        len(modes), modes[0]["affinity"])
             return {
                 "status": "vina",
                 "method": "autodock_vina",

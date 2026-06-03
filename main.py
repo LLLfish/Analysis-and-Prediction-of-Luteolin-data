@@ -1,4 +1,4 @@
-﻿"""
+"""
 网络药理学混合人工智能框架 - 主脚本
 Integrated Network Pharmacology Hybrid AI Framework
 """
@@ -333,7 +333,7 @@ class NetworkPharmacologyFramework:
                 stats = self.kg_module.compute_graph_statistics()
                 graph_path = self.kg_module.save_graph()
                 triples_path = self.kg_module.save_triples()
-                dgl_available = self.kg_module.to_dgl_graph() is not None
+                
                 kg_embedding_status = {'attempted': False, 'available': False}
                 if os.environ.get("RUN_PYKEEN", "0") == "1" and self.kg_embedder and self.kg_module.triples:
                     kg_embedding_status['attempted'] = True
@@ -348,7 +348,7 @@ class NetworkPharmacologyFramework:
                         'edges': edges,
                         'graph_path': graph_path,
                         'triples_path': triples_path,
-                        'dgl_available': dgl_available,
+                        
                         'kg_embedding': kg_embedding_status
                     }
                 }

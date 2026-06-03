@@ -33,33 +33,19 @@ matplotlib>=3.5.0
 seaborn>=0.12.0
 
 # ============================================================================
+# Biological Data Processing (生物数据处理)
+# ============================================================================
+biopython>=1.79
+
+# ============================================================================
 # 可选依赖 (Optional Dependencies)
 # 以下包已用 try-except 保护，安装失败不影响主流程
 #
-# deepchem: 化学深度学习 (cnn_module.py, ligand_features.py 中可选使用)
-#   安装: pip install deepchem
-#   或: conda install -c conda-forge deepchem
-#
-# dgl: 深度图库 (knowledge_graph_module.py 中可选使用)
-#   安装: pip install dgl
-#   或: conda install -c dglteam dgl
-#
 # pykeen: 知识图谱嵌入训练 (knowledge_graph_module.py 中可选使用)
 #   安装: pip install pykeen
-#
-# biopython: PDB 结构解析 (docking_module.py 中可选使用)
-#   安装: pip install biopython
-#
-# openbabel: PDB/PDBQT 格式转换 (docking_module.py 中可选使用)
-#   建议: conda install -c conda-forge openbabel
-#
-# PyTorch Geometric 扩展 (图神经网络):
-#   pip install torch_geometric
-#   或从 https://data.pyg.org/whl/ 下载对应版本的预编译轮子
 # ============================================================================
 
 # ============================================================================
 # External Tools (外部工具 - 需要单独安装)
 # ============================================================================
 # AutoDock Vina: https://autodock-vina.readthedocs.io/
-# Open Babel: http://openbabel.org/

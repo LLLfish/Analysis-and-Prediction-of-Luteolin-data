@@ -451,6 +451,39 @@ def test_untrusted_canonical_dataclass_edges_and_results_are_rejected():
     assert checked_result.issues[0].code == "invalid_canonical_result"
 
 
+def test_untrusted_alias_mapping_hashes_remain_in_issue_provenance():
+    record = {
+        "protein_a": "AKT1",
+        "protein_b": "PIK3CA",
+        "ncbiTaxonId": 9606,
+        "score": 0.5,
+    }
+    mapping_one = {
+        "AKT1": {
+            "source_native_id": "9606.ENSP00000354587",
+            "taxonomy_id": 9606,
+            "verified": False,
+            "mapping_source": "unverified-source-one",
+        },
+        "PIK3CA": {
+            "source_native_id": "9606.ENSP00000263967",
+            "taxonomy_id": 9606,
+            "verified": False,
+            "mapping_source": "unverified-source-one",
+        },
+    }
+    mapping_two = {
+        alias: {**mapping, "mapping_source": "unverified-source-two"}
+        for alias, mapping in mapping_one.items()
+    }
+    first = canonicalize_ppi([record], source_kind="legacy_unverified", alias_mappings=mapping_one)
+    second = canonicalize_ppi([record], source_kind="legacy_unverified", alias_mappings=mapping_two)
+
+    issue_hashes = getattr(first.issues[0], "mapping_hashes", ())
+    assert issue_hashes == (canonical_json_sha256(mapping_one["AKT1"]),)
+    assert first.provenance_sha256 != second.provenance_sha256
+
+
 def test_rebuilding_knowledge_graph_replaces_previous_ppi_state(tmp_path):
     first = canonicalize_ppi([{
         "stringId_A": "9606.ENSP00000000001",

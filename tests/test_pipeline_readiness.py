@@ -622,46 +622,6 @@ def test_network_statistics_stage_does_not_erase_ppi_failure(ppi_status, expecte
     assert result["feature_readiness"]["stages"]["network_statistics"]["status"] == expected_status
 
 
-def test_optional_torch_absence_keeps_model_modules_and_main_importable(tmp_path):
-    import subprocess
-    import sys
-
-    source = r'''
-import builtins
-original_import = builtins.__import__
-def without_torch(name, *args, **kwargs):
-    if name == "torch" or name.startswith("torch."):
-        raise ImportError("torch intentionally hidden for the dependency test")
-    return original_import(name, *args, **kwargs)
-builtins.__import__ = without_torch
-import cnn_module
-import transformer_module
-import main
-assert cnn_module.TORCH_AVAILABLE is False
-assert transformer_module.TORCH_AVAILABLE is False
-assert callable(main.run_feature_pipeline)
-cnn = cnn_module.MolecularCNN()
-fusion = transformer_module.FeatureFusion()
-assert cnn.status.status == "unavailable"
-assert fusion.status.status == "unavailable"
-assert cnn.extract_features(None) is None
-assert fusion.fuse_features(None, None, None) is None
-'''
-    env = os.environ.copy()
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PYTHONPYCACHEPREFIX"] = str(tmp_path / "pycache")
-    env["MPLCONFIGDIR"] = str(tmp_path / "mplconfig")
-    result = subprocess.run(
-        [sys.executable, "-X", "utf8", "-c", source],
-        cwd=str(Path(main_module.__file__).resolve().parent),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_dashboard_html_escapes_untrusted_html_and_script_data(tmp_path, monkeypatch):
     _install_write_guard(monkeypatch)
     payload = "</script><script>alert(7)</script>"

@@ -5,8 +5,9 @@ import csv
 from dataclasses import replace
 import json
 import math
+from pathlib import Path
 
-from main import NetworkPharmacologyFramework
+from main import NetworkAnalyzer, NetworkPharmacologyFramework
 from knowledge_graph_module import KnowledgeGraph
 from data_contracts import (
     CanonicalPpiEdge,
@@ -518,3 +519,33 @@ def test_rebuilding_knowledge_graph_replaces_previous_ppi_state(tmp_path):
     }
     assert len(graph.triples) == 1
     assert graph.ppi_contract["semantic_sha256"] == second.semantic_sha256
+
+
+def test_real_network_analyzer_metrics_round_trip_through_framework_json(tmp_path):
+    dataset = _dataset([ONLINE_EDGE], ppi_source_kind="synthetic_test")
+    framework = _framework(tmp_path, "real-analyzer")
+    framework.output_dir = str(tmp_path / "saved-results")
+    framework.gnn_analyzer = NetworkAnalyzer(output_dir=str(tmp_path / "real-network"))
+    Path(framework.output_dir).mkdir(parents=True, exist_ok=True)
+
+    features = framework.run_feature_extraction(dataset)
+    metric_maps = [
+        value for value in features["gnn"]["centrality"].values()
+        if isinstance(value, dict)
+    ]
+    assert features["gnn"]["num_edges"] == 1
+    assert any(isinstance(key, tuple) for metric in metric_maps for key in metric)
+
+    saved_path = framework.save_results()
+    assert saved_path
+    with open(saved_path, "r", encoding="utf-8") as stream:
+        saved = json.load(stream)
+    saved_metrics = saved["results"]["feature_extraction"]["gnn"]["centrality"]
+    encoded_ids = [
+        key
+        for metric in saved_metrics.values()
+        if isinstance(metric, dict)
+        for key in metric
+    ]
+    assert encoded_ids
+    assert all(json.loads(key)[0] == 9606 for key in encoded_ids)

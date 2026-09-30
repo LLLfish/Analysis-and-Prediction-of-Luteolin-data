@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import hashlib
+import ntpath
+import re
 import threading
 from copy import deepcopy
 from dataclasses import asdict
@@ -47,7 +49,9 @@ except ImportError:
 def build_feature_cache_key(
     protein: ProteinRecord,
     *,
+    model_id: str,
     model_revision: str,
+    model_artifact_sha256: str,
     pooling_policy: str,
     entity_version: str,
     entity_bundle_hash: str,
@@ -56,7 +60,9 @@ def build_feature_cache_key(
     payload = {
         "identity": [protein.taxonomy_id, protein.accession],
         "sequence_sha256": protein.sequence_sha256,
+        "model_id": model_id,
         "model_revision": model_revision,
+        "model_artifact_sha256": model_artifact_sha256,
         "pooling_policy": pooling_policy,
         "entity_version": entity_version,
         "entity_bundle_hash": entity_bundle_hash,
@@ -69,7 +75,7 @@ def validate_sequence_identity(
     protein: ProteinRecord,
     bundle: Dict[str, Any],
     *,
-    allow_synthetic: bool = False,
+    test_only: bool = False,
 ) -> StageStatus:
     """Require the exact shared protein record from a source-verified entity bundle."""
     if type(protein) is not ProteinRecord:
@@ -99,7 +105,7 @@ def validate_sequence_identity(
         return StageStatus("invalid_sequence", protein.sequence_status_reason or "sequence_invalid")
     if protein.sequence_status != "verified" or protein.identity_status != "verified":
         return StageStatus("unverified_source", protein.sequence_status_reason or "protein_identity_unverified")
-    if protein.source_kind == "synthetic_test" and not allow_synthetic:
+    if protein.source_kind == "synthetic_test" and not test_only:
         return StageStatus("unverified_source", "synthetic_test_source_not_allowed_for_runtime")
     if not protein.accession or type(protein.taxonomy_id) is not int:
         return StageStatus("unverified_source", "protein_accession_or_taxonomy_missing")
@@ -142,6 +148,7 @@ class ProteinFeatureExtractor:
         model=None,
         tokenizer=None,
         cache_dir: Optional[str] = None,
+        test_only: bool = False,
     ):
         if not output_dir:
             output_dir = os.path.join(_BASE_DIR, "features", "protein")
@@ -152,13 +159,32 @@ class ProteinFeatureExtractor:
             raise ValueError("max_tokens must be a positive integer")
         self.max_tokens = max_tokens
         self.pooling_policy = _POOLING_POLICY
+        self.test_only = bool(test_only)
         self.device = self._get_device(device) if TORCH_AVAILABLE else "cpu"
         self.sequence = None
         self.protein_name = None
         self.features = {}
-        self.esm_model = model
-        self.esm_tokenizer = tokenizer
-        self.model_revision = model_revision or self._model_revision(model)
+        self.model_id = esm_model_name
+        self.esm_model = model if self.test_only else None
+        self.esm_tokenizer = tokenizer if self.test_only else None
+        self._runtime_model_provenance = None
+        self._test_provenance = (
+            "explicit offline test-only model/tokenizer injection; not pretrained evidence"
+            if self.test_only and model is not None and tokenizer is not None else None
+        )
+        self.model_revision = (
+            model_revision or self._model_revision(model) or "test-only-unpinned"
+            if self.test_only else None
+        )
+        self.model_artifact_sha256 = (
+            hashlib.sha256(
+                json.dumps(
+                    {"test_only": True, "model_id": self.model_id, "revision": self.model_revision},
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if self.test_only and model is not None and tokenizer is not None else None
+        )
         self._cache: Dict[str, FeatureResult] = {}
         self._feature_lock = threading.RLock()
         self._fallback_models = []
@@ -173,7 +199,12 @@ class ProteinFeatureExtractor:
         return revision if isinstance(revision, str) and revision else None
 
     @staticmethod
-    def _local_model_revision(model_dir: Path) -> Optional[str]:
+    def _local_model_provenance(
+        model_dir: Path,
+        *,
+        model_name: str,
+    ) -> Optional[Dict[str, str]]:
+        """Bind a local ESM snapshot revision to config, tokenizer, and weight bytes."""
         config_path = model_dir / "config.json"
         if not config_path.is_file():
             return None
@@ -182,21 +213,100 @@ class ProteinFeatureExtractor:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         revision = config.get("_commit_hash") if isinstance(config, dict) else None
-        if isinstance(revision, str) and revision:
-            return revision
-        weight_files = sorted(
-            path for path in model_dir.rglob("*")
-            if path.is_file() and path.name in {"pytorch_model.bin", "model.safetensors"}
-        )
-        if not weight_files:
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        if (
+            not isinstance(revision, str)
+            or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+            or not isinstance(model_type, str)
+            or model_type.lower() != "esm"
+            or not isinstance(model_name, str)
+            or not model_name.startswith("facebook/esm2_")
+        ):
             return None
-        digest = hashlib.sha256()
-        for path in [config_path, *weight_files]:
-            digest.update(path.relative_to(model_dir).as_posix().encode("utf-8"))
+
+        all_files = [path for path in model_dir.rglob("*") if path.is_file()]
+        tokenizer_files = sorted(
+            path for path in all_files
+            if path.name in {
+                "tokenizer.json", "vocab.txt", "tokenizer.model",
+                "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
+            }
+        )
+        tokenizer_core = {path.name for path in tokenizer_files} & {
+            "tokenizer.json", "vocab.txt", "tokenizer.model",
+        }
+        weight_files = sorted(
+            path for path in all_files
+            if path.name in {"pytorch_model.bin", "model.safetensors"}
+            or re.fullmatch(r"(?:pytorch_model-\d+-of-\d+\.bin|model-\d+-of-\d+\.safetensors)", path.name)
+        )
+        weight_indexes = sorted(
+            path for path in all_files
+            if path.name in {"pytorch_model.bin.index.json", "model.safetensors.index.json"}
+        )
+        if not tokenizer_core or not weight_files:
+            return None
+
+        def file_hash(path: Path) -> str:
+            digest = hashlib.sha256()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
-        return f"sha256:{digest.hexdigest()}"
+            return digest.hexdigest()
+
+        config_sha256 = file_hash(config_path)
+        tokenizer_manifest = {
+            path.relative_to(model_dir).as_posix(): file_hash(path)
+            for path in tokenizer_files
+        }
+        weight_manifest = {
+            path.relative_to(model_dir).as_posix(): file_hash(path)
+            for path in [*weight_files, *weight_indexes]
+        }
+        artifact_manifest = {
+            "model_id": model_name,
+            "revision": revision,
+            "config_sha256": config_sha256,
+            "tokenizer": tokenizer_manifest,
+            "weights": weight_manifest,
+        }
+        canonical_json = lambda value: json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return {
+            "model_id": model_name,
+            "revision": revision,
+            "config_sha256": config_sha256,
+            "tokenizer_sha256": hashlib.sha256(canonical_json(tokenizer_manifest)).hexdigest(),
+            "weights_sha256": hashlib.sha256(canonical_json(weight_manifest)).hexdigest(),
+            "model_artifact_sha256": hashlib.sha256(canonical_json(artifact_manifest)).hexdigest(),
+        }
+
+    @classmethod
+    def _local_model_revision(cls, model_dir: Path) -> Optional[str]:
+        """Compatibility helper returning only a byte-bound local ESM revision."""
+        provenance = cls._local_model_provenance(
+            model_dir, model_name="facebook/esm2_t6_8M_UR50D",
+        )
+        return provenance["revision"] if provenance else None
+
+    @staticmethod
+    def _assert_complete_esm_weights(loading_info: Any) -> None:
+        if not isinstance(loading_info, dict):
+            raise ValueError("model loader did not return checkpoint loading diagnostics")
+        missing = list(loading_info.get("missing_keys", []))
+        mismatched = list(loading_info.get("mismatched_keys", []))
+        errors = list(loading_info.get("error_msgs", []))
+        unexpected = [
+            str(key) for key in loading_info.get("unexpected_keys", [])
+            if not str(key).startswith(("lm_head.", "contact_head."))
+        ]
+        if missing or mismatched or errors or unexpected:
+            raise ValueError(
+                "local ESM checkpoint is incomplete or incompatible "
+                f"(missing={len(missing)}, mismatched={len(mismatched)}, "
+                f"unexpected={len(unexpected)}, errors={len(errors)})"
+            )
 
     def add_fallback_model(self, model_name: str, modelscope_name: str = ""):
         if model_name not in self._fallback_models and model_name != self.esm_model_name:
@@ -216,10 +326,8 @@ class ProteinFeatureExtractor:
 
     def load_esm_model(self, timeout: int = 120) -> bool:
         """Load only a complete local model snapshot; never download or fall back online."""
-        if self.esm_model is not None and self.esm_tokenizer is not None:
-            if self.model_revision is None:
-                self.model_revision = self._model_revision(self.esm_model)
-            return self.model_revision is not None
+        if self.test_only:
+            return self.esm_model is not None and self.esm_tokenizer is not None
         if not _TRANSFORMERS_AVAILABLE:
             logger.warning("Transformers library not installed; ESM is unavailable")
             return False
@@ -227,24 +335,47 @@ class ProteinFeatureExtractor:
             logger.warning("PyTorch not installed; ESM is unavailable")
             return False
         local_dir = Path(self._model_cache_dir) / self.esm_model_name.replace("/", "--")
-        revision = self._local_model_revision(local_dir)
-        if revision is None:
+        provenance = self._local_model_provenance(
+            local_dir, model_name=self.esm_model_name,
+        )
+        if provenance is None:
             logger.info("No revision-verifiable local ESM snapshot at %s", local_dir)
             return False
         try:
             tokenizer = AutoTokenizer.from_pretrained(str(local_dir), local_files_only=True)
-            model = AutoModel.from_pretrained(str(local_dir), local_files_only=True)
+            loaded_model = AutoModel.from_pretrained(
+                str(local_dir), local_files_only=True, output_loading_info=True,
+            )
+            if not isinstance(loaded_model, tuple) or len(loaded_model) != 2:
+                raise ValueError("local model loader did not return loading diagnostics")
+            model, loading_info = loaded_model
+            self._assert_complete_esm_weights(loading_info)
+            loaded_revision = self._model_revision(model)
+            if loaded_revision is not None and loaded_revision != provenance["revision"]:
+                raise ValueError("loaded model revision does not match local snapshot config")
             model.to(self.device)
             model.eval()
+            after_load = self._local_model_provenance(
+                local_dir, model_name=self.esm_model_name,
+            )
+            if after_load != provenance:
+                raise ValueError("local model snapshot changed while it was being loaded")
             self.esm_tokenizer = tokenizer
             self.esm_model = model
-            self.model_revision = revision
-            logger.info("Loaded local ESM snapshot %s at revision %s", self.esm_model_name, revision)
+            self.model_revision = provenance["revision"]
+            self.model_artifact_sha256 = provenance["model_artifact_sha256"]
+            self._runtime_model_provenance = provenance
+            logger.info(
+                "Loaded local ESM snapshot %s at revision %s with artifact %s",
+                self.esm_model_name, self.model_revision, self.model_artifact_sha256,
+            )
             return True
         except Exception as exc:
             self.esm_model = None
             self.esm_tokenizer = None
             self.model_revision = None
+            self.model_artifact_sha256 = None
+            self._runtime_model_provenance = None
             logger.warning("Local ESM snapshot is unavailable: %s", exc)
             return False
 
@@ -497,8 +628,8 @@ class ProteinFeatureExtractor:
         extractor.protein_name = None
         extractor.features = {}
 
-    @staticmethod
     def _result(
+        self,
         protein: ProteinRecord,
         bundle: Dict[str, Any],
         status: str,
@@ -520,9 +651,14 @@ class ProteinFeatureExtractor:
             entity_version=bundle.get("entity_version"),
             entity_bundle_hash=bundle.get("content_sha256"),
             source_kind=protein.source_kind,
+            model_id=self.model_id if model_revision else None,
             model_revision=model_revision,
+            model_artifact_sha256=(
+                self.model_artifact_sha256 if model_revision else None
+            ),
             pooling_policy=pooling_policy,
             cache_key=cache_key,
+            test_provenance=self._test_provenance if status == "test_only" else None,
         )
 
     def _extract_validated_record(
@@ -530,10 +666,12 @@ class ProteinFeatureExtractor:
         protein: ProteinRecord,
         bundle: Dict[str, Any],
         *,
-        allow_synthetic: bool,
+        test_only: bool,
     ) -> FeatureResult:
         self._clear_sample_state(self)
-        identity_status = validate_sequence_identity(protein, bundle, allow_synthetic=allow_synthetic)
+        if test_only != self.test_only:
+            return self._result(protein, bundle, "unverified_source", "test_only_mode_mismatch")
+        identity_status = validate_sequence_identity(protein, bundle, test_only=test_only)
         if identity_status.status != "ready":
             return self._result(protein, bundle, identity_status.status, identity_status.reason)
         sequence = protein.full_sequence or ""
@@ -545,15 +683,19 @@ class ProteinFeatureExtractor:
         if self.esm_model is None or self.esm_tokenizer is None:
             if not self.load_esm_model():
                 return self._result(protein, bundle, "unavailable", "revision_verified_local_esm_unavailable")
-        if not self.model_revision:
+        if not self.model_revision or not self.model_artifact_sha256:
             return self._result(protein, bundle, "unavailable", "esm_model_revision_unavailable")
+        if not test_only and not self._runtime_model_provenance:
+            return self._result(protein, bundle, "unavailable", "verified_local_model_provenance_unavailable")
 
         self.sequence = sequence
         self.protein_name = protein.accession
         pooling_policy = f"{self.pooling_policy}:max_tokens={self.max_tokens}"
         cache_key = build_feature_cache_key(
             protein,
+            model_id=self.model_id,
             model_revision=self.model_revision,
+            model_artifact_sha256=self.model_artifact_sha256,
             pooling_policy=pooling_policy,
             entity_version=bundle["entity_version"],
             entity_bundle_hash=bundle["content_sha256"],
@@ -573,8 +715,10 @@ class ProteinFeatureExtractor:
             )
         features = {"esm_embedding": embedding.astype(float).tolist()}
         self.features = deepcopy(features)
+        result_status = "test_only" if test_only else "ready"
         result = self._result(
-            protein, bundle, "ready", None,
+            protein, bundle, result_status,
+            "offline_test_only_mock_result" if test_only else None,
             model_revision=self.model_revision,
             pooling_policy=pooling_policy,
             cache_key=cache_key,
@@ -587,7 +731,7 @@ class ProteinFeatureExtractor:
         self,
         bundle_path: str,
         *,
-        allow_synthetic: bool = False,
+        test_only: bool = False,
     ) -> List[FeatureResult]:
         """Verify one entities.json and extract each source-bound protein independently."""
         from evidence_builder import load_entity_bundle
@@ -608,7 +752,7 @@ class ProteinFeatureExtractor:
                     ))
                     continue
                 results.append(self._extract_validated_record(
-                    protein, bundle, allow_synthetic=allow_synthetic,
+                    protein, bundle, test_only=test_only,
                 ))
             return results
 
@@ -617,7 +761,7 @@ class ProteinFeatureExtractor:
         protein: ProteinRecord,
         *,
         bundle_path: str,
-        allow_synthetic: bool = False,
+        test_only: bool = False,
     ) -> FeatureResult:
         """Extract only when the exact record is present in a verified source bundle."""
         from evidence_builder import load_entity_bundle
@@ -625,7 +769,7 @@ class ProteinFeatureExtractor:
         with self._feature_lock:
             bundle = load_entity_bundle(bundle_path, verify_sources=True)
             return self._extract_validated_record(
-                protein, bundle, allow_synthetic=allow_synthetic,
+                protein, bundle, test_only=test_only,
             )
 
     def predict_3d_structure_esmfold(self, sequence: str) -> Optional[str]:
@@ -645,7 +789,33 @@ class ProteinFeatureExtractor:
         }
 
     def save_features(self, filename: str = "protein_features.json") -> str:
-        filepath = os.path.join(self.output_dir, "embeddings", filename)
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or filename in {".", ".."}
+            or os.path.basename(filename) != filename
+            or ntpath.basename(filename) != filename
+            or os.path.isabs(filename)
+            or ntpath.isabs(filename)
+            or "/" in filename
+            or "\\" in filename
+            or any(character in filename for character in '<>:"|?*')
+            or filename.endswith((" ", "."))
+        ):
+            raise ValueError("filename must be a basename without path separators")
+        output_root = os.path.realpath(self.output_dir)
+        os.makedirs(output_root, exist_ok=True)
+        embeddings_dir = os.path.join(output_root, "embeddings")
+        resolved_embeddings_dir = os.path.realpath(embeddings_dir)
+        if os.path.normcase(os.path.commonpath((output_root, resolved_embeddings_dir))) != os.path.normcase(output_root):
+            raise ValueError("embeddings directory resolves outside the configured output root")
+        os.makedirs(embeddings_dir, exist_ok=True)
+        resolved_embeddings_dir = os.path.realpath(embeddings_dir)
+        if os.path.normcase(os.path.commonpath((output_root, resolved_embeddings_dir))) != os.path.normcase(output_root):
+            raise ValueError("embeddings directory resolves outside the configured output root")
+        filepath = os.path.realpath(os.path.join(resolved_embeddings_dir, filename))
+        if os.path.normcase(os.path.commonpath((resolved_embeddings_dir, filepath))) != os.path.normcase(resolved_embeddings_dir):
+            raise ValueError("feature path resolves outside the embeddings directory")
         data = {'protein': self.protein_name, 'features': self.features}
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)

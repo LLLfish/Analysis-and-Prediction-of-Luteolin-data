@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,15 +74,160 @@ def _extractor(tmp_path: Path, *, max_tokens: int = 8):
         model=_MockModel(),
         tokenizer=_MockTokenizer(),
         cache_dir=str(tmp_path / "model-cache"),
+        test_only=True,
     )
 
 
 def test_identity_bound_feature_contract_is_exposed():
+    assert "test_only" in inspect.signature(protein_features.ProteinFeatureExtractor).parameters
     assert callable(getattr(protein_features, "validate_sequence_identity", None))
     assert callable(getattr(protein_features.ProteinFeatureExtractor, "extract_from_bundle", None))
     assert callable(getattr(protein_features.ProteinFeatureExtractor, "extract_for_protein", None))
     assert getattr(data_contracts, "StageStatus", None) is not None
     assert getattr(data_contracts, "FeatureResult", None) is not None
+
+
+def test_feature_result_requires_verified_bundle_model_and_finite_embedding(tmp_path):
+    params = inspect.signature(data_contracts.FeatureResult).parameters
+    assert "model_artifact_sha256" in params
+    assert "model_id" in params
+    assert "test_provenance" in params
+
+    _, bundle = _bundle(tmp_path, sequence="ACDE")
+    record = data_contracts.ProteinRecord(**bundle["proteins"][0])
+    artifact_hash = hashlib.sha256(b"offline test snapshot").hexdigest()
+    pooling = "residue-mask-mean-v1:max_tokens=8"
+    cache_key = protein_features.build_feature_cache_key(
+        record,
+        model_id="mock/esm",
+        model_revision="mock-r1",
+        model_artifact_sha256=artifact_hash,
+        pooling_policy=pooling,
+        entity_version=bundle["entity_version"],
+        entity_bundle_hash=bundle["content_sha256"],
+    )
+    base = {
+        "reason": None,
+        "features": {"esm_embedding": [1.0, 2.0]},
+        "accession": record.accession,
+        "taxonomy_id": record.taxonomy_id,
+        "sequence_length": record.sequence_length,
+        "sequence_sha256": record.sequence_sha256,
+        "entity_version": bundle["entity_version"],
+        "entity_bundle_hash": bundle["content_sha256"],
+        "model_id": "mock/esm",
+        "model_revision": "mock-r1",
+        "model_artifact_sha256": artifact_hash,
+        "pooling_policy": pooling,
+        "cache_key": cache_key,
+    }
+
+    with pytest.raises(ValueError, match="synthetic|online"):
+        data_contracts.FeatureResult(
+            status="ready", source_kind="synthetic_test", **base,
+        )
+    with pytest.raises(ValueError, match="embedding"):
+        data_contracts.FeatureResult(
+            status="ready",
+            source_kind="online_snapshot",
+            **{**base, "features": {"esm_embedding": []}},
+        )
+    with pytest.raises(ValueError, match="embedding"):
+        data_contracts.FeatureResult(
+            status="ready",
+            source_kind="online_snapshot",
+            **{**base, "features": {"esm_embedding": [[1.0, 2.0]]}},
+        )
+    with pytest.raises(ValueError, match="embedding"):
+        data_contracts.FeatureResult(
+            status="ready",
+            source_kind="online_snapshot",
+            **{**base, "features": {"esm_embedding": [float("nan")]}},
+        )
+    with pytest.raises(ValueError, match="sequence_sha256"):
+        data_contracts.FeatureResult(
+            status="ready",
+            source_kind="online_snapshot",
+            **{**base, "sequence_sha256": "not-a-hash"},
+        )
+
+    mock_result = data_contracts.FeatureResult(
+        status="test_only",
+        reason="synthetic fixture/model mock",
+        features={"esm_embedding": [1.0, 2.0]},
+        accession=record.accession,
+        taxonomy_id=record.taxonomy_id,
+        sequence_length=record.sequence_length,
+        sequence_sha256=record.sequence_sha256,
+        entity_version=bundle["entity_version"],
+        entity_bundle_hash=bundle["content_sha256"],
+        source_kind="synthetic_test",
+        model_id="mock/esm",
+        model_revision="mock-r1",
+        model_artifact_sha256=artifact_hash,
+        pooling_policy=pooling,
+        cache_key=cache_key,
+        test_provenance="synthetic fixture plus deterministic mock model",
+    )
+    assert mock_result.status == "test_only"
+    assert mock_result.source_kind == "synthetic_test"
+
+
+def test_injected_model_and_arbitrary_revision_are_not_runtime_provenance(tmp_path):
+    pytest.importorskip("torch")
+    extractor = protein_features.ProteinFeatureExtractor(
+        output_dir=str(tmp_path / "features"),
+        esm_model_name="facebook/esm2_t6_8M_UR50D",
+        model_revision="arbitrary-user-revision",
+        model=_MockModel(),
+        tokenizer=_MockTokenizer(),
+        cache_dir=str(tmp_path / "model-cache"),
+    )
+
+    assert extractor.load_esm_model() is False
+    assert extractor.model_revision is None
+
+
+def test_local_snapshot_provenance_hashes_config_tokenizer_and_weights(tmp_path):
+    provenance_builder = getattr(
+        protein_features.ProteinFeatureExtractor, "_local_model_provenance", None,
+    )
+    assert callable(provenance_builder)
+    model_dir = tmp_path / "snapshot"
+    model_dir.mkdir()
+    revision = "a" * 40
+    (model_dir / "config.json").write_text(
+        json.dumps({"_commit_hash": revision, "model_type": "esm"}),
+        encoding="utf-8",
+    )
+    (model_dir / "tokenizer.json").write_text('{"vocab":{"A":1}}', encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"weights-v1")
+
+    first = provenance_builder(model_dir, model_name="facebook/esm2_t6_8M_UR50D")
+    (model_dir / "model.safetensors").write_bytes(b"weights-v2")
+    second = provenance_builder(model_dir, model_name="facebook/esm2_t6_8M_UR50D")
+
+    assert first["revision"] == second["revision"] == revision
+    assert first["config_sha256"] == second["config_sha256"]
+    assert first["tokenizer_sha256"] == second["tokenizer_sha256"]
+    assert first["weights_sha256"] != second["weights_sha256"]
+    assert first["model_artifact_sha256"] != second["model_artifact_sha256"]
+
+
+def test_partial_esm_checkpoint_loading_cannot_be_reported_as_pretrained():
+    validator = getattr(
+        protein_features.ProteinFeatureExtractor, "_assert_complete_esm_weights", None,
+    )
+    assert callable(validator)
+    validator({
+        "missing_keys": [], "mismatched_keys": [], "unexpected_keys": ["lm_head.decoder.weight"],
+        "error_msgs": [],
+    })
+    with pytest.raises(ValueError, match="incomplete or incompatible"):
+        validator({
+            "missing_keys": ["encoder.layer.0.weight"], "mismatched_keys": [],
+            "unexpected_keys": [], "error_msgs": [],
+        })
 
 
 def test_unbound_sequence_api_cannot_emit_protein_features(tmp_path):
@@ -101,11 +247,11 @@ def test_residue_pooling_excludes_cls_eos_and_padding_and_keeps_bundle_provenanc
     bundle_path, bundle = _bundle(tmp_path, sequence="ACD")
     extractor = _extractor(tmp_path)
 
-    results = extractor.extract_from_bundle(bundle_path, allow_synthetic=True)
+    results = extractor.extract_from_bundle(bundle_path, test_only=True)
 
     assert len(results) == 1
     result = results[0]
-    assert result.status == "ready"
+    assert result.status == "test_only"
     assert result.sequence_sha256 == bundle["proteins"][0]["sequence_sha256"]
     assert result.entity_version == bundle["entity_version"]
     assert result.entity_bundle_hash == bundle["content_sha256"]
@@ -121,11 +267,11 @@ def test_real_extraction_rejects_synthetic_source_unless_test_only_opt_in(tmp_pa
     extractor = _extractor(tmp_path)
 
     blocked = extractor.extract_from_bundle(bundle_path)
-    allowed_for_mock_test = extractor.extract_from_bundle(bundle_path, allow_synthetic=True)
+    allowed_for_mock_test = extractor.extract_from_bundle(bundle_path, test_only=True)
 
     assert blocked[0].status == "unverified_source"
     assert blocked[0].features == {}
-    assert allowed_for_mock_test[0].status == "ready"
+    assert allowed_for_mock_test[0].status == "test_only"
     assert allowed_for_mock_test[0].source_kind == "synthetic_test"
 
 
@@ -134,7 +280,7 @@ def test_nonstandard_residue_is_preserved_and_rejected_not_filtered(tmp_path):
     bundle_path, bundle = _bundle(tmp_path, sequence="ACDX")
     extractor = _extractor(tmp_path)
 
-    result = extractor.extract_from_bundle(bundle_path, allow_synthetic=True)[0]
+    result = extractor.extract_from_bundle(bundle_path, test_only=True)[0]
 
     assert bundle["proteins"][0]["raw_sequence"] == "ACDX"
     assert bundle["proteins"][0]["full_sequence"] == "ACDX"
@@ -150,7 +296,7 @@ def test_long_sequence_returns_unsupported_without_truncating_bundle_record(tmp_
     bundle_path, bundle = _bundle(tmp_path, sequence=sequence)
     extractor = _extractor(tmp_path, max_tokens=8)
 
-    result = extractor.extract_from_bundle(bundle_path, allow_synthetic=True)[0]
+    result = extractor.extract_from_bundle(bundle_path, test_only=True)[0]
 
     assert result.status == "unsupported_length"
     assert result.sequence_length == len(sequence)
@@ -169,6 +315,8 @@ def test_cache_key_separates_identity_sequence_model_revision_and_pooling_policy
     bundle_args = {
         "entity_version": bundle["entity_version"],
         "entity_bundle_hash": bundle["content_sha256"],
+        "model_id": "mock/esm",
+        "model_artifact_sha256": "f" * 64,
     }
     base = cache_key(
         record, model_revision="mock-r1", pooling_policy="residue-mask-mean-v1", **bundle_args,
@@ -189,11 +337,22 @@ def test_cache_key_separates_identity_sequence_model_revision_and_pooling_policy
         record,
         model_revision="mock-r1",
         pooling_policy="residue-mask-mean-v1",
+        model_id="mock/esm",
+        model_artifact_sha256="f" * 64,
         entity_version="entities-v2-aaaaaaaaaaaaaaaa",
         entity_bundle_hash="a" * 64,
     )
+    other_artifact = cache_key(
+        record,
+        model_revision="mock-r1",
+        pooling_policy="residue-mask-mean-v1",
+        model_id="mock/esm",
+        model_artifact_sha256="e" * 64,
+        entity_version=bundle["entity_version"],
+        entity_bundle_hash=bundle["content_sha256"],
+    )
 
-    assert len({base, other_model, other_policy, other_identity, other_bundle}) == 5
+    assert len({base, other_model, other_policy, other_identity, other_bundle, other_artifact}) == 6
 
 
 def test_cached_or_concurrent_extraction_does_not_leak_between_proteins(tmp_path):
@@ -205,8 +364,8 @@ def test_cached_or_concurrent_extraction_does_not_leak_between_proteins(tmp_path
     extractor = _extractor(tmp_path)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first_future = pool.submit(extractor.extract_from_bundle, first_path, allow_synthetic=True)
-        second_future = pool.submit(extractor.extract_from_bundle, second_path, allow_synthetic=True)
+        first_future = pool.submit(extractor.extract_from_bundle, first_path, test_only=True)
+        second_future = pool.submit(extractor.extract_from_bundle, second_path, test_only=True)
         first = first_future.result()[0]
         second = second_future.result()[0]
 

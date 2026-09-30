@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import ntpath
 import numpy as np
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -19,6 +20,17 @@ try:
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
 except ImportError:
+    torch = None
+    F = None
+
+    class _TorchUnavailableModule:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("PyTorch is required to construct Transformer models")
+
+    class _UnavailableNN:
+        Module = _TorchUnavailableModule
+
+    nn = _UnavailableNN()
     logger.warning("PyTorch not installed. Transformer features will be limited.")
 
 
@@ -100,13 +112,15 @@ class FeatureFusion:
         self.output_dir = os.path.abspath(output_dir)
         self.model = model
         self.weights_status = weights_status
-        self._verified_weights = False
-        self.status = __import__("data_contracts").StageStatus(
-            "skipped_untrained", "verified_trained_weights_not_loaded",
+        self.status = (
+            __import__("data_contracts").StageStatus("skipped_untrained", "verified_trained_weights_not_loaded")
+            if TORCH_AVAILABLE
+            else __import__("data_contracts").StageStatus("unavailable", "pytorch_unavailable")
         )
 
     def _has_verified_weights(self) -> bool:
-        return self.weights_status == "verified" and self._verified_weights and self.model is not None
+        # P0 has no checkpoint loader, so caller-controlled flags are never evidence.
+        return False
 
     def fuse_features(self, gnn_features: np.ndarray, cnn_features: np.ndarray,
                       seq_features: np.ndarray) -> Optional[np.ndarray]:
@@ -145,6 +159,24 @@ class FeatureFusion:
             return None
 
     def save_fused_features(self, features: np.ndarray, filename: str = "fused_features.npy"):
-        filepath = os.path.join(self.output_dir, filename)
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or filename in {".", ".."}
+            or os.path.basename(filename) != filename
+            or ntpath.basename(filename) != filename
+            or os.path.isabs(filename)
+            or ntpath.isabs(filename)
+            or "/" in filename
+            or "\\" in filename
+            or any(character in filename for character in '<>:"|?*')
+            or filename.endswith((" ", "."))
+        ):
+            raise ValueError("filename must be a basename without path separators")
+        output_root = os.path.realpath(self.output_dir)
+        os.makedirs(output_root, exist_ok=True)
+        filepath = os.path.realpath(os.path.join(output_root, filename))
+        if os.path.normcase(os.path.commonpath((output_root, filepath))) != os.path.normcase(output_root):
+            raise ValueError("feature path resolves outside the configured output root")
         np.save(filepath, features)
         logger.info("Saved fused features: %s", filepath)

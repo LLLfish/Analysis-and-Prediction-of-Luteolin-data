@@ -1133,6 +1133,7 @@ _FEATURE_STATUSES = {
     "ready",
     "partial",
     "skipped_untrained",
+    "test_only",
     "unavailable",
     "invalid_sequence",
     "unsupported_length",
@@ -1176,9 +1177,12 @@ class FeatureResult:
     entity_version: Optional[str] = None
     entity_bundle_hash: Optional[str] = None
     source_kind: Optional[str] = None
+    model_id: Optional[str] = None
     model_revision: Optional[str] = None
+    model_artifact_sha256: Optional[str] = None
     pooling_policy: Optional[str] = None
     cache_key: Optional[str] = None
+    test_provenance: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.status not in _FEATURE_STATUSES:
@@ -1187,15 +1191,43 @@ class FeatureResult:
             raise ValueError("non-ready feature result requires a reason")
         if not isinstance(self.features, dict):
             raise TypeError("feature result features must be an object")
-        if self.status != "ready" and self.features:
+        if self.status not in {"ready", "test_only"} and self.features:
             raise ValueError("non-ready feature result cannot contain features")
-        if self.status == "ready":
-            if not self.accession or type(self.taxonomy_id) is not int:
-                raise ValueError("ready feature result requires a protein identity")
-            if not self.sequence_sha256 or not self.entity_version or not self.entity_bundle_hash:
-                raise ValueError("ready feature result requires sequence and entity bundle provenance")
-            if not self.model_revision or not self.pooling_policy or not self.cache_key:
-                raise ValueError("ready feature result requires model and pooling cache provenance")
+        if self.status in {"ready", "test_only"}:
+            if not self.accession or type(self.taxonomy_id) is not int or self.taxonomy_id <= 0:
+                raise ValueError("feature result requires a protein identity")
+            if (
+                type(self.sequence_length) is not int
+                or self.sequence_length <= 0
+                or not _is_sha256(self.sequence_sha256)
+                or not _is_sha256(self.entity_bundle_hash)
+                or self.entity_version != f"entities-v2-{self.entity_bundle_hash[:16]}"
+            ):
+                raise ValueError("feature result requires sequence_sha256 and entity bundle provenance")
+            if not self.model_id or not self.model_revision or not self.pooling_policy:
+                raise ValueError("feature result requires model and pooling cache provenance")
+            if not _is_sha256(self.model_artifact_sha256) or not _is_sha256(self.cache_key):
+                raise ValueError("feature result requires model artifact and cache SHA-256 values")
+            if not isinstance(self.features.get("esm_embedding"), (list, tuple)):
+                raise ValueError("feature result requires a one-dimensional ESM embedding")
+            embedding = self.features["esm_embedding"]
+            if (
+                not embedding
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, Real)
+                    or not math.isfinite(float(value))
+                    for value in embedding
+                )
+                or set(self.features) != {"esm_embedding"}
+            ):
+                raise ValueError("ready feature result embedding must be non-empty, flat, and finite")
+        if self.status == "ready" and (
+            self.source_kind not in {"online_snapshot", "offline_snapshot"}
+        ):
+            raise ValueError("ready feature result requires a verified online or offline source")
+        if self.status == "test_only" and not self.test_provenance:
+            raise ValueError("test_only feature result requires explicit test provenance")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1209,7 +1241,10 @@ class FeatureResult:
             "entity_version": self.entity_version,
             "entity_bundle_hash": self.entity_bundle_hash,
             "source_kind": self.source_kind,
+            "model_id": self.model_id,
             "model_revision": self.model_revision,
+            "model_artifact_sha256": self.model_artifact_sha256,
             "pooling_policy": self.pooling_policy,
             "cache_key": self.cache_key,
+            "test_provenance": self.test_provenance,
         }

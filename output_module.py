@@ -2,9 +2,11 @@
 import json
 import logging
 import html
+import ntpath
 import numpy as np
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+from urllib.parse import quote
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -40,13 +42,108 @@ except ImportError:
 
 
 class OutputGenerator:
-    def __init__(self, output_dir: str = ""):
+    def __init__(self, output_dir: str = "", *, run_root: Optional[str] = None):
         if not output_dir:
             output_dir = os.path.join(_BASE_DIR, "output")
         self.output_dir = os.path.abspath(output_dir)
-        os.makedirs(os.path.join(self.output_dir, "reports"), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "images"), exist_ok=True)
+        self.run_root = os.path.realpath(os.path.abspath(run_root or output_dir))
+        self._ensure_configured_directory("reports")
+        self._ensure_configured_directory("images")
         self.results = {}
+
+    @staticmethod
+    def _html_text(value: Any) -> str:
+        return html.escape(str(value), quote=True)
+
+    @staticmethod
+    def _safe_script_json(value: Any) -> str:
+        return (
+            json.dumps(value, ensure_ascii=False)
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
+
+    @staticmethod
+    def _validate_filename(filename: str) -> str:
+        reserved_names = {"CON", "PRN", "AUX", "NUL"} | {
+            f"{prefix}{index}"
+            for prefix in ("COM", "LPT")
+            for index in range(1, 10)
+        }
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or filename in {".", ".."}
+            or os.path.basename(filename) != filename
+            or ntpath.basename(filename) != filename
+            or os.path.isabs(filename)
+            or ntpath.isabs(filename)
+            or "/" in filename
+            or "\\" in filename
+            or any(character in filename for character in '<>:"|?*')
+            or any(ord(character) < 32 for character in filename)
+            or filename.endswith((" ", "."))
+            or filename.split(".", 1)[0].upper() in reserved_names
+        ):
+            raise ValueError("filename must be a basename without path separators")
+        return filename
+
+    def _safe_output_path(self, subdirectory: str, filename: str) -> str:
+        filename = self._validate_filename(filename)
+        resolved_dir = self._ensure_configured_directory(subdirectory)
+        resolved_file = os.path.realpath(os.path.join(resolved_dir, filename))
+        if os.path.normcase(os.path.commonpath((resolved_dir, resolved_file))) != os.path.normcase(resolved_dir):
+            raise ValueError("report path resolves outside its configured directory")
+        return resolved_file
+
+    def _ensure_configured_directory(self, subdirectory: str) -> str:
+        output_root = os.path.realpath(self.output_dir)
+        configured_dir = os.path.join(output_root, subdirectory)
+        resolved_dir = os.path.realpath(configured_dir)
+        if os.path.normcase(os.path.commonpath((output_root, resolved_dir))) != os.path.normcase(output_root):
+            raise ValueError("configured output directory resolves outside the output root")
+        os.makedirs(configured_dir, exist_ok=True)
+        resolved_dir = os.path.realpath(configured_dir)
+        if os.path.normcase(os.path.commonpath((output_root, resolved_dir))) != os.path.normcase(output_root):
+            raise ValueError("configured output directory changed outside the output root")
+        return resolved_dir
+
+    def _data_file_links_html(self, report: Dict[str, Any]) -> str:
+        available = report.get("data_files", {})
+        if not isinstance(available, dict):
+            available = {}
+        links = []
+        run_root = os.path.realpath(self.run_root)
+        dashboard_root = os.path.realpath(self.output_dir)
+        for label, relative_path in available.items():
+            if (
+                not isinstance(label, str)
+                or not isinstance(relative_path, str)
+                or not relative_path
+                or os.path.isabs(relative_path)
+                or ntpath.isabs(relative_path)
+            ):
+                continue
+            candidate = os.path.realpath(os.path.join(run_root, relative_path))
+            try:
+                inside_run = os.path.normcase(
+                    os.path.commonpath((run_root, candidate))
+                ) == os.path.normcase(run_root)
+            except ValueError:
+                inside_run = False
+            if not inside_run or not os.path.isfile(candidate):
+                continue
+            href = os.path.relpath(candidate, dashboard_root).replace(os.sep, "/")
+            safe_href = html.escape(quote(href, safe="/.-_"), quote=True)
+            links.append(
+                f'<a href="{safe_href}" class="data-file">{self._html_text(label)}</a>'
+            )
+        if not links:
+            return '<p class="viewer-note">本次运行未生成可用数据文件</p>'
+        return "\n".join(links)
 
     def generate_summary_report(self, results: Dict[str, Any]) -> Dict[str, Any]:
         feature_readiness = results.get("feature_readiness", {})
@@ -69,6 +166,7 @@ class OutputGenerator:
             "knowledge_graph_summary": results.get("knowledge_graph", {}),
             "ligand_summary": results.get("ligand", {}),
             "feature_readiness": feature_readiness,
+            "data_files": results.get("data_files", {}),
             "data_quality": {
                 "targets_found": len(results.get("targets", [])),
                 "features_extracted": feature_ready,
@@ -140,40 +238,44 @@ class OutputGenerator:
             str(feature_readiness.get("overall_status", "unavailable"))
         )
 
-        compound_name = compound.get('name', 'Luteolin')
-        compound_name_cn = compound.get('name_cn', '木犀草素')
-        total_targets = ta.get('total_targets', 0)
-        unique_genes = len(set(ta.get('gene_symbols', [])))
-        binding_affinity = ds.get('binding_affinity', 'N/A')
-        graph_nodes = gs.get('graph_nodes', 0) or kg.get('graph', {}).get('stats', {}).get('num_nodes', 0)
-        graph_edges = gs.get('graph_edges', 0) or kg.get('graph', {}).get('stats', {}).get('num_edges', 0)
-        graph_relations = kg.get('graph', {}).get('stats', {}).get('num_relations', 0)
+        compound_name = self._html_text(compound.get('name', 'Luteolin'))
+        compound_name_cn = self._html_text(compound.get('name_cn', '木犀草素'))
+        total_targets = self._html_text(ta.get('total_targets', 0))
+        unique_genes = self._html_text(len({str(value) for value in ta.get('gene_symbols', [])}))
+        binding_affinity = self._html_text(ds.get('binding_affinity', 'N/A'))
+        graph_nodes = self._html_text(gs.get('graph_nodes', 0) or kg.get('graph', {}).get('stats', {}).get('num_nodes', 0))
+        graph_edges = self._html_text(gs.get('graph_edges', 0) or kg.get('graph', {}).get('stats', {}).get('num_edges', 0))
+        graph_relations = self._html_text(kg.get('graph', {}).get('stats', {}).get('num_relations', 0))
 
         ranked_targets = rank_targets(report.get('targets_raw', []), limit=10)
         sorted_organisms = organism_distribution(report.get('targets_raw', []), limit=10)
 
         activity_types = {}
         for t in report.get('targets_raw', []):
-            at = t.get('activity_type', 'Unknown') or 'Unknown'
+            at = str(t.get('activity_type', 'Unknown') or 'Unknown')
             activity_types[at] = activity_types.get(at, 0) + 1
         sorted_activities = sorted(activity_types.items(), key=lambda x: x[1], reverse=True)[:8]
 
         target_rows = ""
         for i, (label, score, target) in enumerate(ranked_targets, 1):
             activity = f"{target.get('activity_type', '')} {target.get('activity_value', '')} {target.get('activity_unit', '')}".strip()
+            try:
+                score_display = f"{float(score):.4f}"
+            except (TypeError, ValueError, OverflowError):
+                score_display = "N/A"
             target_rows += (
-                f"<tr><td>{i}</td><td>{html.escape(label)}</td>"
-                f"<td>{html.escape(str(target.get('organism', 'Unknown')))}</td>"
-                f"<td>{html.escape(activity)}</td><td>{score:.4f}</td></tr>\n"
+                f"<tr><td>{i}</td><td>{self._html_text(label)}</td>"
+                f"<td>{self._html_text(target.get('organism', 'Unknown'))}</td>"
+                f"<td>{self._html_text(activity)}</td><td>{self._html_text(score_display)}</td></tr>\n"
             )
 
         org_rows = ""
         for org, count in sorted_organisms:
-            org_rows += f'<li><strong>{html.escape(org)}</strong>: {count} targets</li>\n'
+            org_rows += f'<li><strong>{self._html_text(org)}</strong>: {self._html_text(count)} targets</li>\n'
 
         act_rows = ""
         for at, count in sorted_activities:
-            act_rows += f'<li><strong>{at}</strong>: {count} records</li>\n'
+            act_rows += f'<li><strong>{self._html_text(at)}</strong>: {self._html_text(count)} records</li>\n'
 
         chart_target_priority = self._generate_chart_base64('target_priority', report)
         chart_organism = self._generate_chart_base64('organism', report)
@@ -235,7 +337,7 @@ class OutputGenerator:
         <header>
             <h1>{compound_name_cn}网络药理学分析结果</h1>
             <p class="subtitle">基于可追溯数据、蛋白特征与网络统计的分析结果</p>
-            <p class="gen-time">生成时间: {display_time}</p>
+            <p class="gen-time">生成时间: {self._html_text(display_time)}</p>
         </header>
 
         <div class="section">
@@ -280,12 +382,12 @@ class OutputGenerator:
             <h2>化合物信息</h2>
             <div class="compound-info">
                 <div class="info-item"><div class="info-label">名称</div><div class="info-value">{compound_name} ({compound_name_cn})</div></div>
-                <div class="info-item"><div class="info-label">分子式</div><div class="info-value">{compound.get('molecular_formula', 'N/A')}</div></div>
-                <div class="info-item"><div class="info-label">分子量</div><div class="info-value">{compound.get('molecular_weight', 'N/A')}</div></div>
-                <div class="info-item"><div class="info-label">PubChem CID</div><div class="info-value">{compound.get('pubchem_cid', 'N/A')}</div></div>
-                <div class="info-item"><div class="info-label">ChEMBL ID</div><div class="info-value">{compound.get('chembl_id', 'N/A')}</div></div>
-                <div class="info-item"><div class="info-label">InChIKey</div><div class="info-value">{compound.get('inchikey', 'N/A')}</div></div>
-                <div class="info-item" style="grid-column: 1 / -1;"><div class="info-label">SMILES</div><div class="info-value">{compound.get('smiles', 'N/A')}</div></div>
+                <div class="info-item"><div class="info-label">分子式</div><div class="info-value">{self._html_text(compound.get('molecular_formula', 'N/A'))}</div></div>
+                <div class="info-item"><div class="info-label">分子量</div><div class="info-value">{self._html_text(compound.get('molecular_weight', 'N/A'))}</div></div>
+                <div class="info-item"><div class="info-label">PubChem CID</div><div class="info-value">{self._html_text(compound.get('pubchem_cid', 'N/A'))}</div></div>
+                <div class="info-item"><div class="info-label">ChEMBL ID</div><div class="info-value">{self._html_text(compound.get('chembl_id', 'N/A'))}</div></div>
+                <div class="info-item"><div class="info-label">InChIKey</div><div class="info-value">{self._html_text(compound.get('inchikey', 'N/A'))}</div></div>
+                <div class="info-item" style="grid-column: 1 / -1;"><div class="info-label">SMILES</div><div class="info-value">{self._html_text(compound.get('smiles', 'N/A'))}</div></div>
             </div>
         </div>
 
@@ -337,12 +439,7 @@ class OutputGenerator:
         <div class="section">
             <h2>数据文件</h2>
             <div class="data-files">
-                <a href="framework_output/data/processed/targets.csv" class="data-file">靶点数据 (CSV)</a>
-                <a href="framework_output/data/processed/interactions.csv" class="data-file">互作网络数据 (CSV)</a>
-                <a href="framework_output/data/processed/compound_info.csv" class="data-file">化合物信息 (CSV)</a>
-                <a href="framework_output/data/processed/proteins.csv" class="data-file">蛋白质数据 (CSV)</a>
-                <a href="framework_output/framework_results.json" class="data-file">完整结果 (JSON)</a>
-                <a href="framework_output/logs/framework_run.log" class="data-file">运行日志 (LOG)</a>
+                {self._data_file_links_html(report)}
             </div>
         </div>
 
@@ -372,12 +469,12 @@ class OutputGenerator:
             html_content = html_content.replace('<h2>物种分布</h2>',
                 '<h2>知识图谱 3D 交互</h2>' + chr(10) + kg_html + '<h2>物种分布</h2>')
 
-        dashboard_path = os.path.join(self.output_dir, "dashboard.html")
+        dashboard_path = self._safe_output_path(".", "dashboard.html")
         with open(dashboard_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         logger.info("Dashboard HTML generated: %s", dashboard_path)
 
-        report_path = os.path.join(self.output_dir, "report.html")
+        report_path = self._safe_output_path(".", "report.html")
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         logger.info("Report HTML generated: %s", report_path)
@@ -398,7 +495,7 @@ class OutputGenerator:
         for e in edges[:100]:
             if isinstance(e, (list, tuple)) and len(e) >= 2:
                 elist.append({"source": str(e[0]), "target": str(e[1])})
-        nj = json.dumps(nlist); lj = json.dumps(elist)
+        nj = self._safe_script_json(nlist); lj = self._safe_script_json(elist)
         s = []
         s.append("<div id=\"kg-3d-viewer\" class=\"viewer-3d\" style=\"height:500px\"></div>")
         s.append("<p class=\"viewer-note\">3D Knowledge Graph. Drag to rotate, scroll to zoom.</p>")
@@ -451,7 +548,7 @@ class OutputGenerator:
         try:
             with open(pdb_path, "r", encoding="utf-8") as f:
                 pdb_block = f.read()
-            pdb_json = json.dumps(pdb_block)
+            pdb_json = self._safe_script_json(pdb_block)
             return f'''
             <div id="luteolin-3d-viewer" class="viewer-3d"></div>
             <p class="viewer-note">球棍模型来自 RDKit 生成的木犀草素三维构象；如果提供真实靶点 PDBQT，分子对接姿态会写入 docking/results。</p>
@@ -695,7 +792,8 @@ class OutputGenerator:
         return plots
 
     def save_report(self, report: Dict[str, Any], filename: str = "pharmacology_report.json"):
-        filepath = os.path.join(self.output_dir, "reports", filename)
+        filepath = self._safe_output_path("reports", filename)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
         logger.info("Saved report: %s", filepath)
+        return filepath

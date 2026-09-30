@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 from logging_config import setup_logger
 logger = setup_logger(__name__)
 
-from data_contracts import CanonicalPpiResult, StageStatus, canonicalize_ppi
+from data_contracts import CanonicalPpiResult, FeatureResult, ProteinRecord, StageStatus, canonicalize_ppi
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -120,7 +120,12 @@ class NetworkPharmacologyFramework:
         self.docking_module = self._safe_component(globals().get('DockingValidator'), 'DockingValidator', output_dir=os.path.join(self.output_dir, "docking"))
         self.kg_module = self._safe_component(globals().get('KnowledgeGraph'), 'KnowledgeGraph', output_dir=os.path.join(self.output_dir, "knowledge_graph"))
         self.kg_embedder = self._safe_component(globals().get('KGEmbedder'), 'KGEmbedder', output_dir=os.path.join(self.output_dir, "knowledge_graph", "embeddings"))
-        self.output_module = self._safe_component(globals().get('OutputGenerator'), 'OutputGenerator', output_dir=os.path.join(self.output_dir, "output"))
+        self.output_module = self._safe_component(
+            globals().get('OutputGenerator'),
+            'OutputGenerator',
+            output_dir=os.path.join(self.output_dir, "output"),
+            run_root=self.output_dir,
+        )
 
         self.results = {}
 
@@ -214,11 +219,97 @@ class NetworkPharmacologyFramework:
             return StageStatus("partial", "some_protein_features_unavailable", details)
         if len(set(statuses)) == 1 and statuses[0] in {
             "skipped_untrained", "unavailable", "invalid_sequence",
-            "unsupported_length", "unverified_source", "error", "empty",
+            "unsupported_length", "unverified_source", "error", "empty", "test_only",
         }:
             reason = getattr(results[0], "reason", None) or "protein_features_not_ready"
             return StageStatus(statuses[0], reason, details)
         return StageStatus("unavailable", "no_protein_features_ready", details)
+
+    @staticmethod
+    def _bundle_bound_feature_results(results, bundle, extractor) -> List[FeatureResult]:
+        """Accept only extractor results that re-match the independently verified bundle."""
+        from protein_features import build_feature_cache_key, validate_sequence_identity
+
+        candidates = list(results or [])
+        runtime_provenance = getattr(extractor, "_runtime_model_provenance", None)
+        bundled_proteins = bundle.get("proteins", []) if isinstance(bundle, dict) else []
+        bound_results = []
+
+        for protein_data in bundled_proteins:
+            protein = ProteinRecord(**protein_data)
+            identity_status = validate_sequence_identity(protein, bundle)
+            identity = (protein.accession, protein.taxonomy_id)
+            matching = [
+                result for result in candidates
+                if (
+                    getattr(result, "accession", None),
+                    getattr(result, "taxonomy_id", None),
+                ) == identity
+            ]
+
+            def rejected(reason: str) -> FeatureResult:
+                return FeatureResult(
+                    status="unverified_source",
+                    reason=reason,
+                    accession=protein.accession,
+                    taxonomy_id=protein.taxonomy_id,
+                    sequence_length=protein.sequence_length,
+                    sequence_sha256=protein.sequence_sha256,
+                    entity_version=bundle.get("entity_version"),
+                    entity_bundle_hash=bundle.get("content_sha256"),
+                    source_kind=protein.source_kind,
+                )
+
+            if identity_status.status != "ready":
+                bound_results.append(rejected(identity_status.reason or "protein_source_not_verified"))
+                continue
+            if len(matching) != 1 or not isinstance(matching[0], FeatureResult):
+                bound_results.append(rejected("feature_result_missing_or_ambiguous_for_bundle_record"))
+                continue
+            candidate = matching[0]
+            try:
+                candidate = FeatureResult(**candidate.to_dict())
+            except (TypeError, ValueError) as exc:
+                bound_results.append(rejected(f"feature_result_contract_invalid:{type(exc).__name__}"))
+                continue
+
+            expected_identity = (
+                candidate.accession == protein.accession
+                and candidate.taxonomy_id == protein.taxonomy_id
+                and candidate.sequence_length == protein.sequence_length
+                and candidate.sequence_sha256 == protein.sequence_sha256
+                and candidate.entity_version == bundle.get("entity_version")
+                and candidate.entity_bundle_hash == bundle.get("content_sha256")
+                and candidate.source_kind == protein.source_kind
+            )
+            if not expected_identity or protein.source_kind == "synthetic_test":
+                bound_results.append(rejected("feature_result_identity_or_bundle_mismatch"))
+                continue
+            if candidate.status == "ready":
+                provenance_matches = (
+                    isinstance(runtime_provenance, dict)
+                    and candidate.model_id == runtime_provenance.get("model_id")
+                    and candidate.model_revision == runtime_provenance.get("revision")
+                    and candidate.model_artifact_sha256 == runtime_provenance.get("model_artifact_sha256")
+                )
+                try:
+                    expected_cache_key = build_feature_cache_key(
+                        protein,
+                        model_id=candidate.model_id,
+                        model_revision=candidate.model_revision,
+                        model_artifact_sha256=candidate.model_artifact_sha256,
+                        pooling_policy=candidate.pooling_policy,
+                        entity_version=bundle["entity_version"],
+                        entity_bundle_hash=bundle["content_sha256"],
+                    )
+                except (KeyError, TypeError, ValueError):
+                    expected_cache_key = None
+                if not provenance_matches or candidate.cache_key != expected_cache_key:
+                    bound_results.append(rejected("verified_local_model_or_cache_provenance_required"))
+                    continue
+            bound_results.append(candidate)
+
+        return bound_results
 
     def run_feature_extraction(
         self,
@@ -274,7 +365,13 @@ class NetworkPharmacologyFramework:
             }
         else:
             try:
-                protein_results = self.protein_extractor.extract_from_bundle(str(bundle_path))
+                from evidence_builder import load_entity_bundle
+
+                verified_bundle = load_entity_bundle(str(bundle_path), verify_sources=True)
+                extracted_results = self.protein_extractor.extract_from_bundle(str(bundle_path))
+                protein_results = self._bundle_bound_feature_results(
+                    extracted_results, verified_bundle, self.protein_extractor,
+                )
                 protein_status = self._protein_readiness(protein_results)
             except Exception as exc:
                 logger.warning("Verified entity bundle was rejected by protein extraction: %s", exc)
@@ -335,11 +432,25 @@ class NetworkPharmacologyFramework:
                 gnn_features["num_edges"] = graph.number_of_edges()
             except ImportError:
                 gnn_features["status"] = "dependency_unavailable"
-        network_status = (
-            StageStatus("empty", "no_canonical_ppi_edges")
-            if ppi_result.status == "empty"
-            else StageStatus("ready")
-        )
+        ppi_status = getattr(ppi_result, "status", "invalid")
+        if ppi_status == "empty":
+            network_status = StageStatus("empty", "no_canonical_ppi_edges")
+        elif ppi_status == "partial":
+            network_status = StageStatus("partial", "ppi_result_partial")
+        elif ppi_status == "ready" and gnn_features.get("status") != "dependency_unavailable":
+            network_status = StageStatus("ready")
+        else:
+            failed_status = (
+                "dependency_unavailable"
+                if gnn_features.get("status") == "dependency_unavailable"
+                else ppi_status
+            )
+            reason = {
+                "invalid": "ppi_result_invalid",
+                "unresolved": "ppi_result_unresolved",
+                "dependency_unavailable": "network_statistics_dependency_unavailable",
+            }.get(failed_status, "network_statistics_not_ready")
+            network_status = StageStatus("unavailable", reason)
 
         if self.cnn_module is None:
             cnn_status = StageStatus("unavailable", "cnn_module_unavailable")
@@ -552,7 +663,9 @@ class NetworkPharmacologyFramework:
                     'gnn': gnn_results,
                     'ligand': ligand_results,
                     'knowledge_graph': knowledge_graph_results,
-                    'feature_readiness': feature_extraction.get('feature_readiness', {})
+                    'feature_readiness': feature_extraction.get('feature_readiness', {}),
+                    'run_root': self.output_dir,
+                    'data_files': self._available_output_files(),
                 }
                 report = self.output_module.generate_summary_report(summary_input)
                 self.output_module.generate_dashboard_html(report)
@@ -571,6 +684,21 @@ class NetworkPharmacologyFramework:
         logger.info("Output generation completed")
 
         return output_results
+
+    def _available_output_files(self) -> Dict[str, str]:
+        files = {
+            "靶点数据 (CSV)": "data/processed/targets.csv",
+            "互作网络数据 (CSV)": "data/processed/interactions.csv",
+            "化合物信息 (CSV)": "data/processed/compound_info.csv",
+            "蛋白质数据 (CSV)": "data/processed/proteins.csv",
+            "完整结果 (JSON)": "framework_results.json",
+            "运行日志 (LOG)": "logs/framework_run.log",
+        }
+        return {
+            label: relative_path
+            for label, relative_path in files.items()
+            if os.path.isfile(os.path.join(self.output_dir, relative_path))
+        }
 
     def save_results(self) -> str:
         filepath = os.path.join(self.output_dir, "framework_results.json")
@@ -667,6 +795,47 @@ class NetworkPharmacologyFramework:
         logger.info("Pipeline execution completed in %.2f seconds with status=%s", runtime, status)
         return self.results
 
+def _paths_intersect(first: str, second: str) -> bool:
+    try:
+        common = os.path.commonpath((first, second))
+    except ValueError:
+        return False
+    normalized = os.path.normcase(common)
+    return normalized in {os.path.normcase(first), os.path.normcase(second)}
+
+
+def _assert_output_path_is_unprotected(requested_output: str, resolved_output: str) -> None:
+    protected_paths = [
+        os.path.join(_BASE_DIR, "data"),
+        os.path.join(_BASE_DIR, "framework_output"),
+        os.path.join(_BASE_DIR, "offline_data.json"),
+        os.path.join(_BASE_DIR, ".model_cache"),
+        os.path.join(_BASE_DIR, "features"),
+    ]
+    for protected_path in protected_paths:
+        lexical_protected = os.path.abspath(protected_path)
+        resolved_protected = os.path.realpath(lexical_protected)
+        if any(
+            _paths_intersect(candidate, protected)
+            for candidate in (requested_output, resolved_output)
+            for protected in (lexical_protected, resolved_protected)
+        ):
+            raise ValueError("output directory intersects protected historical data or model paths")
+
+
+def _resolve_new_output_dir(output_dir: str) -> str:
+    if not output_dir:
+        raise ValueError("an explicit new output directory is required")
+    requested_output = os.path.abspath(os.path.expanduser(os.fspath(output_dir)))
+    if os.path.lexists(requested_output):
+        raise FileExistsError(f"refusing to overwrite existing output directory: {requested_output}")
+    resolved_output = os.path.realpath(requested_output)
+    _assert_output_path_is_unprotected(requested_output, resolved_output)
+    if os.path.lexists(resolved_output):
+        raise FileExistsError(f"refusing to overwrite existing output directory: {resolved_output}")
+    return resolved_output
+
+
 def run_feature_pipeline(entity_bundle_path: str, output_dir: str) -> Dict[str, Any]:
     """Run the offline P0 feature/report path against one verified entities.json."""
     from evidence_builder import load_entity_bundle
@@ -678,29 +847,12 @@ def run_feature_pipeline(entity_bundle_path: str, output_dir: str) -> Dict[str, 
 
     if not output_dir:
         raise ValueError("an explicit new output directory is required")
-    resolved_output = os.path.abspath(os.path.expanduser(os.fspath(output_dir)))
-    if os.path.exists(resolved_output):
-        raise FileExistsError(f"refusing to overwrite existing output directory: {resolved_output}")
-    protected_paths = [
-        os.path.join(_BASE_DIR, "data"),
-        os.path.join(_BASE_DIR, "framework_output"),
-        os.path.join(_BASE_DIR, "offline_data.json"),
-        os.path.join(_BASE_DIR, ".model_cache"),
-        os.path.join(_BASE_DIR, "features"),
-    ]
-    for protected_path in protected_paths:
-        protected_path = os.path.abspath(protected_path)
-        try:
-            common = os.path.commonpath((resolved_output, protected_path))
-        except ValueError:
-            continue
-        if os.path.normcase(common) in {
-            os.path.normcase(resolved_output),
-            os.path.normcase(protected_path),
-        }:
-            raise ValueError("output directory intersects protected historical data or model paths")
-
+    resolved_output = _resolve_new_output_dir(output_dir)
     os.makedirs(resolved_output, exist_ok=False)
+    post_create_output = os.path.realpath(resolved_output)
+    if os.path.normcase(post_create_output) != os.path.normcase(resolved_output):
+        raise ValueError("output directory changed resolution after creation")
+    _assert_output_path_is_unprotected(post_create_output, post_create_output)
     dataset = {
         "entity_bundle_path": bundle_path,
         "compound": {},

@@ -133,6 +133,11 @@ def test_collector_fetches_and_hands_off_complete_activity_pages(tmp_path, monke
     assert evidence_by_id[700001]["document_record"]["doi"] == "10.0000/synthetic.001"
     assert evidence_by_id[700001]["assay_record_source_sha256"]
     assert evidence_by_id[700001]["document_record_source_sha256"]
+    assert evidence_by_id[700001]["source_url"].startswith("https://www.ebi.ac.uk/chembl/api/data/activity")
+    assert evidence_by_id[700001]["query"]["molecule_chembl_id"] == "CHEMBL151"
+    assert evidence_by_id[700001]["page_offset"] == 0
+    assert evidence_by_id[700001]["pagination_next"].endswith("offset=2")
+    assert evidence_by_id[700001]["response_sha256"] == evidence_by_id[700001]["source_sha256"]
 
 
 def test_legacy_rows_remain_unverified_and_missing_ids_stay_null(tmp_path):
@@ -409,6 +414,28 @@ def test_request_budget_includes_molecule_pages_and_linked_metadata(tmp_path, mo
     assert (output_dir / "partial_ingest.json").is_file()
 
 
+def test_http_redirect_is_not_followed_to_another_host(tmp_path, monkeypatch):
+    builder = pytest.importorskip("evidence_builder")
+    calls = []
+
+    def redirect(url, **kwargs):
+        calls.append((url, kwargs))
+        response = _Response({"redirect": True}, url, status_code=302)
+        response.headers["Location"] = "https://evil.invalid/chembl/api/data/molecule/CHEMBL151.json"
+        return response
+
+    monkeypatch.setattr("evidence_builder.requests.get", redirect)
+    output_dir = tmp_path / "redirected-response"
+
+    result = builder.fetch_chembl_bounded(["CHEMBL151"], output_dir)
+
+    assert result["status"] == "incomplete"
+    assert result["request_count"] == 1
+    assert len(calls) == 1
+    assert calls[0][1]["allow_redirects"] is False
+    assert not (output_dir / "entities.json").exists()
+
+
 def test_symbol_only_uniprot_lookup_is_not_resolved_by_first_search_hit(tmp_path, monkeypatch):
     collector = LuteolinDataCollector(output_dir=str(tmp_path / "symbol-only"))
     calls = []
@@ -497,6 +524,9 @@ def test_run_pipeline_hands_complete_raw_evidence_to_cleaning(tmp_path):
     }
     assert all(row["evidence_status"] == "observed" for row in result["activity_evidence"])
     assert all(row["is_valid_target"] is False for row in result["targets"])
+    display_target = next(row for row in result["targets"] if row["target_chembl_id"] == "CHEMBL900201")
+    assert display_target["target_name"] == fixture["chembl"]["targets"][0]["pref_name"]
+    assert display_target["gene_symbol"] is None
 
 
 def test_collector_groups_multiple_molecule_page_chains_without_discarding_capture(tmp_path, monkeypatch):

@@ -614,15 +614,15 @@ def _fasta_sequence(path: Path, accession: str) -> tuple[Optional[str], Optional
     for line in text.splitlines():
         if line.startswith(">"):
             if header is not None:
-                records.append((header, "".join(chunks)))
+                records.append((header, "\n".join(chunks)))
             header = line[1:].strip()
             chunks = []
         elif line.strip():
             if header is None:
                 return None, "fasta_header_missing"
-            chunks.append(line.strip())
+            chunks.append(line)
     if header is not None:
-        records.append((header, "".join(chunks)))
+        records.append((header, "\n".join(chunks)))
     if len(records) != 1:
         return None, "fasta_record_count_not_one"
     header, sequence = records[0]
@@ -1252,9 +1252,14 @@ class LegacyDisplayAdapter:
             row = asdict(item) if isinstance(item, ActivityEvidence) else dict(item)
             raw = row.get("raw_activity_record")
             raw = raw if isinstance(raw, Mapping) else {}
+            target_metadata = row.get("target_record")
+            target_metadata = target_metadata if isinstance(target_metadata, Mapping) else {}
             projected.append({
                 "target_chembl_id": row.get("target_chembl_id"),
-                "target_name": raw.get("target_pref_name") or raw.get("pref_name") or raw.get("target_name"),
+                "target_name": (
+                    raw.get("target_pref_name") or raw.get("pref_name") or raw.get("target_name")
+                    or target_metadata.get("pref_name")
+                ),
                 "gene_symbol": raw.get("gene_symbol"),
                 "organism": row.get("target_organism"),
                 "activity_type": row.get("standard_type"),

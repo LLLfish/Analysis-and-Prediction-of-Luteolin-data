@@ -138,6 +138,17 @@ def test_target_component_resolution_requires_human_single_protein_and_accession
     assert single[0]["taxonomy_evidence_path"] in {"target.tax_id", "target_components[0].component_tax_id"}
     assert single[0]["identity_key"] == [9606, "P12345"]
 
+    string_tax_target = json.loads(json.dumps(fixture["chembl"]["targets"][0]))
+    string_tax_target["target_components"][0]["component_tax_id"] = "9606"
+    string_tax = resolver(
+        string_tax_target, source_kind="synthetic_test",
+        source_path="raw/source_manifest.json", source_sha256=source_hash,
+    )[0]
+    assert string_tax["resolution_status"] == "verified"
+    assert string_tax["taxonomy_id"] == 9606
+    assert type(string_tax["taxonomy_id"]) is int
+    assert string_tax["taxonomy_evidence_path"] == "target_components[0].component_tax_id"
+
     complex_rows = resolver(
         fixture["chembl"]["targets"][1], source_kind="synthetic_test",
         source_path="raw/source_manifest.json", source_sha256=source_hash,
@@ -219,6 +230,7 @@ def test_uniprot_json_and_fasta_plus_taxonomy_metadata_hash_the_complete_sequenc
         taxonomy_metadata_path=metadata_path,
     ))
     assert from_fasta["sequence_status"] == "verified"
+    assert "\n" in from_fasta["raw_sequence"]
     assert from_fasta["full_sequence"] == from_json["full_sequence"]
     assert from_fasta["sequence_sha256"] == from_json["sequence_sha256"]
     assert len(from_fasta["source_provenance"]) == 2

@@ -3,9 +3,12 @@
 from concurrent.futures import ThreadPoolExecutor
 import csv
 from dataclasses import replace
+import hashlib
 import json
 import math
 from pathlib import Path
+
+import pytest
 
 from main import NetworkAnalyzer, NetworkPharmacologyFramework
 from knowledge_graph_module import KnowledgeGraph
@@ -551,3 +554,50 @@ def test_real_network_analyzer_metrics_round_trip_through_framework_json(tmp_pat
     ]
     assert encoded_ids
     assert all(json.loads(key)[0] == 9606 for key in encoded_ids)
+
+
+@pytest.mark.parametrize(
+    "relative_path,expected_record_count,expected_source_sha256",
+    [
+        (
+            "framework_output/data/raw/string_ppi_network.json",
+            129,
+            "caca2d2042e05409dafbcf6991b0d05ada2d97a6822a3acce0c02b37103022ba",
+        ),
+        (
+            "data/raw/string_ppi_network.json",
+            639,
+            "58f65b1fd63551218c63a4a5c1f7de6c654940951290c2d4dc3048d1f1d6e302",
+        ),
+    ],
+    ids=["current-129-row-snapshot", "older-639-row-snapshot"],
+)
+def test_real_legacy_string_snapshots_keep_source_hashes_and_records(
+    relative_path, expected_record_count, expected_source_sha256
+):
+    snapshot_path = Path(__file__).resolve().parents[1] / relative_path
+    if not snapshot_path.is_file():
+        pytest.skip("Ignored historical source snapshot is not present in this checkout")
+
+    raw_bytes = snapshot_path.read_bytes()
+    actual_source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    assert actual_source_sha256 == expected_source_sha256
+    source_document = json.loads(raw_bytes.decode("utf-8"))
+    source_records = (
+        source_document
+        if isinstance(source_document, list)
+        else source_document.get("interactions", [])
+    )
+    assert len(source_records) == expected_record_count
+
+    result = canonicalize_ppi(source_records, source_kind="legacy_unverified")
+    assert result.input_count == expected_record_count
+    assert result.input_sha256
+    assert result.status in {"ready", "partial"}
+    assert result.accepted_record_count > 0
+    assert result.accepted_record_count + (result.input_count - result.accepted_record_count) == expected_record_count
+    assert all(edge.provenance[0].source_kind == "legacy_unverified" for edge in result.edges)
+
+    if expected_record_count == 129:
+        assert result.accepted_record_count == 129
+        assert result.issues == ()

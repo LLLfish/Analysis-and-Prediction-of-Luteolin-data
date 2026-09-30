@@ -721,7 +721,7 @@ def hydrate_protein_record(
         if raw_response_bytes is None:
             raw_response_bytes = _json_bytes(dict(uniprot_json))
         try:
-            source_payload = json.loads(raw_response_bytes.decode("utf-8"))
+            source_payload = json.loads(raw_response_bytes.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return _uniprot_source_error_record(component, source_kind=kind, reason="uniprot_raw_json_invalid")
         if source_payload != dict(uniprot_json):
@@ -1354,6 +1354,490 @@ def _safe_relative_file(root: Path, relative_path: Any) -> Path:
     return resolved
 
 
+def _same_json_value(left: Any, right: Any) -> bool:
+    try:
+        return canonical_json_sha256(left) == canonical_json_sha256(right)
+    except (TypeError, ValueError, RecursionError):
+        return False
+
+
+def _bundle_source_receipt(
+    root: Path,
+    provenance: Sequence[Mapping[str, Any]],
+    *,
+    source_id: str,
+    source_path: Any,
+    raw_sha256: Any,
+    label: str,
+) -> tuple[dict[str, Any], bytes]:
+    if not isinstance(source_path, str) or not _is_sha256(raw_sha256):
+        raise EvidenceInputError(f"{label} has an incomplete raw source link")
+    matches = [
+        dict(source) for source in provenance
+        if isinstance(source, Mapping)
+        and source.get("source_id") == source_id
+        and source.get("source_path") == source_path
+        and source.get("raw_sha256") == raw_sha256
+    ]
+    if not matches:
+        raise EvidenceInputError(f"{label} source link is absent from bundle provenance")
+    if any(
+        source.get("source_kind") != matches[0].get("source_kind")
+        for source in matches[1:]
+    ):
+        raise EvidenceInputError(f"{label} has ambiguous source provenance")
+    source_path_obj = _safe_relative_file(root, source_path)
+    if not source_path_obj.is_file():
+        raise EvidenceInputError(f"{label} raw source file is missing")
+    raw_bytes = source_path_obj.read_bytes()
+    if _sha256_bytes(raw_bytes) != raw_sha256:
+        raise EvidenceInputError(f"{label} raw source hash mismatch")
+    return matches[0], raw_bytes
+
+
+def _bundle_json_source(
+    root: Path,
+    provenance: Sequence[Mapping[str, Any]],
+    *,
+    source_id: str,
+    source_path: Any,
+    raw_sha256: Any,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    receipt, raw_bytes = _bundle_source_receipt(
+        root, provenance, source_id=source_id, source_path=source_path,
+        raw_sha256=raw_sha256, label=label,
+    )
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceInputError(f"{label} raw source is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise EvidenceInputError(f"{label} raw source JSON root must be an object")
+    response_hash = receipt.get("response_sha256")
+    if response_hash is not None and response_hash not in {
+        _sha256_bytes(raw_bytes), canonical_json_sha256(payload),
+    }:
+        raise EvidenceInputError(f"{label} response hash differs from its raw source")
+    return receipt, payload, raw_bytes
+
+
+def _compare_fields(actual: Mapping[str, Any], expected: Mapping[str, Any], fields: Sequence[str], label: str) -> None:
+    mismatches = [
+        field_name for field_name in fields
+        if not _same_json_value(actual.get(field_name), expected.get(field_name))
+    ]
+    if mismatches:
+        raise EvidenceInputError(f"{label} derived fields differ from raw source: {', '.join(mismatches)}")
+
+
+def _verify_molecule_source_semantics(
+    molecules: Sequence[Mapping[str, Any]], root: Path,
+    provenance: Sequence[Mapping[str, Any]],
+) -> None:
+    fields = (
+        "molecule_chembl_id", "pref_name", "molecule_type", "raw_structure",
+        "canonical_smiles", "structure_sha256", "structure_status",
+        "structure_status_reason", "source_kind",
+    )
+    for molecule in molecules:
+        if molecule.get("structure_status") != "verified":
+            continue
+        molecule_id = molecule.get("molecule_chembl_id")
+        source_id = f"chembl_molecule:{molecule_id}"
+        molecule_sources = [
+            source for source in molecule.get("source_provenance", [])
+            if isinstance(source, Mapping) and source.get("source_id") == source_id
+        ]
+        if len(molecule_sources) != 1:
+            raise EvidenceInputError(f"verified molecule {molecule_id} requires one exact raw source receipt")
+        molecule_source = molecule_sources[0]
+        receipt, raw, _ = _bundle_json_source(
+            root, provenance, source_id=source_id,
+            source_path=molecule_source.get("source_path"),
+            raw_sha256=molecule_source.get("raw_sha256"),
+            label=f"molecule {molecule_id}",
+        )
+        if receipt.get("source_kind") != molecule.get("source_kind"):
+            raise EvidenceInputError(f"molecule {molecule_id} source kind differs from its raw source")
+        if molecule_source.get("source_kind") != receipt.get("source_kind"):
+            raise EvidenceInputError(f"molecule {molecule_id} embedded source kind differs from its receipt")
+        if raw.get("molecule_chembl_id") != molecule_id:
+            raise EvidenceInputError(f"molecule {molecule_id} native ID differs from raw source")
+        source_url = molecule_source.get("source_url")
+        if source_url is not None and source_url != f"{CHEMBL_API_ROOT}/molecule/{molecule_id}.json":
+            raise EvidenceInputError(f"molecule {molecule_id} source URL is not its exact ChEMBL endpoint")
+        rebuilt = asdict(molecule_record_from_source(
+            raw,
+            source_kind=molecule.get("source_kind"),
+            source_path=molecule_source.get("source_path"),
+            source_sha256=molecule_source.get("raw_sha256"),
+            source_url=source_url,
+        ))
+        _compare_fields(molecule, rebuilt, fields, f"molecule {molecule_id}")
+
+
+def _verify_protein_component_references(
+    protein: Mapping[str, Any], root: Path,
+    provenance: Sequence[Mapping[str, Any]],
+) -> None:
+    protein_id = protein.get("accession")
+    component_evidence = protein.get("component_evidence")
+    references = component_evidence.get("references") if isinstance(component_evidence, Mapping) else None
+    if not isinstance(references, list) or not references:
+        raise EvidenceInputError(f"verified protein {protein_id} has no target component source references")
+    seen_references: set[tuple[Any, Any]] = set()
+    for reference in references:
+        if not isinstance(reference, Mapping):
+            raise EvidenceInputError(f"verified protein {protein_id} has a malformed target component reference")
+        target_id = reference.get("target_chembl_id")
+        component_index = reference.get("component_index")
+        if not isinstance(target_id, str) or type(component_index) is not int or component_index < 0:
+            raise EvidenceInputError(f"verified protein {protein_id} has an incomplete target component identity")
+        key = (target_id, component_index)
+        if key in seen_references:
+            raise EvidenceInputError(f"verified protein {protein_id} repeats a target component reference")
+        seen_references.add(key)
+        target_source = reference.get("target_record_source")
+        if not isinstance(target_source, Mapping):
+            raise EvidenceInputError(f"verified protein {protein_id} lacks a target source receipt")
+        source_id = f"chembl_target:{target_id}"
+        receipt, target, _ = _bundle_json_source(
+            root, provenance, source_id=source_id,
+            source_path=target_source.get("source_path"),
+            raw_sha256=target_source.get("raw_sha256"),
+            label=f"protein {protein_id} target {target_id}",
+        )
+        if receipt.get("source_kind") != target_source.get("source_kind"):
+            raise EvidenceInputError(f"protein {protein_id} target source kind mismatch")
+        if target.get("target_chembl_id") != target_id:
+            raise EvidenceInputError(f"protein {protein_id} target ID differs from raw source")
+        target_url = target_source.get("source_url")
+        if target_url is not None and target_url != f"{CHEMBL_API_ROOT}/target/{target_id}.json":
+            raise EvidenceInputError(f"protein {protein_id} target URL is not its exact ChEMBL endpoint")
+        resolutions = resolve_target_components(
+            target,
+            source_kind=receipt.get("source_kind"),
+            source_path=target_source.get("source_path"),
+            source_sha256=target_source.get("raw_sha256"),
+            source_url=target_url,
+        )
+        resolved = next((row for row in resolutions if row.get("component_index") == component_index), None)
+        if not isinstance(resolved, Mapping) or resolved.get("resolution_status") != "verified":
+            raise EvidenceInputError(f"protein {protein_id} is not resolved by its referenced target component")
+        if resolved.get("accession") != protein_id or resolved.get("taxonomy_id") != protein.get("taxonomy_id"):
+            raise EvidenceInputError(f"protein {protein_id} identity differs from its target component")
+        _compare_fields(
+            reference,
+            {
+                "target_chembl_id": resolved.get("target_chembl_id"),
+                "target_type": resolved.get("target_type"),
+                "organism": resolved.get("organism"),
+                "taxonomy_id": resolved.get("taxonomy_id"),
+                "taxonomy_evidence_path": resolved.get("taxonomy_evidence_path"),
+                "component_index": resolved.get("component_index"),
+                "component": resolved.get("component"),
+                "target_record_sha256": resolved.get("target_record_sha256"),
+            },
+            (
+                "target_chembl_id", "target_type", "organism", "taxonomy_id",
+                "taxonomy_evidence_path", "component_index", "component",
+                "target_record_sha256",
+            ),
+            f"protein {protein_id} target component",
+        )
+        _compare_fields(
+            target_source,
+            resolved.get("target_record_source", {}),
+            ("source_id", "source_kind", "source_path", "raw_sha256"),
+            f"protein {protein_id} target source receipt",
+        )
+
+
+def _verify_protein_source_semantics(
+    proteins: Sequence[Mapping[str, Any]], root: Path,
+    provenance: Sequence[Mapping[str, Any]],
+) -> None:
+    semantic_fields = (
+        "accession", "taxonomy_id", "raw_sequence", "full_sequence",
+        "sequence_length", "sequence_sha256", "sequence_status",
+        "sequence_status_reason", "identity_status", "source_kind",
+        "returned_accession", "returned_taxonomy_id",
+    )
+    for protein in proteins:
+        if protein.get("sequence_status") != "verified":
+            continue
+        accession = protein.get("accession")
+        taxonomy_id = protein.get("taxonomy_id")
+        source_rows = protein.get("source_provenance")
+        if not isinstance(source_rows, list):
+            raise EvidenceInputError(f"verified protein {accession} requires raw UniProt sources")
+        source_rows = [row for row in source_rows if isinstance(row, Mapping)]
+        json_rows = [row for row in source_rows if row.get("source_id") == f"uniprot:{accession}"]
+        fasta_rows = [row for row in source_rows if row.get("source_id") == f"uniprot_fasta:{accession}"]
+        metadata_rows = [row for row in source_rows if row.get("source_id") == f"uniprot_taxonomy_metadata:{accession}"]
+        component = {"accession": accession, "taxonomy_id": taxonomy_id, "resolution_status": "verified"}
+        if len(json_rows) == 1 and len(source_rows) == 1:
+            source = json_rows[0]
+            receipt, payload, raw_bytes = _bundle_json_source(
+                root, provenance, source_id=f"uniprot:{accession}",
+                source_path=source.get("source_path"), raw_sha256=source.get("raw_sha256"),
+                label=f"protein {accession} UniProt JSON",
+            )
+            if receipt.get("source_kind") != protein.get("source_kind"):
+                raise EvidenceInputError(f"protein {accession} source kind differs from UniProt JSON")
+            if source.get("source_kind") != receipt.get("source_kind"):
+                raise EvidenceInputError(f"protein {accession} embedded source kind differs from UniProt JSON receipt")
+            source_url = source.get("source_url")
+            expected_url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
+            if source_url is not None and source_url != expected_url:
+                raise EvidenceInputError(f"protein {accession} source URL is not its exact UniProt endpoint")
+            rebuilt = asdict(hydrate_protein_record(
+                component, source_kind=protein.get("source_kind"),
+                source_path=source.get("source_path"), uniprot_json=payload,
+                raw_response_bytes=raw_bytes,
+            ))
+        elif len(fasta_rows) == 1 and len(metadata_rows) == 1 and len(source_rows) == 2:
+            fasta_source = fasta_rows[0]
+            metadata_source = metadata_rows[0]
+            fasta_receipt, _ = _bundle_source_receipt(
+                root, provenance, source_id=f"uniprot_fasta:{accession}",
+                source_path=fasta_source.get("source_path"), raw_sha256=fasta_source.get("raw_sha256"),
+                label=f"protein {accession} FASTA",
+            )
+            metadata_receipt, _ = _bundle_source_receipt(
+                root, provenance, source_id=f"uniprot_taxonomy_metadata:{accession}",
+                source_path=metadata_source.get("source_path"), raw_sha256=metadata_source.get("raw_sha256"),
+                label=f"protein {accession} taxonomy metadata",
+            )
+            if any(receipt.get("source_kind") != protein.get("source_kind") for receipt in (fasta_receipt, metadata_receipt)):
+                raise EvidenceInputError(f"protein {accession} source kind differs from FASTA metadata")
+            if any(source.get("source_kind") != receipt.get("source_kind") for source, receipt in (
+                (fasta_source, fasta_receipt), (metadata_source, metadata_receipt),
+            )):
+                raise EvidenceInputError(f"protein {accession} embedded source kind differs from FASTA metadata receipt")
+            rebuilt = asdict(hydrate_protein_record(
+                component,
+                source_kind=protein.get("source_kind"),
+                fasta_path=_safe_relative_file(root, fasta_source.get("source_path")),
+                taxonomy_metadata_path=_safe_relative_file(root, metadata_source.get("source_path")),
+                fasta_source_path=fasta_source.get("source_path"),
+                taxonomy_metadata_source_path=metadata_source.get("source_path"),
+            ))
+        else:
+            raise EvidenceInputError(f"verified protein {accession} lacks one exact UniProt JSON or FASTA/metadata source pair")
+        _compare_fields(protein, rebuilt, semantic_fields, f"protein {accession} sequence")
+        _verify_protein_component_references(protein, root, provenance)
+
+
+def _activity_linked_json(
+    activity: Mapping[str, Any], root: Path,
+    provenance: Sequence[Mapping[str, Any]], *,
+    field_prefix: str, identifier_field: str, resource: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    identifier = activity.get(identifier_field)
+    record = activity.get(f"{field_prefix}_record")
+    source_path = activity.get(f"{field_prefix}_record_source_path")
+    source_hash = activity.get(f"{field_prefix}_record_source_sha256")
+    if not isinstance(identifier, str) or not isinstance(record, Mapping):
+        raise EvidenceInputError(f"activity {activity.get('activity_id')} lacks linked {resource} evidence")
+    receipt, raw, _ = _bundle_json_source(
+        root, provenance,
+        source_id=f"chembl_{resource}:{identifier}",
+        source_path=source_path, raw_sha256=source_hash,
+        label=f"activity {activity.get('activity_id')} {resource}",
+    )
+    if receipt.get("source_kind") != activity.get("source_kind"):
+        raise EvidenceInputError(f"activity {activity.get('activity_id')} {resource} source kind mismatch")
+    if not _same_json_value(record, raw):
+        raise EvidenceInputError(f"activity {activity.get('activity_id')} {resource} record differs from raw source")
+    return receipt, raw
+
+
+def _verify_activity_source_semantics(
+    activities: Sequence[Mapping[str, Any]], molecules: Sequence[Mapping[str, Any]],
+    root: Path, provenance: Sequence[Mapping[str, Any]],
+) -> None:
+    page_receipts: dict[tuple[str, int], dict[str, Any]] = {}
+    page_pattern = re.compile(r"^chembl_activity:(CHEMBL[0-9]+):page:([0-9]+)$")
+    for source in provenance:
+        if not isinstance(source, Mapping):
+            continue
+        match = page_pattern.fullmatch(str(source.get("source_id", "")))
+        if match is None:
+            continue
+        key = (match.group(1), int(match.group(2)))
+        current = dict(source)
+        previous = page_receipts.get(key)
+        if previous is not None and not _same_json_value(previous, current):
+            raise EvidenceInputError(f"activity page {key[0]}:{key[1]} has ambiguous source receipts")
+        page_receipts[key] = current
+
+    page_cache: dict[tuple[str, int], tuple[dict[str, Any], list[dict[str, Any]], bytes]] = {}
+
+    def load_page(molecule_id: str, page_index: int) -> tuple[dict[str, Any], list[dict[str, Any]], bytes, dict[str, Any]]:
+        key = (molecule_id, page_index)
+        receipt = page_receipts.get(key)
+        if receipt is None:
+            raise EvidenceInputError(f"activity {molecule_id} page {page_index} is absent from source provenance")
+        if key not in page_cache:
+            actual_receipt, payload, raw_bytes = _bundle_json_source(
+                root, provenance, source_id=f"chembl_activity:{molecule_id}:page:{page_index}",
+                source_path=receipt.get("source_path"), raw_sha256=receipt.get("raw_sha256"),
+                label=f"activity {molecule_id} page {page_index}",
+            )
+            _, rows, _ = _validate_activity_page(payload)
+            page_cache[key] = (payload, rows, raw_bytes)
+            receipt = actual_receipt
+        payload, rows, raw_bytes = page_cache[key]
+        return payload, rows, raw_bytes, receipt
+
+    for activity in activities:
+        if activity.get("metadata_status") != "complete":
+            continue
+        query = activity.get("query")
+        query_molecule_id = query.get("molecule_chembl_id") if isinstance(query, Mapping) else None
+        page_index = activity.get("page_index")
+        if not isinstance(query_molecule_id, str) or type(page_index) is not int or page_index < 1:
+            raise EvidenceInputError(f"complete activity {activity.get('activity_id')} lacks its query/page identity")
+        page, raw_rows, page_bytes, receipt = load_page(query_molecule_id, page_index)
+        metadata = page["page_meta"]
+        if receipt.get("source_kind") != activity.get("source_kind"):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} page source kind mismatch")
+        if activity.get("source_id") != "chembl_activity":
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} has an invalid source ID")
+        if activity.get("source_path") != receipt.get("source_path") or activity.get("source_sha256") != receipt.get("raw_sha256"):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} page source link mismatch")
+        accepted_response_hashes = {_sha256_bytes(page_bytes), canonical_json_sha256(page)}
+        if activity.get("response_sha256") not in accepted_response_hashes:
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} response hash differs from its raw page")
+        if not _same_json_value(activity.get("raw_activity_record"), next((
+            row for row in raw_rows
+            if _same_json_value(row, activity.get("raw_activity_record"))
+        ), None)):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} raw row differs from its source page")
+        if activity.get("page_status") != "complete":
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} page status differs from source page")
+        expected_query = {
+            "molecule_chembl_id": query_molecule_id,
+            "limit": metadata.get("limit"),
+            "offset": metadata.get("offset"),
+        }
+        if not _same_json_value(query, expected_query):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} query metadata differs from source page")
+        if activity.get("page_offset") != metadata.get("offset") or activity.get("pagination_next") != metadata.get("next"):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} pagination metadata differs from source page")
+        raw_activity = activity.get("raw_activity_record")
+        if not isinstance(raw_activity, Mapping):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} raw evidence must be an object")
+        molecule_id = raw_activity.get("molecule_chembl_id")
+        expected_molecule_id = molecule_id if isinstance(molecule_id, str) else None
+        expected_assay_id = raw_activity.get("assay_chembl_id") if isinstance(raw_activity.get("assay_chembl_id"), str) else None
+        expected_document_id = raw_activity.get("document_chembl_id") if isinstance(raw_activity.get("document_chembl_id"), str) else None
+        expected_target_id = raw_activity.get("target_chembl_id") if isinstance(raw_activity.get("target_chembl_id"), str) else None
+        for field_name, expected in (
+            ("activity_id", raw_activity.get("activity_id")),
+            ("molecule_chembl_id", expected_molecule_id),
+            ("assay_chembl_id", expected_assay_id),
+            ("document_chembl_id", expected_document_id),
+            ("target_chembl_id", expected_target_id),
+            ("standard_type", raw_activity.get("standard_type")),
+            ("standard_relation", raw_activity.get("standard_relation")),
+            ("standard_value", raw_activity.get("standard_value")),
+            ("standard_units", raw_activity.get("standard_units")),
+            ("pchembl_value", raw_activity.get("pchembl_value")),
+        ):
+            if not _same_json_value(activity.get(field_name), expected):
+                raise EvidenceInputError(f"activity {activity.get('activity_id')} field {field_name} differs from raw source")
+
+        _, target = _activity_linked_json(
+            activity, root, provenance, field_prefix="target",
+            identifier_field="target_chembl_id", resource="target",
+        )
+        _, assay = _activity_linked_json(
+            activity, root, provenance, field_prefix="assay",
+            identifier_field="assay_chembl_id", resource="assay",
+        )
+        _activity_linked_json(
+            activity, root, provenance, field_prefix="document",
+            identifier_field="document_chembl_id", resource="document",
+        )
+        if target.get("target_chembl_id") != expected_target_id:
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} target ID differs from raw target source")
+        if assay.get("assay_chembl_id") != expected_assay_id or assay.get("target_chembl_id") != expected_target_id:
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} assay identity/target link differs from raw source")
+        if activity["document_record"].get("document_chembl_id") != expected_document_id:
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} document ID differs from raw source")
+        target_type, organism, taxonomy, components = _target_fields(raw_activity, target)
+        for field_name, expected in (
+            ("target_type", target_type),
+            ("target_organism", organism),
+            ("target_taxonomy_id", taxonomy),
+            ("target_components", components),
+        ):
+            if not _same_json_value(activity.get(field_name), expected):
+                raise EvidenceInputError(f"activity {activity.get('activity_id')} field {field_name} differs from linked target source")
+        assay_confidence = assay.get("confidence_score")
+        raw_confidence = raw_activity.get("confidence_score")
+        if raw_confidence is not None:
+            expected_confidence, expected_confidence_source = raw_confidence, "activity"
+        elif assay_confidence is not None:
+            expected_confidence, expected_confidence_source = assay_confidence, "assay"
+        else:
+            expected_confidence, expected_confidence_source = None, None
+        for field_name, expected in (
+            ("confidence_score", expected_confidence),
+            ("assay_confidence_score", assay_confidence),
+            ("confidence_source", expected_confidence_source),
+        ):
+            if not _same_json_value(activity.get(field_name), expected):
+                raise EvidenceInputError(f"activity {activity.get('activity_id')} field {field_name} differs from linked raw source")
+        if expected_molecule_id != query_molecule_id:
+            raise EvidenceInputError(f"complete activity {activity.get('activity_id')} molecule ID differs from its query")
+        if expected_molecule_id not in {row.get("molecule_chembl_id") for row in molecules}:
+            raise EvidenceInputError(f"complete activity {activity.get('activity_id')} molecule is absent from entity bundle")
+
+    all_groups: dict[str, list[Mapping[str, Any]]] = {}
+    for activity in activities:
+        query = activity.get("query")
+        molecule_id = query.get("molecule_chembl_id") if isinstance(query, Mapping) else None
+        if isinstance(molecule_id, str) and activity.get("pagination_status") == "complete":
+            all_groups.setdefault(molecule_id, []).append(activity)
+    for molecule_id, rows in all_groups.items():
+        receipts = sorted(
+            ((index, receipt) for (source_molecule, index), receipt in page_receipts.items() if source_molecule == molecule_id),
+            key=lambda pair: pair[0],
+        )
+        if not receipts or [index for index, _ in receipts] != list(range(1, len(receipts) + 1)):
+            raise EvidenceInputError(f"activity {molecule_id} complete pagination has missing page receipts")
+        pages: list[dict[str, Any]] = []
+        expected_activity_hashes: list[str] = []
+        for index, _ in receipts:
+            page, raw_rows, _, _ = load_page(molecule_id, index)
+            pages.append(page)
+            expected_activity_hashes.extend(canonical_json_sha256(row) for row in raw_rows)
+        expected_row_count = sum(len(page["activities"]) for page in pages)
+        if _page_chain_status(pages, expected_row_count) != "complete":
+            raise EvidenceInputError(f"activity {molecule_id} page source chain is not complete")
+        actual_activity_hashes = [
+            canonical_json_sha256(activity.get("raw_activity_record"))
+            for activity in activities
+            if isinstance(activity.get("query"), Mapping)
+            and activity["query"].get("molecule_chembl_id") == molecule_id
+        ]
+        if sorted(actual_activity_hashes) != sorted(expected_activity_hashes):
+            raise EvidenceInputError(f"activity {molecule_id} evidence rows do not match complete raw page sources")
+
+
+def _verify_entity_bundle_source_semantics(
+    bundle: Mapping[str, Any], root: Path,
+    provenance: Sequence[Mapping[str, Any]],
+) -> None:
+    _verify_molecule_source_semantics(bundle["molecules"], root, provenance)
+    _verify_protein_source_semantics(bundle["proteins"], root, provenance)
+    _verify_activity_source_semantics(bundle["activities"], bundle["molecules"], root, provenance)
+
+
 def load_entity_bundle(path: os.PathLike[str] | str, *, verify_sources: bool = True) -> dict[str, Any]:
     """Load and verify canonical bundle, bundle hash, activity links and raw files."""
     bundle_path = Path(path).resolve()
@@ -1452,6 +1936,7 @@ def load_entity_bundle(path: os.PathLike[str] | str, *, verify_sources: bool = T
                 raise EvidenceInputError(f"raw source file is missing: {source.get('source_path')}")
             if _sha256_bytes(source_path.read_bytes()) != source["raw_sha256"]:
                 raise EvidenceInputError(f"raw source hash mismatch: {source.get('source_path')}")
+        _verify_entity_bundle_source_semantics(bundle, bundle_path.parent, provenance)
     return bundle
 
 

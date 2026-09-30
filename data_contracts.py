@@ -1081,18 +1081,30 @@ def validate_protein_record(record: ProteinRecord) -> None:
     if record.raw_sequence is not None and not isinstance(record.raw_sequence, str):
         raise TypeError("raw_sequence must be text or null")
     if record.full_sequence is None:
+        if record.raw_sequence is not None:
+            raise ValueError("raw_sequence cannot be preserved without its normalized full_sequence")
         if record.sequence_length is not None or record.sequence_sha256 is not None:
             raise ValueError("sequence length/hash require a preserved full_sequence")
     else:
         if not isinstance(record.full_sequence, str):
             raise TypeError("full_sequence must be text or null")
+        if record.raw_sequence is None:
+            raise ValueError("full_sequence requires its preserved raw_sequence")
         if record.full_sequence != record.full_sequence.upper() or any(char.isspace() for char in record.full_sequence):
             raise ValueError("full_sequence must be uppercase and whitespace-free")
+        normalized_raw = "".join(char for char in record.raw_sequence if not char.isspace()).upper()
+        if normalized_raw != record.full_sequence:
+            raise ValueError("normalized raw_sequence does not match full_sequence")
         if type(record.sequence_length) is not int or record.sequence_length != len(record.full_sequence):
             raise ValueError("sequence_length does not match full_sequence")
         expected_hash = hashlib.sha256(record.full_sequence.encode("utf-8")).hexdigest()
         if record.sequence_sha256 != expected_hash:
             raise ValueError("sequence_sha256 does not match full_sequence")
+    if record.identity_status == "verified":
+        if record.returned_accession is not None and record.returned_accession != record.accession:
+            raise ValueError("returned accession does not match verified protein identity")
+        if record.returned_taxonomy_id is not None and record.returned_taxonomy_id != record.taxonomy_id:
+            raise ValueError("returned taxonomy does not match verified protein identity")
     if not isinstance(record.source_provenance, list) or any(not isinstance(item, dict) for item in record.source_provenance):
         raise TypeError("source_provenance must be a list of objects")
     if not isinstance(record.component_evidence, dict):
@@ -1105,6 +1117,10 @@ def validate_protein_record(record: ProteinRecord) -> None:
     if record.sequence_status == "verified":
         if record.identity_status != "verified" or record.accession is None or record.taxonomy_id is None:
             raise ValueError("verified sequence requires a verified accession and taxonomy")
+        if record.returned_accession != record.accession or record.returned_taxonomy_id != record.taxonomy_id:
+            raise ValueError("verified sequence requires returned accession and taxonomy to match")
+        if record.source_kind == "legacy_unverified":
+            raise ValueError("legacy_unverified source cannot produce a verified sequence")
         if record.full_sequence is None or not record.source_provenance:
             raise ValueError("verified sequence requires full sequence and raw source provenance")
         if not record.full_sequence or any(residue not in _STANDARD_AMINO_ACIDS for residue in record.full_sequence):

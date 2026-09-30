@@ -146,6 +146,24 @@ class NetworkPharmacologyFramework:
                      compound_name, num_targets, num_proteins, num_interactions)
         return dataset
 
+    @staticmethod
+    def _json_safe_metric_keys(value):
+        """Project tuple graph identities to reversible JSON object keys."""
+        if isinstance(value, dict):
+            projected = {}
+            for key, item in value.items():
+                if isinstance(key, tuple):
+                    if len(key) != 2 or type(key[0]) is not int or not isinstance(key[1], str):
+                        raise TypeError("Unsupported tuple key in network metrics")
+                    key = json.dumps(list(key), ensure_ascii=False, separators=(",", ":"))
+                if key in projected:
+                    raise ValueError("Network metric key projection is not collision-free")
+                projected[key] = NetworkPharmacologyFramework._json_safe_metric_keys(item)
+            return projected
+        if isinstance(value, (list, tuple)):
+            return [NetworkPharmacologyFramework._json_safe_metric_keys(item) for item in value]
+        return value
+
     def _canonicalize_dataset_ppi(self, dataset: Dict[str, Any]) -> CanonicalPpiResult:
         result = canonicalize_ppi(
             dataset.get('interactions', []),
@@ -207,7 +225,8 @@ class NetworkPharmacologyFramework:
                         source_record_hashes=edge.source_record_hashes,
                     )
                 if graph.number_of_nodes() > 0:
-                    gnn_features['centrality'] = self.gnn_analyzer.compute_centrality(graph)
+                    centrality = self.gnn_analyzer.compute_centrality(graph)
+                    gnn_features['centrality'] = self._json_safe_metric_keys(centrality)
                     gnn_features['graph_stats'] = self.gnn_analyzer.compute_graph_statistics(graph)
                 else:
                     gnn_features['status'] = 'empty'

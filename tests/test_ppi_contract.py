@@ -534,7 +534,9 @@ def test_real_network_analyzer_metrics_round_trip_through_framework_json(tmp_pat
         if isinstance(value, dict)
     ]
     assert features["gnn"]["num_edges"] == 1
-    assert any(isinstance(key, tuple) for metric in metric_maps for key in metric)
+    projected_ids = [key for metric in metric_maps for key in metric]
+    assert projected_ids
+    assert all(json.loads(key)[0] == 9606 for key in projected_ids)
 
     saved_path = framework.save_results()
     assert saved_path

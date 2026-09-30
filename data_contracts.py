@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 import csv
 import hashlib
 import json
@@ -53,16 +53,10 @@ _ENVELOPE_FIELDS = {
 _TIME_FIELDS = frozenset({"retrieved_at", "created_at", "generated_at", "timestamp"})
 
 
-def _plain(value: Any) -> Any:
-    """Convert supported values to deterministic JSON data, marking non-finite floats."""
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        return _plain(value.to_dict())
-    if hasattr(value, "__dataclass_fields__"):
-        return _plain(asdict(value))
-    if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item) for item in value]
+def _plain(value: Any, _depth: int = 0, _active: Optional[set[int]] = None) -> Any:
+    """Convert values to deterministic JSON data with cycle and depth guards."""
+    if _depth > 64:
+        return {"__depth_limit__": f"{type(value).__module__}.{type(value).__qualname__}"}
     if isinstance(value, float) and not math.isfinite(value):
         if math.isnan(value):
             marker = "nan"
@@ -71,7 +65,28 @@ def _plain(value: Any) -> Any:
         return {"__nonfinite_float__": marker}
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
-    return {"__unsupported_type__": f"{type(value).__module__}.{type(value).__qualname__}"}
+
+    active = _active if _active is not None else set()
+    value_id = id(value)
+    if value_id in active:
+        return {"__cycle__": f"{type(value).__module__}.{type(value).__qualname__}"}
+    active.add(value_id)
+    try:
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                item.name: _plain(getattr(value, item.name), _depth + 1, active)
+                for item in fields(value)
+            }
+        if isinstance(value, Mapping):
+            return {
+                str(key): _plain(item, _depth + 1, active)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [_plain(item, _depth + 1, active) for item in value]
+        return {"__unsupported_type__": f"{type(value).__module__}.{type(value).__qualname__}"}
+    finally:
+        active.discard(value_id)
 
 
 def _without_fields(value: Any, excluded: frozenset[str]) -> Any:
@@ -265,6 +280,7 @@ class ValidationIssue:
     source_kind: str
     source_record_hash: str
     field: Optional[str] = None
+    mapping_hashes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -292,7 +308,7 @@ class CanonicalPpiResult:
 
     @property
     def unresolved_count(self) -> int:
-        return sum(issue.code == "unresolved_alias" for issue in self.issues)
+        return sum(issue.code in {"unresolved_alias", "untrusted_alias_mapping"} for issue in self.issues)
 
     def to_dict(self, include_edges: bool = True) -> dict[str, Any]:
         result = {
@@ -315,13 +331,11 @@ class CanonicalPpiResult:
 
 
 def _source_for_record(record: Mapping[str, Any], requested: Optional[str]) -> str:
-    source = requested or record.get("source_kind")
-    if source:
-        return source if isinstance(source, str) else ""
-    if "stringId_A" in record and "stringId_B" in record:
-        return "online_snapshot"
-    if "source_native_id_a" in record and "source_native_id_b" in record:
-        return "offline_snapshot"
+    if requested is not None:
+        return requested if isinstance(requested, str) else ""
+    if "source_kind" in record:
+        value = record["source_kind"]
+        return value if isinstance(value, str) else ""
     return "legacy_unverified"
 
 
@@ -384,6 +398,226 @@ def _semantic_payload(
     }
 
 
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _canonical_edge_error(edge: Any) -> Optional[str]:
+    if not isinstance(edge, CanonicalPpiEdge):
+        return "value is not a CanonicalPpiEdge"
+    endpoints = (edge.endpoint_a, edge.endpoint_b)
+    for endpoint in endpoints:
+        if not isinstance(endpoint, CanonicalPpiEndpoint):
+            return "endpoint is not a CanonicalPpiEndpoint"
+        if _strict_taxonomy(endpoint.taxonomy_id) is None:
+            return "endpoint taxonomy_id must be a positive integer"
+        if (
+            not isinstance(endpoint.source_native_id, str)
+            or not endpoint.source_native_id
+            or endpoint.source_native_id.strip() != endpoint.source_native_id
+        ):
+            return "endpoint source_native_id must be a non-empty stable string"
+        if not isinstance(endpoint.display_name, str):
+            return "endpoint display_name must be a string"
+    if edge.endpoint_a.taxonomy_id != edge.endpoint_b.taxonomy_id:
+        return "canonical edge endpoints have conflicting taxonomy IDs"
+    if edge.endpoint_b.identity_key < edge.endpoint_a.identity_key:
+        return "canonical edge endpoints are not in stable order"
+    if isinstance(edge.score, bool) or not isinstance(edge.score, Real):
+        return "canonical edge score must be numeric"
+    score = float(edge.score)
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        return "canonical edge score must be finite and in [0, 1]"
+    if not _is_sha256(edge.semantic_sha256):
+        return "canonical edge semantic hash is invalid"
+    if not isinstance(edge.provenance, tuple) or not edge.provenance:
+        return "canonical edge must retain at least one source provenance record"
+    provenance_keys = []
+    for item in edge.provenance:
+        if not isinstance(item, PpiRecordProvenance):
+            return "canonical edge provenance has an invalid record type"
+        if not isinstance(item.source_kind, str) or item.source_kind not in _ALLOWED_SOURCE_KINDS:
+            return "canonical edge provenance source_kind is invalid"
+        if not _is_sha256(item.source_record_hash):
+            return "canonical edge source_record_hash is invalid"
+        if type(item.record_index) is not int or item.record_index < 0:
+            return "canonical edge provenance record_index is invalid"
+        if (
+            not isinstance(item.source_fields, tuple)
+            or any(not isinstance(field, str) for field in item.source_fields)
+            or tuple(sorted(item.source_fields)) != item.source_fields
+        ):
+            return "canonical edge provenance source_fields must be sorted strings"
+        if not item.input_endpoint_a or not item.input_endpoint_b:
+            return "canonical edge provenance must retain both raw endpoint values"
+        if not isinstance(item.input_endpoint_a, str) or not isinstance(item.input_endpoint_b, str):
+            return "canonical edge raw endpoint values must be strings"
+        if (
+            not isinstance(item.mapping_sources, tuple)
+            or any(not isinstance(source, str) or not source for source in item.mapping_sources)
+        ):
+            return "canonical edge mapping_sources must be non-empty strings"
+        if not isinstance(item.mapping_hashes, tuple) or any(
+            not _is_sha256(mapping_hash) for mapping_hash in item.mapping_hashes
+        ):
+            return "canonical edge mapping_hashes must be SHA-256 values"
+        if item.retrieved_at is not None and not isinstance(item.retrieved_at, str):
+            return "canonical edge retrieved_at must be a string or null"
+        provenance_keys.append((item.source_kind, item.source_record_hash, item.record_index))
+    if provenance_keys != sorted(provenance_keys):
+        return "canonical edge provenance is not in stable order"
+    expected_hash = canonical_json_sha256(
+        _semantic_payload(edge.endpoint_a, edge.endpoint_b, score)
+    )
+    if edge.semantic_sha256 != expected_hash:
+        return "canonical edge semantic hash does not match its contents"
+    return None
+
+
+def _invalid_canonical_result(value: Any, message: str) -> CanonicalPpiResult:
+    source_hash = canonical_json_sha256(value)
+    raw_count = getattr(value, "input_count", 0)
+    input_count = raw_count if type(raw_count) is int and raw_count >= 0 else 0
+    issue = ValidationIssue(
+        "invalid_canonical_result",
+        message,
+        None,
+        "legacy_unverified",
+        source_hash,
+        None,
+    )
+    return _build_result([], [issue], input_count, 0, source_hash)
+
+
+def _validate_canonical_result(value: CanonicalPpiResult) -> CanonicalPpiResult:
+    if type(value.schema_version) is not int or value.schema_version != PPI_SCHEMA_VERSION:
+        return _invalid_canonical_result(value, "Canonical PPI result has an unsupported schema version.")
+    if not isinstance(value.status, str) or value.status not in {"ready", "partial", "empty", "unresolved", "invalid"}:
+        return _invalid_canonical_result(value, "Canonical PPI result has an invalid status.")
+    if type(value.input_count) is not int or value.input_count < 0:
+        return _invalid_canonical_result(value, "Canonical PPI result input_count is invalid.")
+    if (
+        type(value.accepted_record_count) is not int
+        or value.accepted_record_count < 0
+        or value.accepted_record_count > value.input_count
+    ):
+        return _invalid_canonical_result(value, "Canonical PPI result accepted_record_count is invalid.")
+    if not isinstance(value.edges, tuple) or len(value.edges) > value.accepted_record_count:
+        return _invalid_canonical_result(value, "Canonical PPI result edges are malformed.")
+    if not isinstance(value.issues, tuple):
+        return _invalid_canonical_result(value, "Canonical PPI result issue ledger is malformed.")
+    if not all(_is_sha256(item) for item in (value.semantic_sha256, value.provenance_sha256, value.input_sha256)):
+        return _invalid_canonical_result(value, "Canonical PPI result hashes are invalid.")
+
+    for index, edge in enumerate(value.edges):
+        error = _canonical_edge_error(edge)
+        if error:
+            return _invalid_canonical_result(value, f"Canonical PPI result edge {index} is invalid: {error}.")
+    for issue in value.issues:
+        if not isinstance(issue, ValidationIssue):
+            return _invalid_canonical_result(value, "Canonical PPI result contains an invalid issue type.")
+        if (
+            not isinstance(issue.code, str)
+            or not issue.code
+            or not isinstance(issue.message, str)
+            or not isinstance(issue.source_kind, str)
+            or not _is_sha256(issue.source_record_hash)
+            or (issue.record_index is not None and (
+                type(issue.record_index) is not int
+                or issue.record_index < 0
+                or issue.record_index >= value.input_count
+            ))
+            or (issue.field is not None and not isinstance(issue.field, str))
+            or not isinstance(issue.mapping_hashes, tuple)
+            or any(not _is_sha256(mapping_hash) for mapping_hash in issue.mapping_hashes)
+        ):
+            return _invalid_canonical_result(value, "Canonical PPI result contains a malformed issue record.")
+
+    expected = _build_result(
+        value.edges,
+        value.issues,
+        value.input_count,
+        value.accepted_record_count,
+        value.input_sha256,
+    )
+    if (
+        value.edges != expected.edges
+        or value.issues != expected.issues
+        or value.status != expected.status
+        or value.semantic_sha256 != expected.semantic_sha256
+        or value.provenance_sha256 != expected.provenance_sha256
+    ):
+        return _invalid_canonical_result(value, "Canonical PPI result metadata does not match its contents.")
+    return value
+
+
+def _canonicalize_edge_sequence(edges: list[CanonicalPpiEdge]) -> CanonicalPpiResult:
+    input_hash = canonical_json_sha256(edges)
+    raw_count = max(len(edges), sum(
+        len(edge.provenance) if isinstance(edge, CanonicalPpiEdge) and isinstance(edge.provenance, tuple) else 1
+        for edge in edges
+    ))
+    issues = []
+    valid = []
+    for index, edge in enumerate(edges):
+        error = _canonical_edge_error(edge)
+        if error:
+            issues.append(ValidationIssue(
+                "invalid_canonical_edge",
+                error,
+                index,
+                "legacy_unverified",
+                canonical_json_sha256(edge),
+                None,
+            ))
+        else:
+            valid.append((index, edge))
+
+    by_pair = {}
+    for index, edge in valid:
+        by_pair.setdefault(edge.edge_key, []).append((index, edge))
+    unique_edges = []
+    accepted_count = 0
+    for pair_key in sorted(by_pair):
+        pair_records = by_pair[pair_key]
+        if len(pair_records) > 1:
+            code = "conflicting_duplicate_score" if len({item.score for _, item in pair_records}) > 1 else "duplicate_canonical_edge"
+            for index, edge in pair_records:
+                issues.append(ValidationIssue(
+                    code,
+                    "Canonical edge input repeats an unordered endpoint pair; duplicate entries are quarantined.",
+                    index,
+                    edge.provenance[0].source_kind,
+                    edge.provenance[0].source_record_hash,
+                    "score" if code == "conflicting_duplicate_score" else None,
+                ))
+            continue
+        edge = pair_records[0][1]
+        unique_edges.append(edge)
+        accepted_count += len(edge.provenance)
+    return _build_result(unique_edges, issues, raw_count, accepted_count, input_hash)
+
+
+def _metadata_failure(records: Any, errors: Sequence[tuple[str, str, Optional[str]]]) -> CanonicalPpiResult:
+    source_hash = canonical_json_sha256(records)
+    if isinstance(records, Mapping) and isinstance(records.get("interactions"), list):
+        rows = records["interactions"]
+    elif isinstance(records, list):
+        rows = records
+    else:
+        rows = []
+    issues = []
+    for code, message, field in errors:
+        if rows:
+            issues.extend(
+                ValidationIssue(code, message, index, "legacy_unverified", canonical_json_sha256(row), field)
+                for index, row in enumerate(rows)
+            )
+        else:
+            issues.append(ValidationIssue(code, message, None, "legacy_unverified", source_hash, field))
+    return _build_result([], issues, len(rows), 0, source_hash)
+
+
 def canonicalize_ppi(
     records: Any,
     *,
@@ -396,83 +630,76 @@ def canonicalize_ppi(
     least one ValidationIssue. Reversed duplicates merge provenance; conflicting
     weights for the same unordered pair are rejected as a group.
     """
+    metadata_errors = []
+    if source_kind is not None:
+        if not isinstance(source_kind, str):
+            metadata_errors.append(("invalid_source_kind", "source_kind must be a string.", "source_kind"))
+        elif source_kind not in _ALLOWED_SOURCE_KINDS:
+            metadata_errors.append(("unknown_source_kind", f"Unsupported source_kind {source_kind!r}.", "source_kind"))
+    if alias_mappings is not None and not isinstance(alias_mappings, Mapping):
+        metadata_errors.append(("invalid_alias_mappings", "alias_mappings must be an object keyed by alias.", "alias_mappings"))
+    if metadata_errors:
+        return _metadata_failure(records, metadata_errors)
+
     if isinstance(records, CanonicalPpiResult):
-        return records
+        return _validate_canonical_result(records)
     if isinstance(records, list) and records and all(isinstance(item, CanonicalPpiEdge) for item in records):
-        input_hash = canonical_json_sha256([edge.to_dict() for edge in records])
-        return _build_result(records, [], len(records), len(records), input_hash)
-    mappings = alias_mappings if isinstance(alias_mappings, Mapping) else {}
+        return _canonicalize_edge_sequence(records)
+
     source_hash = canonical_json_sha256(records)
     envelope_source_kind = None
-    source_schema_version = None
     root_issues: list[ValidationIssue] = []
-
     if isinstance(records, Mapping) and "interactions" in records:
         envelope = records
+        envelope_errors = []
+        if "schema_version" not in envelope:
+            envelope_errors.append(("missing_schema_version", "PPI envelopes must declare schema_version=2.", "schema_version"))
+        elif type(envelope["schema_version"]) is not int or envelope["schema_version"] != PPI_SCHEMA_VERSION:
+            envelope_errors.append((
+                "unsupported_schema_version",
+                f"Unsupported PPI schema version {envelope['schema_version']!r}; expected integer {PPI_SCHEMA_VERSION}.",
+                "schema_version",
+            ))
+        if "source_kind" in envelope:
+            envelope_kind = envelope["source_kind"]
+            if not isinstance(envelope_kind, str):
+                envelope_errors.append(("invalid_source_kind", "Envelope source_kind must be a string.", "source_kind"))
+            elif envelope_kind not in _ALLOWED_SOURCE_KINDS:
+                envelope_errors.append(("unknown_source_kind", f"Unsupported envelope source_kind {envelope_kind!r}.", "source_kind"))
+            elif source_kind is not None and envelope_kind != source_kind:
+                envelope_errors.append(("conflicting_source_kind", "Explicit source_kind conflicts with the PPI envelope.", "source_kind"))
+            else:
+                envelope_source_kind = envelope_kind
+        if "alias_mappings" in envelope and not isinstance(envelope["alias_mappings"], Mapping):
+            envelope_errors.append(("invalid_alias_mappings", "Envelope alias_mappings must be an object keyed by alias.", "alias_mappings"))
+        if envelope_errors:
+            return _metadata_failure(records, envelope_errors)
+
         unknown_envelope = sorted(set(envelope) - _ENVELOPE_FIELDS)
         if unknown_envelope:
             root_issues.append(ValidationIssue(
                 "unknown_fields",
                 f"Unknown PPI envelope fields: {', '.join(unknown_envelope)}",
                 None,
-                source_kind or "legacy_unverified",
+                source_kind or envelope_source_kind or "legacy_unverified",
                 source_hash,
                 unknown_envelope[0],
             ))
-        source_schema_version = envelope.get("schema_version")
-        if source_schema_version is not None and source_schema_version != PPI_SCHEMA_VERSION:
-            rows = envelope.get("interactions")
-            rows = rows if isinstance(rows, list) else []
-            issues = [
-                ValidationIssue(
-                    "unsupported_schema_version",
-                    f"Unsupported PPI schema version {source_schema_version!r}; expected {PPI_SCHEMA_VERSION}.",
-                    index,
-                    source_kind or str(envelope.get("source_kind") or "legacy_unverified"),
-                    canonical_json_sha256(row),
-                    "schema_version",
-                )
-                for index, row in enumerate(rows)
-            ]
-            if not issues:
-                issues.append(ValidationIssue(
-                    "unsupported_schema_version",
-                    f"Unsupported PPI schema version {source_schema_version!r}; expected {PPI_SCHEMA_VERSION}.",
-                    None,
-                    source_kind or "legacy_unverified",
-                    source_hash,
-                    "schema_version",
-                ))
-            return _build_result([], root_issues + issues, len(rows), 0, source_hash)
-        if source_kind is None:
-            envelope_source_kind = envelope.get("source_kind")
-        if alias_mappings is None and isinstance(envelope.get("alias_mappings"), Mapping):
-            mappings = envelope["alias_mappings"]
+        mappings = alias_mappings if alias_mappings is not None else envelope.get("alias_mappings", {})
         rows = envelope.get("interactions")
         if not isinstance(rows, list):
-            issue = ValidationIssue(
-                "invalid_collection",
-                "PPI interactions must be a list.",
-                None,
-                source_kind or "legacy_unverified",
-                source_hash,
-                "interactions",
-            )
-            return _build_result([], root_issues + [issue], 0, 0, source_hash)
+            return _metadata_failure(records, [("invalid_collection", "PPI interactions must be a list.", "interactions")])
     elif isinstance(records, list):
+        mappings = alias_mappings if alias_mappings is not None else {}
         rows = records
     else:
-        issue = ValidationIssue(
-            "invalid_collection",
-            "PPI input must be a list or a versioned object containing interactions.",
-            None,
-            source_kind or "legacy_unverified",
-            source_hash,
-            None,
-        )
-        return _build_result([], root_issues + [issue], 0, 0, source_hash)
+        return _metadata_failure(records, [("invalid_collection", "PPI input must be a list or a versioned object containing interactions.", None)])
 
-    requested_source = source_kind or envelope_source_kind
+    for alias, mapping in mappings.items():
+        if not isinstance(alias, str) or not alias or alias.strip() != alias or not isinstance(mapping, Mapping):
+            return _metadata_failure(records, [("invalid_alias_mappings", "Alias mappings must use non-empty string keys and object values.", "alias_mappings")])
+
+    requested_source = source_kind if source_kind is not None else envelope_source_kind
     input_rows = []
     issues = list(root_issues)
     candidate_records = []
@@ -492,8 +719,40 @@ def canonicalize_ppi(
             input_rows.append(_plain(row))
             continue
 
-        current_source = _source_for_record(row, requested_source)
         input_rows.append(_plain(row))
+        row_source = row.get("source_kind")
+        if "source_kind" in row:
+            if not isinstance(row_source, str):
+                issues.append(ValidationIssue(
+                    "invalid_source_kind",
+                    "Record source_kind must be a string.",
+                    index,
+                    "legacy_unverified",
+                    row_hash,
+                    "source_kind",
+                ))
+                continue
+            if row_source not in _ALLOWED_SOURCE_KINDS:
+                issues.append(ValidationIssue(
+                    "unknown_source_kind",
+                    f"Unsupported source_kind {row_source!r}.",
+                    index,
+                    row_source,
+                    row_hash,
+                    "source_kind",
+                ))
+                continue
+            if requested_source is not None and row_source != requested_source:
+                issues.append(ValidationIssue(
+                    "conflicting_source_kind",
+                    "Record source_kind conflicts with the explicit source origin.",
+                    index,
+                    requested_source,
+                    row_hash,
+                    "source_kind",
+                ))
+                continue
+        current_source = _source_for_record(row, requested_source)
         if current_source not in _ALLOWED_SOURCE_KINDS:
             issues.append(ValidationIssue(
                 "unknown_source_kind",
@@ -530,16 +789,20 @@ def canonicalize_ppi(
             original_endpoints.append(original_id or native_id or "")
             if native_id is None:
                 alias_field = f"protein_{side}"
-                has_alias = isinstance(row.get(alias_field), str) and bool(row.get(alias_field))
-                code = "unresolved_alias" if has_alias and field == alias_field else (
-                    "untrusted_alias_mapping" if has_alias else "missing_endpoint"
-                )
-                message = (
-                    f"Alias in {alias_field} has no verified source-native ID mapping."
-                    if code == "unresolved_alias"
-                    else f"Endpoint could not be resolved from {field or alias_field}."
-                )
-                issues.append(ValidationIssue(code, message, index, current_source, row_hash, field))
+                alias = row.get(alias_field)
+                has_alias = isinstance(alias, str) and bool(alias)
+                mapping_supplied = has_alias and alias in mappings
+                if not has_alias:
+                    code = "missing_endpoint"
+                    message = f"Endpoint could not be resolved from {field or alias_field}."
+                elif mapping_supplied:
+                    code = "untrusted_alias_mapping"
+                    message = f"Alias in {alias_field} has a mapping without verified stable identity and taxonomy provenance."
+                else:
+                    code = "unresolved_alias"
+                    message = f"Alias in {alias_field} has no verified source-native ID mapping."
+                mapping_hashes = (canonical_json_sha256(mappings[alias]),) if mapping_supplied else ()
+                issues.append(ValidationIssue(code, message, index, current_source, row_hash, field, mapping_hashes))
                 unresolved = True
                 row_error = True
                 break
@@ -648,6 +911,7 @@ def canonicalize_ppi(
                     provenance.source_kind,
                     provenance.source_record_hash,
                     "score",
+                    provenance.mapping_hashes,
                 ))
             continue
 
@@ -700,7 +964,7 @@ def _build_result(
         status = "partial"
     elif sorted_edges:
         status = "ready"
-    elif sorted_issues and all(issue.code == "unresolved_alias" for issue in sorted_issues):
+    elif sorted_issues and all(issue.code in {"unresolved_alias", "untrusted_alias_mapping"} for issue in sorted_issues):
         status = "unresolved"
     else:
         status = "invalid"
@@ -712,7 +976,7 @@ def _build_result(
         input_count=input_count,
         accepted_record_count=accepted_record_count,
         semantic_sha256=canonical_json_sha256(semantic_payload),
-        provenance_sha256=canonical_json_sha256(provenance_payload),
+        provenance_sha256=canonical_json_sha256({"accepted": provenance_payload, "issues": [asdict(issue) for issue in sorted_issues]}),
         input_sha256=input_sha256,
     )
 

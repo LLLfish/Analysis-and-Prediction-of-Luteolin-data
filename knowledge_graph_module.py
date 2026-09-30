@@ -66,6 +66,12 @@ class KnowledgeGraph:
 
     def build_from_data(self, compound_data: Dict, target_data, ppi_data=None):
         logger.info("Building knowledge graph from data...")
+        if NETWORKX_AVAILABLE:
+            self.graph = nx.MultiDiGraph()
+        self.entity_to_id = {}
+        self.relation_to_id = {}
+        self.triples = []
+        self.ppi_contract = None
         try:
             ppi_result = canonicalize_ppi(ppi_data if ppi_data is not None else [])
             self.ppi_contract = ppi_result.to_dict(include_edges=False)

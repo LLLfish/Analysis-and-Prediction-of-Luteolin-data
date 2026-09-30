@@ -5,6 +5,7 @@ Data Cleaning and Unified Dataset Construction for Luteolin
 数据流: PubChem -> ChEMBL -> UniProt -> STRING
 """
 
+import hashlib
 import os
 import json
 import logging
@@ -12,6 +13,7 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 import warnings
 warnings.filterwarnings
@@ -237,221 +239,260 @@ class LuteolinDataCollector:
         return self.raw_data['pubchem']
 
     def fetch_chembl_data(self) -> Dict[str, Any]:
-        logger.info("Step 2: Fetching target data from ChEMBL...")
+        """Capture complete, bounded ChEMBL evidence without field projection."""
+        logger.info("Step 2: Fetching bounded activity evidence from ChEMBL...")
+        from evidence_builder import _collect_chembl, activity_evidence_from_collector_payload, LegacyDisplayAdapter
+
+        requested_kind = getattr(self, "source_kind", "online_snapshot")
+        source_kind = requested_kind if requested_kind in {"online_snapshot", "synthetic_test"} else "online_snapshot"
+        molecule_ids = getattr(self, "chembl_molecule_ids", ["CHEMBL151"])
         try:
-            molecule_url = "https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?q=luteolin"
-            headers = {'Accept': 'application/json'}
-            response = requests.get(molecule_url, headers=headers, timeout=30)
-            response.raise_for_status()
-            # Verify response is actually JSON (PubChem may be blocked/redirected)
-            ct = response.headers.get("Content-Type", "")
-            if "json" not in ct and not response.text.strip().startswith("{"):
-                raise ValueError(f"PubChem returned non-JSON response (got {len(response.text)} bytes HTML). "
-                                f"PubChem may be blocked on this network; offline data will be used.")
-            data = response.json()
-
-            chembl_id = 'CHEMBL151'
-            molecules = data.get('molecules', [])
-
-            target_url = (
-                f"https://www.ebi.ac.uk/chembl/api/data/activity.json"
-                f"?molecule_chembl_id={chembl_id}&limit=100"
+            result = _collect_chembl(
+                molecule_ids,
+                max_pages=10,
+                max_records=1000,
+                timeout=30,
+                max_requests=128,
+                max_response_bytes=8_000_000,
             )
-            target_response = requests.get(target_url, headers=headers, timeout=30)
-            target_response.raise_for_status()
-            target_data = target_response.json()
-
-            activities = target_data.get('activities', [])
-            targets = []
-            for act in activities:
-                if act.get('target_chembl_id'):
-                    targets.append({
-                        'target_chembl_id': act.get('target_chembl_id'),
-                        'target_name': act.get('target_pref_name', ''),
-                        'gene_symbol': '',
-                        'organism': act.get('target_organism', ''),
-                        'activity_type': act.get('standard_type', ''),
-                        'activity_value': act.get('standard_value'),
-                        'activity_unit': act.get('standard_units', ''),
-                        'pchembl_value': act.get('pchembl_value')
-                    })
-
-            result = {
-                'chembl_id': chembl_id,
-                'fetch_time': datetime.now().isoformat(),
-                'targets': targets,
-                'total_activities': len(activities)
-            }
-            self.raw_data['chembl'] = result
-            logger.info("ChEMBL: ID=%s, activities=%d", chembl_id, len(activities))
+            result["chembl_id"] = molecule_ids[0] if len(molecule_ids) == 1 else None
+            result["source_kind"] = source_kind
+            result["fetch_time"] = datetime.now().isoformat()
+            raw_page_root = Path(self.output_dir) / "raw" / "chembl" / "activities"
+            raw_page_root.mkdir(parents=True, exist_ok=True)
+            for page_index, page in enumerate(result.get("activity_pages", []), start=1):
+                page["source_kind"] = source_kind
+                molecule_id = page["molecule_chembl_id"]
+                raw_text = page["raw_response_text"]
+                page_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+                relative_path = f"raw/chembl/activities/{molecule_id}/{page_hash}.json"
+                snapshot_path = Path(self.output_dir) / Path(relative_path)
+                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                if snapshot_path.exists():
+                    if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != page_hash:
+                        raise ValueError(f"immutable ChEMBL snapshot collision: {relative_path}")
+                else:
+                    with snapshot_path.open("xb") as snapshot:
+                        snapshot.write(raw_text.encode("utf-8"))
+                page["source_path"] = relative_path
+                page["source_sha256"] = page_hash
+                for receipt in result.get("page_receipts", []):
+                    if receipt.get("response_sha256") == page["response_sha256"]:
+                        receipt["source_kind"] = source_kind
+                        receipt["source_path"] = relative_path
+                        receipt["source_sha256"] = page_hash
+            for receipt in result.get("page_receipts", []):
+                source_id = receipt.get("source_id", "")
+                if not source_id.startswith(("chembl_molecule:", "chembl_target:")):
+                    continue
+                category, identifier = source_id.split(":", 1)
+                if not identifier.startswith("CHEMBL") or not identifier[6:].isdigit():
+                    continue
+                raw_text = receipt.get("raw_response_text")
+                payload = receipt.get("payload")
+                if not isinstance(raw_text, str) or not isinstance(payload, dict):
+                    continue
+                source_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+                relative_path = f"raw/chembl/{category.removeprefix('chembl_')}/{identifier}/{source_hash}.json"
+                snapshot_path = Path(self.output_dir) / Path(relative_path)
+                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                if snapshot_path.exists():
+                    if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != source_hash:
+                        raise ValueError(f"immutable ChEMBL snapshot collision: {relative_path}")
+                else:
+                    with snapshot_path.open("xb") as snapshot:
+                        snapshot.write(raw_text.encode("utf-8"))
+                receipt["source_path"] = relative_path
+                receipt["source_sha256"] = source_hash
+            result["activities"] = [
+                activity
+                for page in result.get("activity_pages", [])
+                for activity in page.get("activities", [])
+            ]
+            evidence_rows = activity_evidence_from_collector_payload(result)
+            result["targets"] = LegacyDisplayAdapter.targets(evidence_rows)
+            result["total_activities"] = len(result["activities"])
+            result["collection_status"] = (
+                "complete" if result.get("pagination_status") == "complete" else "incomplete"
+            )
+            self.raw_data["chembl"] = result
+            logger.info(
+                "ChEMBL: molecules=%d, pages=%d, activities=%d, pagination=%s",
+                len(molecule_ids), result.get("page_count", 0),
+                result["total_activities"], result.get("pagination_status"),
+            )
         except Exception as e:
-            logger.warning("ChEMBL network error: %s, using offline data", e)
+            logger.warning("ChEMBL retrieval incomplete: %s", e)
             result = {
-                'chembl_id': 'CHEMBL151',
-                'fetch_time': datetime.now().isoformat(),
-                'targets': self.offline_targets.copy(),
-                'total_activities': len(self.offline_targets),
-                'source': 'offline'
+                "chembl_id": "CHEMBL151",
+                "fetch_time": datetime.now().isoformat(),
+                "source_kind": "legacy_unverified",
+                "activities": [],
+                "activity_pages": [],
+                "targets": [],
+                "total_activities": 0,
+                "pagination_status": "incomplete",
+                "collection_status": "incomplete",
+                "incomplete_reasons": [str(e)],
             }
-            self.raw_data['chembl'] = result
-            logger.info("Offline data loaded: %d targets", len(self.offline_targets))
+            self.raw_data["chembl"] = result
 
         raw_dir = os.path.join(self.output_dir, "raw")
         json_path = os.path.join(raw_dir, "chembl_luteolin_targets.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(self.raw_data['chembl'], f, ensure_ascii=False, indent=2)
-        return self.raw_data['chembl']
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        raw_sha256 = hashlib.sha256(Path(json_path).read_bytes()).hexdigest()
+        result["raw_snapshot_path"] = os.path.relpath(json_path, self.output_dir).replace(os.sep, "/")
+        result["raw_snapshot_sha256"] = raw_sha256
+        return result
 
     def fetch_tcmsp_data(self) -> Dict[str, Any]:
-        logger.info("Step 2.5: Fetching TCM data from TCMSP...")
+        """Return the embedded TCMSP reference without calling it online evidence."""
+        logger.info("Step 2.5: Recording TCMSP static reference provenance...")
+        request_status = "not_attempted"
+        http_status = None
         try:
             tcmsp_url = "https://tcmsp-e.com/tcmspsearch.php?qs=compound_name&qr=luteolin"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json'
-            }
-            response = requests.get(tcmsp_url, headers=headers, timeout=30)
+            response = requests.get(
+                tcmsp_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json",
+                },
+                timeout=30,
+            )
             response.raise_for_status()
-
-            result = {
-                'mol_id': 'MOL000006',
-                'name': 'luteolin',
-                'name_cn': '木犀草素',
-                'fetch_time': datetime.now().isoformat(),
-                'adme': self.offline_tcmsp.get('adme', {}),
-                'herbs': self.offline_tcmsp.get('herbs', []),
-                'targets': self.offline_tcmsp.get('targets', []),
-                'diseases': self.offline_tcmsp.get('diseases', []),
-                'source': 'online'
-            }
-            self.raw_data['tcmsp'] = result
-            logger.info("TCMSP: Mol ID=%s, herbs=%d, targets=%d",
-                        result['mol_id'], len(result['herbs']), len(result['targets']))
+            http_status = getattr(response, "status_code", None)
+            request_status = "http_success_static_payload_not_used"
         except Exception as e:
-            logger.warning("TCMSP network error: %s, using offline data", e)
-            result = {
-                'mol_id': self.offline_tcmsp.get('mol_id', 'MOL000006'),
-                'name': 'luteolin',
-                'name_cn': '木犀草素',
-                'fetch_time': datetime.now().isoformat(),
-                'adme': self.offline_tcmsp.get('adme', {}),
-                'herbs': self.offline_tcmsp.get('herbs', []),
-                'targets': self.offline_tcmsp.get('targets', []),
-                'diseases': self.offline_tcmsp.get('diseases', []),
-                'source': 'offline'
-            }
-            self.raw_data['tcmsp'] = result
-            logger.info("Offline TCM data loaded: herbs=%d, targets=%d",
-                        len(result['herbs']), len(result['targets']))
+            request_status = "http_unavailable_static_payload_used"
+            logger.info("TCMSP page request status=%s: %s", request_status, e)
 
+        static_path = os.path.join(os.path.dirname(__file__), "offline_data.json")
+        static_sha256 = hashlib.sha256(Path(static_path).read_bytes()).hexdigest() if os.path.isfile(static_path) else None
+        result = {
+            "mol_id": self.offline_tcmsp.get("mol_id"),
+            "name": "luteolin",
+            "name_cn": "木犀草素",
+            "fetch_time": datetime.now().isoformat(),
+            "adme": self.offline_tcmsp.get("adme", {}),
+            "herbs": self.offline_tcmsp.get("herbs", []),
+            "targets": self.offline_tcmsp.get("targets", []),
+            "diseases": self.offline_tcmsp.get("diseases", []),
+            "source": "static_reference",
+            "source_kind": "static_reference",
+            "evidence_status": "unverified",
+            "source_path": "offline_data.json",
+            "source_sha256": static_sha256,
+            "http_request_status": request_status,
+            "http_status": http_status,
+        }
+        self.raw_data["tcmsp"] = result
+        logger.info(
+            "TCMSP retained as static_reference: herbs=%d, targets=%d",
+            len(result["herbs"]), len(result["targets"]),
+        )
         raw_dir = os.path.join(self.output_dir, "raw")
         json_path = os.path.join(raw_dir, "tcmsp_luteolin.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(self.raw_data['tcmsp'], f, ensure_ascii=False, indent=2)
-        return self.raw_data['tcmsp']
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        return result
 
     def fetch_uniprot_data(self, gene_symbols: List[str]) -> Dict[str, Any]:
-        logger.info("Step 3: Fetching protein data from UniProt...")
-        proteins = []
-        found_genes = set()
-
-        try:
-            for gene in gene_symbols:
-                if gene in self.offline_proteins:
-                    proteins.append(self.offline_proteins[gene].copy())
-                    found_genes.add(gene)
-                    continue
-                url = (
-                    f"https://rest.uniprot.org/uniprotkb/search?query=gene:{gene}"
-                    f"+AND+organism_id:9606&fields=accession,id,gene_names,"
-                    f"protein_name,length,mass,entry_name&format=json&size=1"
-                )
-                response = requests.get(url, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    results = data.get('results', [])
-                    if results:
-                        protein = results[0]
-                        protein_info = {
-                            'gene_symbol': gene,
-                            'uniprot_id': protein.get('primaryAccession', ''),
-                            'entry_name': protein.get('uniProtkbId', ''),
-                            'protein_name': protein.get('proteinDescription', {}).get(
-                                'recommendedName', {}).get('fullName', {}).get('value', ''),
-                            'length': protein.get('sequence', {}).get('length', 0),
-                            'mass': protein.get('sequence', {}).get('mass', 0)
-                        }
-                        proteins.append(protein_info)
-                        found_genes.add(gene)
-            logger.info("UniProt: %d proteins retrieved", len(proteins))
-        except Exception as e:
-            logger.warning("UniProt network error: %s, using offline data", e)
-            for gene in gene_symbols:
-                if gene in self.offline_proteins and gene not in found_genes:
-                    proteins.append(self.offline_proteins[gene].copy())
-                    found_genes.add(gene)
-            logger.info("Offline protein data loaded: %d proteins", len(proteins))
-
+        """Reject symbol-only target guesses; sequence hydration needs exact components."""
+        logger.info("Step 3: UniProt symbol search disabled pending verified target components...")
+        unresolved = []
+        for value in gene_symbols or []:
+            if isinstance(value, str) and value.strip():
+                unresolved.append({
+                    "query": value,
+                    "reason": "symbol_search_disabled",
+                    "resolution_status": "unverified",
+                })
         result = {
-            'fetch_time': datetime.now().isoformat(),
-            'proteins': proteins,
-            'total_proteins': len(proteins)
+            "retrieval_status": "not_requested",
+            "resolution_status": "unverified" if unresolved else "empty",
+            "source_kind": "legacy_unverified",
+            "proteins": [],
+            "total_proteins": 0,
+            "unresolved_requests": unresolved,
+            "reason": "verified ChEMBL target component accession and taxonomy are required",
         }
-        self.raw_data['uniprot'] = result
-
+        self.raw_data["uniprot"] = result
         raw_dir = os.path.join(self.output_dir, "raw")
         json_path = os.path.join(raw_dir, "uniprot_proteins.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         return result
 
     def fetch_string_data(self, gene_symbols: List[str]) -> Dict[str, Any]:
-        logger.info("Step 4: Fetching PPI network from STRING...")
-        try:
-            string_api_url = "https://string-db.org/api"
-            output_format = "json"
-            method = "network"
-            species = 9606
-            params = {
-                'identifiers': '\r'.join(gene_symbols),
-                'species': species,
-                'limit': 20,
-                'caller_identity': 'luteolin_analysis'
+        """Fetch STRING only for explicit seeds; never substitute static fallback rows."""
+        symbols = sorted({
+            value.strip() for value in (gene_symbols or [])
+            if isinstance(value, str) and value.strip()
+        })
+        if not symbols:
+            result = {
+                "species": "Homo sapiens",
+                "species_id": 9606,
+                "fetch_time": datetime.now().isoformat(),
+                "input_genes": [],
+                "interactions": [],
+                "total_interactions": 0,
+                "source_kind": "legacy_unverified",
+                "resolution_status": "empty",
+                "request_status": "not_requested",
             }
-            url = f"{string_api_url}/{output_format}/{method}"
-            response = requests.post(url, data=params, timeout=60)
+            self.raw_data["string"] = result
+            raw_dir = os.path.join(self.output_dir, "raw")
+            with open(os.path.join(raw_dir, "string_ppi_network.json"), "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            return result
+
+        logger.info("Step 4: Fetching STRING PPI for %d explicit seed symbols...", len(symbols))
+        try:
+            url = "https://string-db.org/api/json/network"
+            response = requests.post(
+                url,
+                data={
+                    "identifiers": "\r".join(symbols),
+                    "species": 9606,
+                    "limit": 20,
+                    "caller_identity": "luteolin_analysis",
+                },
+                timeout=60,
+            )
             response.raise_for_status()
             interactions = response.json()
-
+            if not isinstance(interactions, list) or any(not isinstance(row, dict) for row in interactions):
+                raise ValueError("STRING response must be a list of interaction objects")
             result = {
-                'species': 'Homo sapiens',
-                'species_id': species,
-                'fetch_time': datetime.now().isoformat(),
-                'input_genes': gene_symbols,
-                'interactions': interactions,
-                'total_interactions': len(interactions)
+                "species": "Homo sapiens",
+                "species_id": 9606,
+                "fetch_time": datetime.now().isoformat(),
+                "input_genes": symbols,
+                "interactions": interactions,
+                "total_interactions": len(interactions),
+                "source_kind": "online_snapshot",
+                "request_status": "complete",
             }
-            self.raw_data['string'] = result
-            logger.info("STRING: %d genes, %d interactions",
-                        len(gene_symbols), len(interactions))
         except Exception as e:
-            logger.warning("STRING network error: %s, using offline data", e)
+            logger.warning("STRING retrieval incomplete: %s", e)
             result = {
-                'species': 'Homo sapiens',
-                'species_id': 9606,
-                'fetch_time': datetime.now().isoformat(),
-                'input_genes': gene_symbols,
-                'interactions': self.offline_interactions.copy(),
-                'total_interactions': len(self.offline_interactions),
-                'source': 'offline'
+                "species": "Homo sapiens",
+                "species_id": 9606,
+                "fetch_time": datetime.now().isoformat(),
+                "input_genes": symbols,
+                "interactions": [],
+                "total_interactions": 0,
+                "source_kind": "legacy_unverified",
+                "resolution_status": "incomplete",
+                "request_status": "failed",
+                "reason": str(e),
             }
-            self.raw_data['string'] = result
-            logger.info("Offline PPI data loaded: %d interactions",
-                        len(self.offline_interactions))
-
+        self.raw_data["string"] = result
         raw_dir = os.path.join(self.output_dir, "raw")
-        json_path = os.path.join(raw_dir, "string_ppi_network.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
+        with open(os.path.join(raw_dir, "string_ppi_network.json"), "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         return result
 
@@ -462,78 +503,105 @@ class LuteolinDataCollector:
         return ''
 
     def clean_and_standardize(self) -> Dict[str, Any]:
-        logger.info("Step 5: Data Cleaning and Standardization...")
+        """Project raw collector output while retaining separate evidence rows."""
+        logger.info("Step 5: Building evidence and legacy display projections...")
+        from dataclasses import asdict
+        from evidence_builder import activity_evidence_from_collector_payload, LegacyDisplayAdapter
+
+        chembl_payload = self.raw_data.get("chembl", {})
+        activity_rows = activity_evidence_from_collector_payload(chembl_payload)
+        serialized_evidence = [asdict(row) for row in activity_rows]
         cleaned_data = {
-            'compound': {},
-            'targets': [],
-            'interactions': [],
-            'proteins': [],
-            'metadata': {
-                'processing_time': datetime.now().isoformat(),
-                'data_sources': list(self.raw_data.keys())
-            }
+            "compound": {},
+            "targets": [],
+            "activity_evidence": serialized_evidence,
+            "interactions": [],
+            "proteins": [],
+            "metadata": {
+                "processing_time": datetime.now().isoformat(),
+                "data_sources": list(self.raw_data.keys()),
+                "activity_pagination_status": chembl_payload.get("pagination_status", "unknown"),
+                "activity_collection_status": chembl_payload.get("collection_status", "legacy_unverified"),
+                "activity_source_kind": chembl_payload.get("source_kind", "legacy_unverified"),
+            },
         }
-        if 'pubchem' in self.raw_data:
-            pubchem = self.raw_data['pubchem']
-            props = pubchem.get('properties', {})
-            cleaned_data['compound'] = {
-                'name': 'Luteolin',
-                'name_cn': '木犀草素',
-                'pubchem_cid': pubchem.get('cid'),
-                'chembl_id': self.raw_data.get('chembl', {}).get('chembl_id', 'CHEMBL151'),
-                'molecular_formula': props.get('Molecular_Formula', 'C15H10O6'),
-                'molecular_weight': float(props.get('Molecular_Weight', 286.24)),
-                'smiles': (props.get('Canonical_SMILES', '')
-                           or props.get('SMILES_Absolute', '')
-                           or props.get('SMILES_Connectivity', '')
-                           or 'C1=CC(=C(C=C1C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O)O'),
-                'inchi': props.get('InChI', '') or props.get('InChI_Standard', ''),
-                'inchikey': props.get('InChIKey', '') or props.get('InChIKey_Standard', ''),
+        if "pubchem" in self.raw_data:
+            pubchem = self.raw_data["pubchem"]
+            props = pubchem.get("properties", {})
+            smiles = (
+                props.get("Canonical_SMILES")
+                or props.get("SMILES_Absolute")
+                or props.get("SMILES_Connectivity")
+            )
+            cleaned_data["compound"] = {
+                "name": pubchem.get("name") or self.compound_name,
+                "name_cn": pubchem.get("name_cn") or self.compound_name_cn,
+                "pubchem_cid": pubchem.get("cid"),
+                "chembl_id": chembl_payload.get("chembl_id"),
+                "molecular_formula": props.get("Molecular_Formula"),
+                "molecular_weight": props.get("Molecular_Weight"),
+                "smiles": smiles,
+                "inchi": props.get("InChI") or props.get("InChI_Standard"),
+                "inchikey": props.get("InChIKey") or props.get("InChIKey_Standard"),
+                "raw_record": pubchem,
+                "structure_status": "present" if isinstance(smiles, str) and smiles.strip() else "missing",
             }
-            logger.info("Compound data cleaned")
 
-        if 'chembl' in self.raw_data:
-            targets = self.raw_data['chembl'].get('targets', [])
-            seen_targets = set()
-            cleaned_targets = []
-            protein_data = {p.get('gene_symbol'): p
-                           for p in self.raw_data.get('uniprot', {}).get('proteins', [])}
+        display_rows = LegacyDisplayAdapter.targets(activity_rows)
+        for target in display_rows:
+            components = target.get("target_components")
+            if not isinstance(components, list):
+                matching_evidence = next((
+                    item for item in serialized_evidence
+                    if item.get("activity_id") == target.get("activity_id")
+                    and item.get("target_chembl_id") == target.get("target_chembl_id")
+                ), {})
+                components = matching_evidence.get("target_components", [])
+            accessions = [
+                component.get("accession")
+                for component in components
+                if isinstance(component, dict) and isinstance(component.get("accession"), str)
+            ]
+            organism = normalize_organism(target.get("organism"))
+            target_class = classify_target(target)
+            target_type = next((
+                item.get("target_type") for item in serialized_evidence
+                if item.get("activity_id") == target.get("activity_id")
+                and item.get("target_chembl_id") == target.get("target_chembl_id")
+            ), None)
+            is_confirmed_single_human = (
+                target_type == "SINGLE PROTEIN"
+                and organism == "Homo sapiens"
+                and len(accessions) == 1
+                and all(
+                    component.get("component_tax_id", component.get("tax_id")) in (9606, "9606")
+                    for component in components if isinstance(component, dict)
+                )
+            )
+            cleaned_data["targets"].append({
+                **target,
+                "target_name": target.get("target_name"),
+                "gene_symbol": target.get("gene_symbol"),
+                "uniprot_id": accessions[0] if is_confirmed_single_human else None,
+                "organism": organism,
+                "target_type": target_type,
+                "target_components": components,
+                "target_class": target_class,
+                "is_valid_target": False,
+            })
 
-            for target in targets:
-                target_id = target.get('target_chembl_id', '')
-                if target_id and target_id not in seen_targets and target_id != 'N/A':
-                    seen_targets.add(target_id)
-                    gene_symbol = target.get('gene_symbol', '')
-                    if not gene_symbol:
-                        gene_symbol = self._map_target_to_gene(target.get('target_name', ''))
-                    uniprot_id = ''
-                    if gene_symbol in protein_data:
-                        uniprot_id = protein_data[gene_symbol].get('uniprot_id', '')
-                    elif gene_symbol in self.offline_proteins:
-                        uniprot_id = self.offline_proteins[gene_symbol].get('uniprot_id', '')
-                    organism = normalize_organism(target.get('organism', 'Homo sapiens'))
-                    target_class = classify_target(target)
-                    cleaned_targets.append({
-                        'target_chembl_id': target_id,
-                        'target_name': target.get('target_name', ''),
-                        'gene_symbol': gene_symbol,
-                        'uniprot_id': uniprot_id,
-                        'organism': organism,
-                        'activity_type': target.get('activity_type', ''),
-                        'activity_value': target.get('activity_value'),
-                        'activity_unit': target.get('activity_unit', ''),
-                        'pchembl_value': target.get('pchembl_value'),
-                        'target_class': target_class,
-                        'is_valid_target': target_class != 'non_protein_or_unchecked'
-                    })
-            cleaned_data['targets'] = cleaned_targets
-            logger.info("Targets cleaned: %d unique targets", len(cleaned_targets))
-
-        cleaned_data['proteins'] = self.raw_data.get('uniprot', {}).get('proteins', [])
-        cleaned_data['interactions'] = self.raw_data.get('string', {}).get('interactions', [])
+        raw_proteins = self.raw_data.get("uniprot", {}).get("proteins", [])
+        for protein in raw_proteins:
+            if not isinstance(protein, dict):
+                continue
+            copied = dict(protein)
+            if not copied.get("sequence"):
+                copied["sequence_status"] = "missing"
+                copied["sequence_status_reason"] = "legacy_payload_has_metadata_without_sequence"
+            cleaned_data["proteins"].append(copied)
+        cleaned_data["interactions"] = self.raw_data.get("string", {}).get("interactions", [])
         self.processed_data = cleaned_data
         return cleaned_data
-
     def save_processed_data(self) -> str:
         processed_dir = os.path.join(self.output_dir, "processed")
         if not self.processed_data:
@@ -579,13 +647,15 @@ class LuteolinDataCollector:
         self.fetch_pubchem_data()
         self.fetch_chembl_data()
         self.fetch_tcmsp_data()
-        targets = self.raw_data.get('chembl', {}).get('targets', [])
-        gene_symbols = []
-        for t in targets:
-            gene = t.get('gene_symbol', '') or self._map_target_to_gene(t.get('target_name', ''))
-            if gene and normalize_organism(t.get('organism')) == 'Homo sapiens':
-                gene_symbols.append(gene)
-        gene_symbols = list(set(gene_symbols))
+        targets = self.raw_data.get("chembl", {}).get("targets", [])
+        gene_symbols = sorted({
+            target.get("gene_symbol").strip()
+            for target in targets
+            if isinstance(target, dict)
+            and isinstance(target.get("gene_symbol"), str)
+            and target.get("gene_symbol").strip()
+            and normalize_organism(target.get("organism")) == "Homo sapiens"
+        })
         self.fetch_uniprot_data(gene_symbols)
         self.fetch_string_data(gene_symbols)
         self.clean_and_standardize()

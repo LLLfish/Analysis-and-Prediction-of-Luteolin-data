@@ -12,7 +12,7 @@
         "molecule_type": "Small molecule",
         "molecule_structures": {
           "canonical_smiles": "C1=CC(=C(C=C1C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O)O",
-          "standard_inchi": "InChI=1S/C15H10O6/c16-8-3-1-7(2-4-8)15-14(20)13-11(19)5-9(17)6-10(13)12(18)21-15/h1-6,16-18H"
+          "standard_inchi": "InChI=1S/C15H10O6/c16-8-4-11(19)15-12(20)6-13(21-14(15)5-8)7-1-2-9(17)10(18)3-7/h1-6,16-19H"
         }
       },
       {

@@ -390,6 +390,7 @@ class LuteolinDataCollector:
         logger.info("Step 2.5: Recording TCMSP static reference provenance...")
         request_status = "not_attempted"
         http_status = None
+        response = None
         try:
             tcmsp_url = "https://tcmsp-e.com/tcmspsearch.php?qs=compound_name&qr=luteolin"
             response = requests.get(
@@ -399,14 +400,27 @@ class LuteolinDataCollector:
                     "Accept": "application/json",
                 },
                 timeout=30,
+                stream=True,
+                allow_redirects=False,
             )
-            response.raise_for_status()
+            final_url = getattr(response, "url", tcmsp_url)
+            if not isinstance(final_url, str) or not final_url.startswith("https://tcmsp-e.com/"):
+                raise ValueError("TCMSP response escaped the configured host")
             http_status = getattr(response, "status_code", None)
+            if type(http_status) is not int or not 200 <= http_status < 300:
+                raise ValueError(f"TCMSP static probe returned HTTP {http_status!r}")
+            response.raise_for_status()
             request_status = "http_success_static_payload_not_used"
         except Exception as e:
             request_status = "http_unavailable_static_payload_used"
             logger.info("TCMSP page request status=%s: %s", request_status, e)
-
+        finally:
+            close = getattr(response, "close", None) if response is not None else None
+            if callable(close):
+                try:
+                    close()
+                except Exception as close_error:
+                    logger.debug("TCMSP static probe close failed: %s", close_error)
         static_path = os.path.join(os.path.dirname(__file__), "offline_data.json")
         static_sha256 = hashlib.sha256(Path(static_path).read_bytes()).hexdigest() if os.path.isfile(static_path) else None
         result = {

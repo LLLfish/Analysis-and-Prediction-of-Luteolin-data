@@ -168,9 +168,15 @@ def test_legacy_rows_remain_unverified_and_missing_ids_stay_null(tmp_path):
 
 def test_static_tcmsp_payload_stays_static_after_http_success(tmp_path, monkeypatch):
     collector = LuteolinDataCollector(output_dir=str(tmp_path / "tcmsp"))
+    calls = []
+
+    def successful_static_probe(url, **kwargs):
+        calls.append((url, kwargs))
+        return _Response({"ok": True}, url)
+
     monkeypatch.setattr(
         "data_collection.requests.get",
-        lambda url, **kwargs: _Response({"ok": True}, url),
+        successful_static_probe,
     )
 
     result = collector.fetch_tcmsp_data()
@@ -178,6 +184,8 @@ def test_static_tcmsp_payload_stays_static_after_http_success(tmp_path, monkeypa
     assert result["source_kind"] == "static_reference"
     assert result["source"] != "online"
     assert result["evidence_status"] == "unverified"
+    assert calls[0][1]["stream"] is True
+    assert calls[0][1]["allow_redirects"] is False
 
 
 def test_local_builder_exports_page_status_and_full_activity_records(tmp_path, monkeypatch):

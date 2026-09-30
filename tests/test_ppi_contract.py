@@ -2,12 +2,20 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import csv
+from dataclasses import replace
 import json
 import math
 
 from main import NetworkPharmacologyFramework
 from knowledge_graph_module import KnowledgeGraph
-from data_contracts import canonical_json_sha256, canonicalize_ppi, read_ppi_records
+from data_contracts import (
+    CanonicalPpiEdge,
+    CanonicalPpiEndpoint,
+    PpiRecordProvenance,
+    canonical_json_sha256,
+    canonicalize_ppi,
+    read_ppi_records,
+)
 
 
 ONLINE_EDGE = {
@@ -375,3 +383,105 @@ def test_unknown_schema_fields_and_display_only_names_never_become_edges():
     assert unknown_field.issues[0].code == "unknown_fields"
     assert display_only.edge_count == 0
     assert display_only.issues[0].code == "missing_endpoint"
+
+
+def test_envelope_and_source_metadata_require_exact_supported_types():
+    record = {
+        "stringId_A": "9606.ENSP00000354587",
+        "stringId_B": "9606.ENSP00000263967",
+        "ncbiTaxonId": 9606,
+        "score": 0.5,
+    }
+    legacy_record = {
+        "protein_a": "AKT1",
+        "protein_b": "PIK3CA",
+        "ncbiTaxonId": 9606,
+        "score": 0.5,
+    }
+    float_version = canonicalize_ppi(
+        {"schema_version": 2.0, "interactions": [record]}, source_kind="synthetic_test"
+    )
+    invalid_source = canonicalize_ppi([record], source_kind={})
+    invalid_mappings = canonicalize_ppi({
+        "schema_version": 2,
+        "source_kind": "legacy_unverified",
+        "interactions": [legacy_record],
+        "alias_mappings": [],
+    })
+    unasserted_origin = canonicalize_ppi([record])
+
+    assert float_version.status == "invalid"
+    assert float_version.edge_count == 0
+    assert float_version.issues[0].code == "unsupported_schema_version"
+    assert invalid_source.status == "invalid"
+    assert invalid_source.edge_count == 0
+    assert invalid_source.issues[0].code == "invalid_source_kind"
+    assert invalid_mappings.status == "invalid"
+    assert invalid_mappings.edge_count == 0
+    assert invalid_mappings.issues[0].code == "invalid_alias_mappings"
+    assert unasserted_origin.status == "ready"
+    assert unasserted_origin.edges[0].provenance[0].source_kind == "legacy_unverified"
+
+
+def test_untrusted_canonical_dataclass_edges_and_results_are_rejected():
+    endpoint_a = CanonicalPpiEndpoint(9606, "9606.PROTEIN_A")
+    endpoint_b = CanonicalPpiEndpoint(9606, "9606.PROTEIN_B")
+    forged_edge = CanonicalPpiEdge(
+        endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b,
+        score=math.nan,
+        provenance=(),
+        semantic_sha256="f" * 64,
+    )
+    forged_edge_result = canonicalize_ppi([forged_edge], source_kind="synthetic_test")
+    valid_result = canonicalize_ppi([{
+        "stringId_A": endpoint_a.source_native_id,
+        "stringId_B": endpoint_b.source_native_id,
+        "ncbiTaxonId": 9606,
+        "score": 0.5,
+    }], source_kind="synthetic_test")
+    forged_result = replace(valid_result, semantic_sha256="f" * 64)
+    checked_result = canonicalize_ppi(forged_result)
+
+    assert forged_edge_result.status == "invalid"
+    assert forged_edge_result.edge_count == 0
+    assert forged_edge_result.issues[0].code == "invalid_canonical_edge"
+    assert checked_result.status == "invalid"
+    assert checked_result.edge_count == 0
+    assert checked_result.issues[0].code == "invalid_canonical_result"
+
+
+def test_rebuilding_knowledge_graph_replaces_previous_ppi_state(tmp_path):
+    first = canonicalize_ppi([{
+        "stringId_A": "9606.ENSP00000000001",
+        "stringId_B": "9606.ENSP00000000002",
+        "ncbiTaxonId": 9606,
+        "score": 0.6,
+    }], source_kind="synthetic_test")
+    second = canonicalize_ppi([{
+        "stringId_A": "9606.ENSP00000000003",
+        "stringId_B": "9606.ENSP00000000004",
+        "ncbiTaxonId": 9606,
+        "score": 0.8,
+    }], source_kind="synthetic_test")
+    graph = KnowledgeGraph(output_dir=str(tmp_path / "repeat-build"))
+
+    graph.build_from_data({}, [], first)
+    assert graph.compute_graph_statistics()["num_edges"] == 1
+    graph.build_from_data({}, [], first)
+    assert graph.compute_graph_statistics()["num_edges"] == 1
+    assert len(graph.triples) == 1
+
+    graph.build_from_data({}, [], second)
+    ppi_edges = [
+        (left, right, properties)
+        for left, right, properties in graph.graph.edges(data=True)
+        if properties.get("relation") == "interacts_with"
+    ]
+    assert len(ppi_edges) == 1
+    assert {ppi_edges[0][0], ppi_edges[0][1]} == {
+        (9606, "9606.ENSP00000000003"),
+        (9606, "9606.ENSP00000000004"),
+    }
+    assert len(graph.triples) == 1
+    assert graph.ppi_contract["semantic_sha256"] == second.semantic_sha256

@@ -601,3 +601,32 @@ def test_real_legacy_string_snapshots_keep_source_hashes_and_records(
     if expected_record_count == 129:
         assert result.accepted_record_count == 129
         assert result.issues == ()
+
+
+def test_string_taxonomy_adapter_is_decimal_only_and_preserves_raw_record_hash():
+    raw_record = {
+        "stringId_A": "9606.ENSP00000244573",
+        "stringId_B": "9606.ENSP00000261254",
+        "ncbiTaxonId": "9606",
+        "score": 0.531,
+    }
+    result = canonicalize_ppi([raw_record], source_kind="legacy_unverified")
+    assert result.status == "ready"
+    assert result.edges[0].endpoint_a.taxonomy_id == 9606
+    assert type(result.edges[0].endpoint_a.taxonomy_id) is int
+    assert result.edges[0].source_record_hashes == (canonical_json_sha256(raw_record),)
+
+    for bad_taxonomy in (True, "9606x", "9606.0", 9606.0):
+        invalid = canonicalize_ppi(
+            [{**raw_record, "ncbiTaxonId": bad_taxonomy}],
+            source_kind="legacy_unverified",
+        )
+        assert invalid.edge_count == 0
+        assert invalid.issues[0].code in {"invalid_taxonomy", "taxonomy_conflict"}
+
+    conflict = canonicalize_ppi(
+        [{**raw_record, "taxonomy_id": 10090}],
+        source_kind="legacy_unverified",
+    )
+    assert conflict.edge_count == 0
+    assert conflict.issues[0].code == "taxonomy_conflict"

@@ -1,0 +1,127 @@
+{
+  "schema_version": 2,
+  "purpose": "synthetic_test_only",
+  "fixtures": [
+    {
+      "id": "string_native_id_shape",
+      "source_kind": "synthetic_test",
+      "input_format": "string_native",
+      "record": {
+        "stringId_A": "9606.ENSP00000354587",
+        "stringId_B": "9606.ENSP00000263967",
+        "preferredName_A": "AKT1",
+        "preferredName_B": "PIK3CA",
+        "ncbiTaxonId": 9606,
+        "score": 0.985
+      },
+      "expected": {
+        "status": "ready",
+        "issue_code": null
+      }
+    },
+    {
+      "id": "offline_alias_with_explicit_mapping",
+      "source_kind": "synthetic_test",
+      "input_format": "legacy_alias",
+      "record": {
+        "protein_a": "AKT1",
+        "protein_b": "PIK3CA",
+        "ncbiTaxonId": 9606,
+        "score": 0.985
+      },
+      "alias_mappings": {
+        "AKT1": {
+          "source_native_id": "9606.ENSP00000354587",
+          "taxonomy_id": 9606,
+          "verified": true,
+          "mapping_source": "synthetic_test:explicit mapping fixture"
+        },
+        "PIK3CA": {
+          "source_native_id": "9606.ENSP00000263967",
+          "taxonomy_id": 9606,
+          "verified": true,
+          "mapping_source": "synthetic_test:explicit mapping fixture"
+        }
+      },
+      "expected": {
+        "status": "ready",
+        "issue_code": null
+      }
+    },
+    {
+      "id": "legacy_symbol_without_mapping",
+      "source_kind": "legacy_unverified",
+      "input_format": "legacy_alias",
+      "record": {
+        "protein_a": "MAPK1",
+        "protein_b": "EGFR",
+        "ncbiTaxonId": 9606,
+        "score": 0.8
+      },
+      "expected": {
+        "status": "unresolved",
+        "issue_code": "unresolved_alias"
+      }
+    },
+    {
+      "id": "alias_mapping_not_verified",
+      "source_kind": "legacy_unverified",
+      "input_format": "legacy_alias",
+      "record": {
+        "protein_a": "MAPK1",
+        "protein_b": "EGFR",
+        "ncbiTaxonId": 9606,
+        "score": 0.8
+      },
+      "alias_mappings": {
+        "MAPK1": {
+          "source_native_id": "9606.ENSP00000222390",
+          "taxonomy_id": 9606,
+          "verified": false,
+          "mapping_source": "synthetic_test:unverified mapping"
+        },
+        "EGFR": {
+          "source_native_id": "9606.ENSP00000275493",
+          "taxonomy_id": 9606,
+          "verified": false,
+          "mapping_source": "synthetic_test:unverified mapping"
+        }
+      },
+      "expected": {
+        "status": "unresolved",
+        "issue_code": "untrusted_alias_mapping"
+      }
+    },
+    {
+      "id": "boolean_score",
+      "source_kind": "synthetic_test",
+      "input_format": "string_native",
+      "record": {
+        "stringId_A": "9606.ENSP00000354587",
+        "stringId_B": "9606.ENSP00000263967",
+        "ncbiTaxonId": 9606,
+        "score": true
+      },
+      "expected": {
+        "status": "invalid",
+        "issue_code": "invalid_score_type"
+      }
+    },
+    {
+      "id": "cross_taxonomy_edge",
+      "source_kind": "synthetic_test",
+      "input_format": "string_native",
+      "record": {
+        "stringId_A": "9606.ENSP00000354587",
+        "stringId_B": "10090.ENSMUSP00000000001",
+        "taxonomy_id_A": 9606,
+        "taxonomy_id_B": 10090,
+        "score": 0.8
+      },
+      "expected": {
+        "status": "invalid",
+        "issue_code": "taxonomy_conflict"
+      }
+    }
+  ]
+}

@@ -1,7 +1,13 @@
 """Offline PPI contract tests that exercise the existing consumer entry points."""
 
+from concurrent.futures import ThreadPoolExecutor
+import csv
+import json
+import math
+
 from main import NetworkPharmacologyFramework
 from knowledge_graph_module import KnowledgeGraph
+from data_contracts import canonical_json_sha256, canonicalize_ppi, read_ppi_records
 
 
 ONLINE_EDGE = {
@@ -182,3 +188,190 @@ def test_empty_ppi_input_produces_empty_network_and_knowledge_graph(tmp_path):
     assert framework.kg_module.graph.number_of_edges() == 0
     assert kg_results["graph"]["stats"]["num_nodes"] == 0
     assert kg_results["graph"]["stats"]["num_edges"] == 0
+
+
+def test_fixture_manifest_accounts_for_every_synthetic_and_legacy_record(ppi_fixture_manifest):
+    assert ppi_fixture_manifest["purpose"] == "synthetic_test_only"
+    assert ppi_fixture_manifest["schema_version"] == 2
+
+    for fixture in ppi_fixture_manifest["fixtures"]:
+        result = canonicalize_ppi(
+            [fixture["record"]],
+            source_kind=fixture["source_kind"],
+            alias_mappings=fixture.get("alias_mappings"),
+        )
+        expected = fixture["expected"]
+        assert result.input_count == 1, fixture["id"]
+        assert result.status == expected["status"], fixture["id"]
+        assert result.accepted_record_count + len({issue.record_index for issue in result.issues}) == 1, fixture["id"]
+        if expected["issue_code"] is None:
+            assert result.edge_count == 1, fixture["id"]
+            assert result.issues == (), fixture["id"]
+        else:
+            matching = [issue for issue in result.issues if issue.code == expected["issue_code"]]
+            assert matching, fixture["id"]
+            assert matching[0].record_index == 0
+            assert len(matching[0].source_record_hash) == 64
+
+
+def test_score_boundaries_and_invalid_types_have_explicit_ledger_codes():
+    base = {
+        "source_native_id_a": "9606.ENSP00000354587",
+        "source_native_id_b": "9606.ENSP00000263967",
+        "taxonomy_id": 9606,
+    }
+    for score in (0, 1, 0.5):
+        result = canonicalize_ppi([{**base, "score": score}], source_kind="synthetic_test")
+        assert result.status == "ready"
+        assert result.edges[0].score == float(score)
+
+    invalid_cases = (
+        (True, "invalid_score_type"),
+        ("0.5", "invalid_score_type"),
+        (math.nan, "non_finite_score"),
+        (math.inf, "non_finite_score"),
+        (-0.01, "score_out_of_range"),
+        (1.01, "score_out_of_range"),
+    )
+    for score, expected_code in invalid_cases:
+        result = canonicalize_ppi([{**base, "score": score}], source_kind="synthetic_test")
+        assert result.edge_count == 0
+        assert result.accepted_record_count == 0
+        assert result.issues[0].code == expected_code
+        assert result.issues[0].record_index == 0
+        assert len(result.issues[0].source_record_hash) == 64
+
+
+def test_reversed_duplicates_and_edge_order_have_stable_semantic_hashes():
+    records = [
+        {
+            "source_native_id_a": "9606.PROTEIN_B",
+            "source_native_id_b": "9606.PROTEIN_A",
+            "taxonomy_id": 9606,
+            "score": 0.5,
+            "retrieved_at": "2026-09-30T08:00:00Z",
+        },
+        {
+            "source_native_id_a": "9606.PROTEIN_A",
+            "source_native_id_b": "9606.PROTEIN_B",
+            "taxonomy_id": 9606,
+            "score": 0.5,
+            "retrieved_at": "2026-09-30T09:00:00Z",
+        },
+        {
+            "source_native_id_a": "9606.PROTEIN_D",
+            "source_native_id_b": "9606.PROTEIN_C",
+            "taxonomy_id": 9606,
+            "score": 0.8,
+        },
+    ]
+    first = canonicalize_ppi(records, source_kind="synthetic_test")
+    reordered = canonicalize_ppi(list(reversed(records)), source_kind="synthetic_test")
+
+    assert first.status == reordered.status == "ready"
+    assert first.edge_count == reordered.edge_count == 2
+    assert [edge.edge_key for edge in first.edges] == [edge.edge_key for edge in reordered.edges]
+    assert first.semantic_sha256 == reordered.semantic_sha256
+    duplicate = next(edge for edge in first.edges if edge.score == 0.5)
+    assert len(duplicate.provenance) == 2
+    assert len(duplicate.source_record_hashes) == 2
+    assert duplicate.provenance[0].retrieved_at != duplicate.provenance[1].retrieved_at
+    assert canonical_json_sha256(
+        {"edge": "same", "retrieved_at": "first"}, exclude_fields=("retrieved_at",)
+    ) == canonical_json_sha256(
+        {"edge": "same", "retrieved_at": "second"}, exclude_fields=("retrieved_at",)
+    )
+
+
+def test_chinese_path_json_and_utf8_sig_csv_round_trip_identity(tmp_path):
+    output_dir = tmp_path / "木犀草素数据" / "PPI fixtures"
+    output_dir.mkdir(parents=True)
+    json_path = output_dir / "在线快照.json"
+    csv_path = output_dir / "离线快照.csv"
+    json_record = {
+        "source_native_id_a": "9606.测试蛋白甲",
+        "source_native_id_b": "9606.测试蛋白乙",
+        "taxonomy_id": 9606,
+        "display_name_a": "木犀草素相关靶点",
+        "display_name_b": "蛋白乙",
+        "score": 0.75,
+        "retrieved_at": "2026-09-30T08:00:00Z",
+    }
+    with json_path.open("w", encoding="utf-8", newline="") as stream:
+        json.dump([json_record], stream, ensure_ascii=False)
+
+    csv_record = {
+        **json_record,
+        "display_name_a": "不同显示名",
+        "display_name_b": "另一个显示名",
+        "retrieved_at": "2026-09-30T09:00:00Z",
+    }
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(csv_record))
+        writer.writeheader()
+        writer.writerow(csv_record)
+
+    json_result = canonicalize_ppi(read_ppi_records(json_path), source_kind="synthetic_test")
+    csv_result = canonicalize_ppi(read_ppi_records(csv_path), source_kind="synthetic_test")
+    assert json_result.status == csv_result.status == "ready"
+    assert json_result.edges[0].endpoint_a.identity_key == csv_result.edges[0].endpoint_a.identity_key
+    assert json_result.edges[0].endpoint_b.identity_key == csv_result.edges[0].endpoint_b.identity_key
+    assert json_result.semantic_sha256 == csv_result.semantic_sha256
+    assert json_result.provenance_sha256 != csv_result.provenance_sha256
+    assert "测试蛋白甲" in json_result.edges[0].endpoint_a.source_native_id or "测试蛋白甲" in json_result.edges[0].endpoint_b.source_native_id
+
+
+def test_concurrent_normalization_keeps_result_ledgers_isolated():
+    valid = [{
+        "stringId_A": "9606.ENSP00000354587",
+        "stringId_B": "9606.ENSP00000263967",
+        "ncbiTaxonId": 9606,
+        "score": 0.5,
+    }]
+    invalid = [{
+        "stringId_A": "9606.ENSP00000354587",
+        "stringId_B": "9606.ENSP00000263967",
+        "ncbiTaxonId": 9606,
+        "score": True,
+    }]
+
+    def normalize(index):
+        rows = valid if index % 2 == 0 else invalid
+        return index % 2, canonicalize_ppi(rows, source_kind="synthetic_test")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(normalize, range(24)))
+
+    valid_results = [result for invalid_flag, result in results if invalid_flag == 0]
+    invalid_results = [result for invalid_flag, result in results if invalid_flag == 1]
+    assert {result.semantic_sha256 for result in valid_results} == {valid_results[0].semantic_sha256}
+    assert all(result.issues == () and result.edge_count == 1 for result in valid_results)
+    assert all(result.issues[0].code == "invalid_score_type" for result in invalid_results)
+    assert all(result.edge_count == 0 for result in invalid_results)
+
+
+def test_unknown_schema_fields_and_display_only_names_never_become_edges():
+    record = {
+        "stringId_A": "9606.ENSP00000354587",
+        "stringId_B": "9606.ENSP00000263967",
+        "ncbiTaxonId": 9606,
+        "score": 0.5,
+    }
+    unknown_version = canonicalize_ppi(
+        {"schema_version": 99, "interactions": [record]}, source_kind="synthetic_test"
+    )
+    unknown_field = canonicalize_ppi(
+        [{**record, "unexpected_identity": "AKT1"}], source_kind="synthetic_test"
+    )
+    display_only = canonicalize_ppi(
+        [{"preferredName_A": "AKT1", "preferredName_B": "PIK3CA", "score": 0.5}],
+        source_kind="legacy_unverified",
+    )
+
+    assert unknown_version.edge_count == 0
+    assert unknown_version.issues[0].code == "unsupported_schema_version"
+    assert unknown_version.issues[0].record_index == 0
+    assert unknown_field.edge_count == 0
+    assert unknown_field.issues[0].code == "unknown_fields"
+    assert display_only.edge_count == 0
+    assert display_only.issues[0].code == "missing_endpoint"

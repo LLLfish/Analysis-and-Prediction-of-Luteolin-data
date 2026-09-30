@@ -164,6 +164,19 @@ def test_target_component_resolution_requires_human_single_protein_and_accession
     assert symbol_only[0]["resolution_status"] == "unverified"
     assert symbol_only[0]["reason_code"] == "missing_component_accession"
 
+    gene_symbol_in_accession_field = json.loads(json.dumps(fixture["chembl"]["targets"][0]))
+    gene_symbol_in_accession_field["target_components"][0]["accession"] = "AKT1"
+    invalid_accession = resolver(
+        gene_symbol_in_accession_field, source_kind="synthetic_test",
+        source_path="raw/source_manifest.json", source_sha256=source_hash,
+    )
+    assert invalid_accession[0]["resolution_status"] == "unverified"
+    assert invalid_accession[0]["reason_code"] == "invalid_component_accession"
+    unhydrated = _plain(builder.hydrate_protein_record(invalid_accession[0]))
+    assert unhydrated["accession"] is None
+    assert unhydrated["sequence_status"] == "unverified"
+    assert unhydrated["component_evidence"]["component"]["accession"] == "AKT1"
+
 
 def test_uniprot_json_and_fasta_plus_taxonomy_metadata_hash_the_complete_sequence(tmp_path):
     fixture = _fixture()
@@ -210,6 +223,16 @@ def test_uniprot_json_and_fasta_plus_taxonomy_metadata_hash_the_complete_sequenc
     assert from_fasta["sequence_sha256"] == from_json["sequence_sha256"]
     assert len(from_fasta["source_provenance"]) == 2
 
+    legacy = _plain(hydrate(
+        component,
+        source_kind="legacy_unverified",
+        source_path="raw/uniprot/legacy.json",
+        uniprot_json=payload,
+        raw_response_bytes=json_bytes,
+    ))
+    assert legacy["sequence_status"] == "unverified"
+    assert legacy["sequence_status_reason"] == "source_kind_legacy_unverified"
+
 
 def test_wrong_accession_taxonomy_length_and_nonstandard_residues_stay_unverified_or_invalid():
     fixture = _fixture()
@@ -218,6 +241,7 @@ def test_wrong_accession_taxonomy_length_and_nonstandard_residues_stay_unverifie
     component = _single_component()
 
     cases = [
+        ("BAD", 9606, "ACDE", 4, "accession_mismatch"),
         ("P99999", 9606, "ACDE", 4, "accession_mismatch"),
         ("P12345", 10090, "ACDE", 4, "taxonomy_mismatch"),
         ("P12345", 9606, "ACDE", 5, "declared_length_mismatch"),
@@ -239,18 +263,22 @@ def test_wrong_accession_taxonomy_length_and_nonstandard_residues_stay_unverifie
         ))
         assert result["sequence_status"] == "invalid"
         assert result["sequence_status_reason"] == reason
-        assert result["identity_status"] != "verified" or reason == "declared_length_mismatch"
+        if reason in {"accession_mismatch", "taxonomy_mismatch"}:
+            assert result["identity_status"] != "verified"
+        else:
+            assert result["identity_status"] == "verified"
 
+    missing_payload = {
+        "primaryAccession": "P12345",
+        "organism": {"taxonId": 9606},
+        "sequence": {"length": 20},
+    }
     missing = _plain(hydrate(
         component,
         source_kind="synthetic_test",
         source_path="raw/uniprot/missing-sequence.json",
-        uniprot_json={
-            "primaryAccession": "P12345",
-            "organism": {"taxonId": 9606},
-            "sequence": {"length": 20},
-        },
-        raw_response_bytes=b'{"missing":"sequence"}',
+        uniprot_json=missing_payload,
+        raw_response_bytes=json.dumps(missing_payload, separators=(",", ":")).encode("utf-8"),
     ))
     assert missing["sequence_status"] == "missing"
     assert missing["sequence_status_reason"] == "sequence_value_missing"
@@ -288,6 +316,15 @@ def test_local_bundle_contains_canonical_molecules_proteins_exclusions_and_verif
     second_result = ingest(FIXTURE_PATH, second_output)
     assert second_result["content_sha256"] == result["content_sha256"]
 
+    cli_output = tmp_path / "bundle-cli"
+    build_exit = verify_cli([
+        "build-local", "--manifest", str(FIXTURE_PATH), "--out", str(cli_output),
+    ])
+    cli_build = json.loads(capsys.readouterr().out)
+    assert build_exit == 0
+    assert cli_build["status"] == "complete"
+    assert cli_build["content_sha256"] == result["content_sha256"]
+
     exit_code = verify_cli(["verify-bundle", str(bundle_path)])
     cli_result = json.loads(capsys.readouterr().out)
     assert exit_code == 0
@@ -316,6 +353,42 @@ def test_bundle_loader_rejects_content_and_raw_source_tampering(tmp_path):
         stream.write(b" ")
     with pytest.raises(ValueError, match="raw source hash mismatch"):
         builder.load_entity_bundle(second_output / "entities.json")
+
+
+def test_local_manifest_can_reference_fasta_with_separate_matching_taxonomy_metadata(tmp_path, monkeypatch):
+    manifest = _fixture()
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    (input_dir / "P12345.fasta").write_text(
+        ">sp|P12345|SYNTHETIC_HUMAN\nACDEFGHIKL\nMNPQRSTVWY\n", encoding="utf-8"
+    )
+    (input_dir / "P12345-metadata.json").write_text(json.dumps({
+        "primaryAccession": "P12345",
+        "organism": {"scientificName": "Homo sapiens", "taxonId": 9606},
+        "sequence": {"length": 20},
+    }), encoding="utf-8")
+    manifest["uniprot"]["P12345"] = {
+        "source_kind": "synthetic_test",
+        "fasta_path": "P12345.fasta",
+        "taxonomy_metadata_path": "P12345-metadata.json",
+    }
+    manifest_path = input_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr("evidence_builder.requests.get", lambda *args, **kwargs: calls.append(args[0]))
+    output_dir = tmp_path / "fasta-bundle"
+
+    result = builder.ingest_local_manifest(manifest_path, output_dir)
+    bundle = builder.load_entity_bundle(output_dir / "entities.json")
+
+    assert calls == []
+    assert result["status"] == "complete"
+    protein = bundle["proteins"][0]
+    assert protein["sequence_status"] == "verified"
+    assert protein["full_sequence"] == "ACDEFGHIKLMNPQRSTVWY"
+    assert protein["sequence_sha256"] == hashlib.sha256(protein["full_sequence"].encode("utf-8")).hexdigest()
+    assert any(source["source_path"].endswith("P12345.fasta") for source in bundle["source_provenance"])
+    assert any(source["source_path"].endswith("P12345-metadata.json") for source in bundle["source_provenance"])
 
 
 def test_default_sequence_hydration_is_offline_and_online_get_is_bounded(tmp_path, monkeypatch):

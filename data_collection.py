@@ -239,7 +239,7 @@ class LuteolinDataCollector:
         return self.raw_data['pubchem']
 
     def fetch_chembl_data(self) -> Dict[str, Any]:
-        """Capture complete, bounded ChEMBL evidence without field projection."""
+        """Capture bounded ChEMBL pages and linked metadata without projection loss."""
         logger.info("Step 2: Fetching bounded activity evidence from ChEMBL...")
         from evidence_builder import _collect_chembl, activity_evidence_from_collector_payload, LegacyDisplayAdapter
 
@@ -255,95 +255,134 @@ class LuteolinDataCollector:
                 max_requests=128,
                 max_response_bytes=8_000_000,
             )
-            result["chembl_id"] = molecule_ids[0] if len(molecule_ids) == 1 else None
-            result["source_kind"] = source_kind
-            result["fetch_time"] = datetime.now().isoformat()
-            raw_page_root = Path(self.output_dir) / "raw" / "chembl" / "activities"
-            raw_page_root.mkdir(parents=True, exist_ok=True)
-            for page_index, page in enumerate(result.get("activity_pages", []), start=1):
-                page["source_kind"] = source_kind
-                molecule_id = page["molecule_chembl_id"]
-                raw_text = page["raw_response_text"]
-                page_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-                relative_path = f"raw/chembl/activities/{molecule_id}/{page_hash}.json"
-                snapshot_path = Path(self.output_dir) / Path(relative_path)
+        except Exception as exc:
+            logger.warning("ChEMBL retrieval could not start: %s", exc)
+            result = {
+                "molecule_ids": list(molecule_ids) if isinstance(molecule_ids, (list, tuple)) else [],
+                "molecule_records": {},
+                "target_records": {},
+                "assay_records": {},
+                "document_records": {},
+                "activity_pages": [],
+                "page_receipts": [],
+                "pagination_status": "incomplete",
+                "metadata_status": "incomplete",
+                "status": "incomplete",
+                "incomplete_reasons": [str(exc)],
+                "request_count": 0,
+                "page_count": 0,
+                "activity_count": 0,
+            }
+
+        result["chembl_id"] = molecule_ids[0] if isinstance(molecule_ids, (list, tuple)) and len(molecule_ids) == 1 else None
+        result["source_kind"] = source_kind
+        result["fetch_time"] = datetime.now().isoformat()
+        snapshot_failures = []
+        for page in result.get("activity_pages", []):
+            page["source_kind"] = source_kind
+            molecule_id = page.get("molecule_chembl_id")
+            raw_text = page.get("raw_response_text")
+            if not isinstance(molecule_id, str) or not isinstance(raw_text, str):
+                snapshot_failures.append("activity page missing explicit molecule identity or raw body")
+                continue
+            page_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            relative_path = f"raw/chembl/activities/{molecule_id}/{page_hash}.json"
+            snapshot_path = Path(self.output_dir) / Path(relative_path)
+            try:
                 snapshot_path.parent.mkdir(parents=True, exist_ok=True)
                 if snapshot_path.exists():
                     if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != page_hash:
-                        raise ValueError(f"immutable ChEMBL snapshot collision: {relative_path}")
+                        raise ValueError(f"immutable snapshot collision: {relative_path}")
                 else:
                     with snapshot_path.open("xb") as snapshot:
                         snapshot.write(raw_text.encode("utf-8"))
                 page["source_path"] = relative_path
                 page["source_sha256"] = page_hash
                 for receipt in result.get("page_receipts", []):
-                    if receipt.get("response_sha256") == page["response_sha256"]:
+                    if receipt.get("source_id", "").startswith(f"chembl_activity:{molecule_id}:") and receipt.get("response_sha256") == page.get("response_sha256"):
                         receipt["source_kind"] = source_kind
                         receipt["source_path"] = relative_path
                         receipt["source_sha256"] = page_hash
-            for receipt in result.get("page_receipts", []):
-                source_id = receipt.get("source_id", "")
-                if not source_id.startswith(("chembl_molecule:", "chembl_target:")):
-                    continue
-                category, identifier = source_id.split(":", 1)
-                if not identifier.startswith("CHEMBL") or not identifier[6:].isdigit():
-                    continue
-                raw_text = receipt.get("raw_response_text")
-                payload = receipt.get("payload")
-                if not isinstance(raw_text, str) or not isinstance(payload, dict):
-                    continue
-                source_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-                relative_path = f"raw/chembl/{category.removeprefix('chembl_')}/{identifier}/{source_hash}.json"
-                snapshot_path = Path(self.output_dir) / Path(relative_path)
+            except Exception as exc:
+                snapshot_failures.append(f"{relative_path}:{exc}")
+
+        for receipt in result.get("page_receipts", []):
+            source_id = receipt.get("source_id", "")
+            if not source_id.startswith(("chembl_molecule:", "chembl_target:", "chembl_assay:", "chembl_document:")):
+                continue
+            category, identifier = source_id.split(":", 1)
+            if not identifier.startswith("CHEMBL") or not identifier[6:].isdigit():
+                snapshot_failures.append(f"invalid source record identifier: {source_id}")
+                continue
+            raw_text = receipt.get("raw_response_text")
+            if not isinstance(raw_text, str):
+                snapshot_failures.append(f"raw response missing: {source_id}")
+                continue
+            source_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            relative_path = f"raw/chembl/{category.removeprefix('chembl_')}/{identifier}/{source_hash}.json"
+            snapshot_path = Path(self.output_dir) / Path(relative_path)
+            try:
                 snapshot_path.parent.mkdir(parents=True, exist_ok=True)
                 if snapshot_path.exists():
                     if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != source_hash:
-                        raise ValueError(f"immutable ChEMBL snapshot collision: {relative_path}")
+                        raise ValueError(f"immutable snapshot collision: {relative_path}")
                 else:
                     with snapshot_path.open("xb") as snapshot:
                         snapshot.write(raw_text.encode("utf-8"))
+                receipt["source_kind"] = source_kind
                 receipt["source_path"] = relative_path
                 receipt["source_sha256"] = source_hash
-            result["activities"] = [
-                activity
-                for page in result.get("activity_pages", [])
-                for activity in page.get("activities", [])
-            ]
+            except Exception as exc:
+                snapshot_failures.append(f"{relative_path}:{exc}")
+        if snapshot_failures:
+            result.setdefault("incomplete_reasons", []).extend(snapshot_failures)
+            result["metadata_status"] = "incomplete"
+
+        result["activities"] = [
+            activity
+            for page in result.get("activity_pages", [])
+            for activity in page.get("activities", [])
+        ]
+        self.raw_data["chembl"] = result
+        try:
             evidence_rows = activity_evidence_from_collector_payload(result)
             result["targets"] = LegacyDisplayAdapter.targets(evidence_rows)
-            result["total_activities"] = len(result["activities"])
-            result["collection_status"] = (
-                "complete" if result.get("pagination_status") == "complete" else "incomplete"
-            )
-            self.raw_data["chembl"] = result
-            logger.info(
-                "ChEMBL: molecules=%d, pages=%d, activities=%d, pagination=%s",
-                len(molecule_ids), result.get("page_count", 0),
-                result["total_activities"], result.get("pagination_status"),
-            )
-        except Exception as e:
-            logger.warning("ChEMBL retrieval incomplete: %s", e)
-            result = {
-                "chembl_id": "CHEMBL151",
-                "fetch_time": datetime.now().isoformat(),
-                "source_kind": "legacy_unverified",
-                "activities": [],
-                "activity_pages": [],
-                "targets": [],
-                "total_activities": 0,
-                "pagination_status": "incomplete",
-                "collection_status": "incomplete",
-                "incomplete_reasons": [str(e)],
-            }
-            self.raw_data["chembl"] = result
+            result["projection_status"] = "complete"
+        except Exception as exc:
+            # A display conversion failure must never erase captured pages or IDs.
+            logger.warning("ChEMBL evidence projection failed; raw capture retained: %s", exc)
+            result["targets"] = []
+            result["projection_status"] = "error"
+            result["projection_errors"] = [str(exc)]
+            result.setdefault("incomplete_reasons", []).append(f"evidence_projection:{exc}")
+        result["total_activities"] = len(result["activities"])
+        result["collection_status"] = (
+            "complete"
+            if result.get("pagination_status") == "complete"
+            and result.get("metadata_status") == "complete"
+            and result.get("projection_status") == "complete"
+            else "incomplete"
+        )
+        result["status"] = result["collection_status"]
+        logger.info(
+            "ChEMBL: molecules=%d, pages=%d, activities=%d, pagination=%s, metadata=%s",
+            len(result.get("molecule_ids", [])), result.get("page_count", 0),
+            result["total_activities"], result.get("pagination_status"), result.get("metadata_status"),
+        )
 
         raw_dir = os.path.join(self.output_dir, "raw")
         json_path = os.path.join(raw_dir, "chembl_luteolin_targets.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        raw_sha256 = hashlib.sha256(Path(json_path).read_bytes()).hexdigest()
-        result["raw_snapshot_path"] = os.path.relpath(json_path, self.output_dir).replace(os.sep, "/")
-        result["raw_snapshot_sha256"] = raw_sha256
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            result["raw_snapshot_path"] = os.path.relpath(json_path, self.output_dir).replace(os.sep, "/")
+            result["raw_snapshot_sha256"] = hashlib.sha256(Path(json_path).read_bytes()).hexdigest()
+        except Exception as exc:
+            result["raw_snapshot_status"] = "error"
+            result.setdefault("incomplete_reasons", []).append(f"aggregate_snapshot:{exc}")
+            result["collection_status"] = "incomplete"
+            result["status"] = "incomplete"
+        self.raw_data["chembl"] = result
         return result
 
     def fetch_tcmsp_data(self) -> Dict[str, Any]:

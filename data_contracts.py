@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 import csv
 import hashlib
 import json
@@ -1032,3 +1032,82 @@ def read_ppi_records(path: os.PathLike[str] | str) -> Any:
                     continue
         return rows
     raise ValueError("PPI input file must end in .json or .csv")
+
+
+@dataclass(frozen=True)
+class ProteinRecord:
+    """Shared identity and complete-sequence record for later feature consumers."""
+
+    accession: Optional[str]
+    taxonomy_id: Optional[int]
+    raw_sequence: Optional[str]
+    full_sequence: Optional[str]
+    sequence_length: Optional[int]
+    sequence_sha256: Optional[str]
+    sequence_status: str
+    sequence_status_reason: Optional[str]
+    identity_status: str
+    source_kind: str
+    source_provenance: list[dict[str, Any]] = field(default_factory=list)
+    component_evidence: dict[str, Any] = field(default_factory=dict)
+    returned_accession: Optional[str] = None
+    returned_taxonomy_id: Optional[int] = None
+
+
+_PROTEIN_STATUSES = {"verified", "missing", "invalid", "error", "unverified"}
+_PROTEIN_IDENTITY_STATUSES = {"verified", "mismatch", "invalid", "unverified"}
+_STANDARD_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+
+def validate_protein_record(record: ProteinRecord) -> None:
+    """Raise when a shared protein record breaks identity or full-sequence invariants."""
+    if type(record) is not ProteinRecord:
+        raise TypeError("protein must be the shared data_contracts.ProteinRecord")
+    if record.sequence_status not in _PROTEIN_STATUSES:
+        raise ValueError("unsupported protein sequence_status")
+    if record.identity_status not in _PROTEIN_IDENTITY_STATUSES:
+        raise ValueError("unsupported protein identity_status")
+    if record.source_kind not in {"online_snapshot", "legacy_unverified", "synthetic_test"}:
+        raise ValueError("unsupported protein source_kind")
+    if record.accession is not None:
+        if not isinstance(record.accession, str) or re.fullmatch(r"[A-Za-z0-9]{6,10}", record.accession) is None:
+            raise ValueError("protein accession must be a 6-10 character UniProt-style identifier")
+    if record.taxonomy_id is not None and _strict_taxonomy(record.taxonomy_id) is None:
+        raise TypeError("canonical protein taxonomy_id must be a positive integer")
+    if record.returned_accession is not None and not isinstance(record.returned_accession, str):
+        raise TypeError("returned_accession must preserve the raw returned text")
+    if record.returned_taxonomy_id is not None and _strict_taxonomy(record.returned_taxonomy_id) is None:
+        raise TypeError("returned_taxonomy_id must be a positive integer")
+    if record.raw_sequence is not None and not isinstance(record.raw_sequence, str):
+        raise TypeError("raw_sequence must be text or null")
+    if record.full_sequence is None:
+        if record.sequence_length is not None or record.sequence_sha256 is not None:
+            raise ValueError("sequence length/hash require a preserved full_sequence")
+    else:
+        if not isinstance(record.full_sequence, str):
+            raise TypeError("full_sequence must be text or null")
+        if record.full_sequence != record.full_sequence.upper() or any(char.isspace() for char in record.full_sequence):
+            raise ValueError("full_sequence must be uppercase and whitespace-free")
+        if type(record.sequence_length) is not int or record.sequence_length != len(record.full_sequence):
+            raise ValueError("sequence_length does not match full_sequence")
+        expected_hash = hashlib.sha256(record.full_sequence.encode("utf-8")).hexdigest()
+        if record.sequence_sha256 != expected_hash:
+            raise ValueError("sequence_sha256 does not match full_sequence")
+    if not isinstance(record.source_provenance, list) or any(not isinstance(item, dict) for item in record.source_provenance):
+        raise TypeError("source_provenance must be a list of objects")
+    if not isinstance(record.component_evidence, dict):
+        raise TypeError("component_evidence must be an object")
+    for source in record.source_provenance:
+        if not _is_sha256(source.get("raw_sha256")):
+            raise ValueError("protein raw source provenance requires a SHA-256")
+        if not (isinstance(source.get("source_path"), str) or isinstance(source.get("source_url"), str)):
+            raise ValueError("protein source provenance requires a path or URL")
+    if record.sequence_status == "verified":
+        if record.identity_status != "verified" or record.accession is None or record.taxonomy_id is None:
+            raise ValueError("verified sequence requires a verified accession and taxonomy")
+        if record.full_sequence is None or not record.source_provenance:
+            raise ValueError("verified sequence requires full sequence and raw source provenance")
+        if not record.full_sequence or any(residue not in _STANDARD_AMINO_ACIDS for residue in record.full_sequence):
+            raise ValueError("verified sequence contains a nonstandard amino-acid residue")
+    elif not record.sequence_status_reason:
+        raise ValueError("non-verified sequence status requires a reason")

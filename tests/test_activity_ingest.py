@@ -48,6 +48,12 @@ def _chembl_get_from_fixture(fixture, calls):
     target_by_id = {
         row["target_chembl_id"]: row for row in fixture["chembl"]["targets"]
     }
+    assay_by_id = {
+        row["assay_chembl_id"]: row for row in fixture["chembl"]["assays"]
+    }
+    document_by_id = {
+        row["document_chembl_id"]: row for row in fixture["chembl"]["documents"]
+    }
     molecule_by_id = {
         row["molecule_chembl_id"]: row for row in fixture["chembl"]["molecules"]
     }
@@ -76,10 +82,10 @@ def _chembl_get_from_fixture(fixture, calls):
             payload = target_by_id[target_id]
         elif "/assay/" in path and path.endswith(".json"):
             assay_id = path.rsplit("/", 1)[-1].removesuffix(".json")
-            payload = {"assay_chembl_id": assay_id, "confidence_score": 9}
+            payload = assay_by_id[assay_id]
         elif "/document/" in path and path.endswith(".json"):
             document_id = path.rsplit("/", 1)[-1].removesuffix(".json")
-            payload = {"document_chembl_id": document_id}
+            payload = document_by_id[document_id]
         else:
             raise AssertionError(f"unexpected request path: {path}")
         return _Response(payload, url)
@@ -99,6 +105,7 @@ def test_collector_fetches_and_hands_off_complete_activity_pages(tmp_path, monke
     result = collector.fetch_chembl_data()
 
     assert result.get("pagination_status") == "complete"
+    assert result.get("metadata_status") == "complete"
     pages = result.get("activity_pages")
     assert isinstance(pages, list) and len(pages) == 2
     activity_rows = [row for page in pages for row in page["activities"]]
@@ -117,6 +124,15 @@ def test_collector_fetches_and_hands_off_complete_activity_pages(tmp_path, monke
     assert evidence_by_id[700001]["raw_activity_record"]["recorded_extra_field"] == "preserve-me-1"
     assert evidence_by_id[700001]["assay_chembl_id"] == "CHEMBL900001"
     assert evidence_by_id[700001]["document_chembl_id"] == "CHEMBL900101"
+    assert evidence_by_id[700001]["confidence_score"] == 9
+    assert evidence_by_id[700001]["confidence_source"] == "assay"
+    assert "confidence_score" not in evidence_by_id[700001]["raw_activity_record"]
+    assert evidence_by_id[700001]["assay_record"]["assay_chembl_id"] == "CHEMBL900001"
+    assert evidence_by_id[700001]["assay_record"]["assay_cell_type"] is None
+    assert evidence_by_id[700001]["document_record"]["document_chembl_id"] == "CHEMBL900101"
+    assert evidence_by_id[700001]["document_record"]["doi"] == "10.0000/synthetic.001"
+    assert evidence_by_id[700001]["assay_record_source_sha256"]
+    assert evidence_by_id[700001]["document_record_source_sha256"]
 
 
 def test_legacy_rows_remain_unverified_and_missing_ids_stay_null(tmp_path):
@@ -187,6 +203,10 @@ def test_local_builder_exports_page_status_and_full_activity_records(tmp_path, m
     assert activity["target_taxonomy_id"] == 9606
     assert activity["target_components"] == fixture["chembl"]["targets"][0]["target_components"]
     assert activity["confidence_score"] == 9
+    assert activity["confidence_source"] == "assay"
+    assert "confidence_score" not in activity["raw_activity_record"]
+    assert activity["assay_record"]["assay_chembl_id"] == "CHEMBL900001"
+    assert activity["document_record"]["document_chembl_id"] == "CHEMBL900101"
     assert activity["standard_relation"] == "="
     assert activity["standard_units"] == "nM"
     complex_activity = next(row for row in bundle["activities"] if row["activity_id"] == 700002)
@@ -285,8 +305,25 @@ def test_fetch_cli_collects_multiple_molecules_and_writes_verified_bundle(tmp_pa
         "CHEMBL151", "CHEMBL123456",
     }
     assert len(bundle["activities"]) == 4
+    assert {row["molecule_chembl_id"] for row in bundle["molecules"]} == {
+        "CHEMBL151", "CHEMBL123456",
+    }
+    assert all(row["structure_status"] == "verified" for row in bundle["molecules"])
+    assert {row["accession"] for row in bundle["proteins"]} == {"P12345"}
+    assert all(row["sequence_status"] == "missing" for row in bundle["proteins"])
+    assert all(row["sequence_status_reason"] == "local_sequence_source_missing" for row in bundle["proteins"])
+    first_activity = next(row for row in bundle["activities"] if row["activity_id"] == 700001)
+    assert first_activity["confidence_score"] == 9
+    assert first_activity["confidence_source"] == "assay"
+    assert "confidence_score" not in first_activity["raw_activity_record"]
+    assert first_activity["assay_record"]["assay_chembl_id"] == "CHEMBL900001"
+    assert first_activity["document_record"]["document_chembl_id"] == "CHEMBL900101"
     assert all(Path(row["source_path"]).name.endswith(".json") for row in bundle["activities"])
     assert all((output_dir / source["source_path"]).is_file() for source in bundle["source_provenance"])
+    assert {source["source_id"] for source in bundle["source_provenance"]}.issuperset({
+        "chembl_assay:CHEMBL900001", "chembl_document:CHEMBL900101",
+        "chembl_target:CHEMBL900201", "chembl_molecule:CHEMBL151",
+    })
     assert {"CHEMBL151", "CHEMBL123456"}.issubset({
         parse_qs(urlparse(url).query).get("molecule_chembl_id", [None])[0]
         for url, _ in calls if "/activity.json" in url
@@ -346,6 +383,30 @@ def test_truncated_local_manifest_preserves_raw_and_stays_incomplete(tmp_path):
     assert (output_dir / "partial_ingest.json").is_file()
     assert (output_dir / "raw" / "source_manifest.json").is_file()
     assert list((output_dir / "raw" / "chembl" / "activities").rglob("*.json"))
+
+
+def test_request_budget_includes_molecule_pages_and_linked_metadata(tmp_path, monkeypatch):
+    builder = pytest.importorskip("evidence_builder")
+    fixture = _fixture()
+    calls = []
+    monkeypatch.setattr(
+        "evidence_builder.requests.get", _chembl_get_from_fixture(fixture, calls)
+    )
+    output_dir = tmp_path / "request-budget"
+
+    result = builder.fetch_chembl_bounded(
+        ["CHEMBL151"], output_dir, max_pages=10, max_records=20,
+        max_requests=3, max_response_bytes=100_000,
+    )
+
+    assert result["request_count"] == 3
+    assert len(calls) == 3
+    assert result["pagination_status"] == "complete"
+    assert result["metadata_status"] == "incomplete"
+    assert result["status"] == "incomplete"
+    assert any("max_requests reached" in reason for reason in result["incomplete_reasons"])
+    assert not (output_dir / "entities.json").exists()
+    assert (output_dir / "partial_ingest.json").is_file()
 
 
 def test_symbol_only_uniprot_lookup_is_not_resolved_by_first_search_hit(tmp_path, monkeypatch):
@@ -408,6 +469,12 @@ def test_run_pipeline_hands_complete_raw_evidence_to_cleaning(tmp_path):
         "target_records": {
             row["target_chembl_id"]: row for row in fixture["chembl"]["targets"]
         },
+            "assay_records": {
+                row["assay_chembl_id"]: row for row in fixture["chembl"]["assays"]
+            },
+            "document_records": {
+                row["document_chembl_id"]: row for row in fixture["chembl"]["documents"]
+            },
     })
     collector.fetch_tcmsp_data = lambda: collector.raw_data.setdefault("tcmsp", {
         "source_kind": "static_reference", "evidence_status": "unverified",
@@ -430,4 +497,84 @@ def test_run_pipeline_hands_complete_raw_evidence_to_cleaning(tmp_path):
     }
     assert all(row["evidence_status"] == "observed" for row in result["activity_evidence"])
     assert all(row["is_valid_target"] is False for row in result["targets"])
+
+
+def test_collector_groups_multiple_molecule_page_chains_without_discarding_capture(tmp_path, monkeypatch):
+    fixture = _fixture()
+    calls = []
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "multi-collector"))
+    collector.source_kind = "synthetic_test"
+    collector.chembl_molecule_ids = ["CHEMBL151", "CHEMBL123456"]
+    monkeypatch.setattr(
+        "data_collection.requests.get", _chembl_get_from_fixture(fixture, calls)
+    )
+
+    result = collector.fetch_chembl_data()
+    cleaned = collector.clean_and_standardize()
+
+    assert result["chembl_id"] is None
+    assert result["pagination_status"] == "complete"
+    assert result["metadata_status"] == "complete"
+    assert result["collection_status"] == "complete"
+    assert len(result["activity_pages"]) == 3
+    assert len(result["activities"]) == 4
+    assert {row["activity_id"] for row in cleaned["activity_evidence"]} == {
+        700001, 700002, 700003, 800001,
+    }
+    assert {row["molecule_chembl_id"] for row in cleaned["activity_evidence"]} == {
+        "CHEMBL151", "CHEMBL123456",
+    }
+
+
+def test_projection_error_does_not_replace_successfully_captured_raw_pages(tmp_path, monkeypatch):
+    fixture = _fixture()
+    calls = []
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "projection-error"))
+    collector.source_kind = "synthetic_test"
+    monkeypatch.setattr(
+        "data_collection.requests.get", _chembl_get_from_fixture(fixture, calls)
+    )
+    monkeypatch.setattr(
+        "evidence_builder.activity_evidence_from_collector_payload",
+        lambda payload: (_ for _ in ()).throw(RuntimeError("projection failure fixture")),
+    )
+
+    result = collector.fetch_chembl_data()
+
+    assert result["projection_status"] == "error"
+    assert result["pagination_status"] == "complete"
+    assert result["collection_status"] == "incomplete"
+    assert len(result["activity_pages"]) == 2
+    assert [row["activity_id"] for row in result["activities"]] == [700001, 700002, 700003]
+    assert "projection failure fixture" in result["projection_errors"][0]
+    assert all((Path(collector.output_dir) / page["source_path"]).is_file() for page in result["activity_pages"])
+
+
+def test_failed_required_assay_metadata_keeps_pagination_complete_but_bundle_incomplete(tmp_path, monkeypatch):
+    builder = pytest.importorskip("evidence_builder")
+    fixture = _fixture()
+    calls = []
+    base_get = _chembl_get_from_fixture(fixture, calls)
+
+    def fail_one_assay(url, *args, **kwargs):
+        if "/assay/CHEMBL900001.json" in url:
+            calls.append((url, kwargs))
+            raise TimeoutError("synthetic assay metadata timeout")
+        return base_get(url, *args, **kwargs)
+
+    monkeypatch.setattr("evidence_builder.requests.get", fail_one_assay)
+    output_dir = tmp_path / "missing-assay-metadata"
+
+    result = builder.fetch_chembl_bounded(
+        ["CHEMBL151"], output_dir, max_pages=10, max_records=20,
+        max_requests=32, max_response_bytes=100_000,
+    )
+
+    assert result["pagination_status"] == "complete"
+    assert result["metadata_status"] == "incomplete"
+    assert result["status"] == "incomplete"
+    assert any("assay:CHEMBL900001" in reason for reason in result["incomplete_reasons"])
+    assert (output_dir / "partial_ingest.json").is_file()
+    assert not (output_dir / "entities.json").exists()
+    assert list((output_dir / "raw" / "chembl" / "activities").rglob("*.json"))
 

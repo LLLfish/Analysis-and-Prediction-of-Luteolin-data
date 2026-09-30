@@ -45,7 +45,6 @@
                 "target_chembl_id": "CHEMBL900201",
                 "target_organism": "Homo sapiens",
                 "target_tax_id": 9606,
-                "confidence_score": 9,
                 "standard_type": "Ki",
                 "standard_relation": "=",
                 "standard_value": "120",
@@ -65,7 +64,6 @@
                 "target_chembl_id": "CHEMBL900202",
                 "target_organism": "Homo sapiens",
                 "target_tax_id": 9606,
-                "confidence_score": 8,
                 "standard_type": "Kd",
                 "standard_relation": ">",
                 "standard_value": "500",
@@ -96,7 +94,6 @@
                 "target_chembl_id": "CHEMBL900203",
                 "target_organism": "Rattus norvegicus",
                 "target_tax_id": 10116,
-                "confidence_score": 7,
                 "standard_type": "IC50",
                 "standard_relation": "<",
                 "standard_value": "300",
@@ -130,7 +127,6 @@
                 "target_chembl_id": "CHEMBL910201",
                 "target_organism": "Homo sapiens",
                 "target_tax_id": 9606,
-                "confidence_score": 9,
                 "standard_type": "Ki",
                 "standard_relation": "<",
                 "standard_value": "80",
@@ -158,7 +154,6 @@
             "component_id": 901,
             "accession": "P12345",
             "component_type": "PROTEIN",
-            "component_tax_id": 9606,
             "organism": "Homo sapiens"
           }
         ]
@@ -174,14 +169,12 @@
             "component_id": 902,
             "accession": "Q12345",
             "component_type": "PROTEIN",
-            "component_tax_id": 9606,
             "organism": "Homo sapiens"
           },
           {
             "component_id": 903,
             "accession": "Q67890",
             "component_type": "PROTEIN",
-            "component_tax_id": 9606,
             "organism": "Homo sapiens"
           }
         ]
@@ -197,7 +190,6 @@
             "component_id": 904,
             "accession": "Q99999",
             "component_type": "PROTEIN",
-            "component_tax_id": 10116,
             "organism": "Rattus norvegicus"
           }
         ]
@@ -213,10 +205,137 @@
             "component_id": 905,
             "accession": "P12345",
             "component_type": "PROTEIN",
-            "component_tax_id": 9606,
             "organism": "Homo sapiens"
           }
         ]
+      }
+    ],
+    "assays": [
+      {
+        "assay_chembl_id": "CHEMBL900001",
+        "target_chembl_id": "CHEMBL900201",
+        "assay_type": "B",
+        "assay_category": "binding",
+        "assay_test_type": "confirmatory",
+        "assay_organism": "Homo sapiens",
+        "assay_tax_id": 9606,
+        "assay_cell_type": null,
+        "assay_subcellular_fraction": null,
+        "bao_format": null,
+        "bao_label": "single protein format",
+        "confidence_score": 9,
+        "description": "synthetic binding assay one",
+        "src_assay_id": "synthetic-assay-1"
+      },
+      {
+        "assay_chembl_id": "CHEMBL900002",
+        "target_chembl_id": "CHEMBL900202",
+        "assay_type": "B",
+        "assay_category": "binding",
+        "assay_test_type": "confirmatory",
+        "assay_organism": "Homo sapiens",
+        "assay_tax_id": 9606,
+        "assay_cell_type": null,
+        "assay_subcellular_fraction": null,
+        "bao_format": null,
+        "bao_label": "single protein format",
+        "confidence_score": 8,
+        "description": "synthetic binding assay two",
+        "src_assay_id": "synthetic-assay-2"
+      },
+      {
+        "assay_chembl_id": "CHEMBL900003",
+        "target_chembl_id": "CHEMBL900203",
+        "assay_type": "B",
+        "assay_category": "binding",
+        "assay_test_type": "confirmatory",
+        "assay_organism": "Rattus norvegicus",
+        "assay_tax_id": 10116,
+        "assay_cell_type": null,
+        "assay_subcellular_fraction": null,
+        "bao_format": null,
+        "bao_label": "single protein format",
+        "confidence_score": 7,
+        "description": "synthetic non-human assay",
+        "src_assay_id": "synthetic-assay-3"
+      },
+      {
+        "assay_chembl_id": "CHEMBL910001",
+        "target_chembl_id": "CHEMBL910201",
+        "assay_type": "B",
+        "assay_category": "binding",
+        "assay_test_type": "confirmatory",
+        "assay_organism": "Homo sapiens",
+        "assay_tax_id": 9606,
+        "assay_cell_type": null,
+        "assay_subcellular_fraction": null,
+        "bao_format": null,
+        "bao_label": "single protein format",
+        "confidence_score": 9,
+        "description": "synthetic caffeine assay",
+        "src_assay_id": "synthetic-assay-4"
+      }
+    ],
+    "documents": [
+      {
+        "document_chembl_id": "CHEMBL900101",
+        "doi": "10.0000/synthetic.001",
+        "pubmed_id": null,
+        "title": "Synthetic test article one",
+        "authors": "Fixture authors",
+        "journal": "Synthetic Journal",
+        "year": 2026,
+        "volume": "1",
+        "issue": "1",
+        "first_page": "1",
+        "last_page": "2",
+        "src_id": 1,
+        "src_short_name": "synthetic_test"
+      },
+      {
+        "document_chembl_id": "CHEMBL900102",
+        "doi": "10.0000/synthetic.002",
+        "pubmed_id": null,
+        "title": "Synthetic test article two",
+        "authors": "Fixture authors",
+        "journal": "Synthetic Journal",
+        "year": 2026,
+        "volume": "1",
+        "issue": "2",
+        "first_page": "3",
+        "last_page": "4",
+        "src_id": 1,
+        "src_short_name": "synthetic_test"
+      },
+      {
+        "document_chembl_id": "CHEMBL900103",
+        "doi": "10.0000/synthetic.003",
+        "pubmed_id": null,
+        "title": "Synthetic non-human test article",
+        "authors": "Fixture authors",
+        "journal": "Synthetic Journal",
+        "year": 2026,
+        "volume": "1",
+        "issue": "3",
+        "first_page": "5",
+        "last_page": "6",
+        "src_id": 1,
+        "src_short_name": "synthetic_test"
+      },
+      {
+        "document_chembl_id": "CHEMBL910101",
+        "doi": "10.0000/synthetic.004",
+        "pubmed_id": null,
+        "title": "Synthetic test article four",
+        "authors": "Fixture authors",
+        "journal": "Synthetic Journal",
+        "year": 2026,
+        "volume": "1",
+        "issue": "4",
+        "first_page": "7",
+        "last_page": "8",
+        "src_id": 1,
+        "src_short_name": "synthetic_test"
       }
     ]
   },

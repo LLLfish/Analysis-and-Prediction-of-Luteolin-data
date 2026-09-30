@@ -56,16 +56,29 @@ class CNN3D(nn.Module):
 
 
 class MolecularCNN:
-    def __init__(self, output_dir: str = "", grid_size: int = 32, voxel_size: float = 1.0):
+    def __init__(
+        self,
+        output_dir: str = "",
+        grid_size: int = 32,
+        voxel_size: float = 1.0,
+        *,
+        weights_status: str = "unverified",
+        model=None,
+    ):
         if not output_dir:
             output_dir = os.path.join(_BASE_DIR, "features", "cnn")
         self.output_dir = os.path.abspath(output_dir)
-        os.makedirs(self.output_dir, exist_ok=True)
         self.grid_size = grid_size
         self.voxel_size = voxel_size
-        self.model = None
-        if TORCH_AVAILABLE:
-            self.model = CNN3D()
+        self.model = model
+        self.weights_status = weights_status
+        self._verified_weights = False
+        self.status = __import__("data_contracts").StageStatus(
+            "skipped_untrained", "verified_trained_weights_not_loaded",
+        )
+
+    def _has_verified_weights(self) -> bool:
+        return self.weights_status == "verified" and self._verified_weights and self.model is not None
 
     def molecule_to_grid(self, mol) -> Optional[np.ndarray]:
         if not RDKIT_AVAILABLE or mol is None:
@@ -89,16 +102,34 @@ class MolecularCNN:
             return None
 
     def extract_features(self, mol_grid: np.ndarray) -> Optional[np.ndarray]:
-        if self.model is None or not TORCH_AVAILABLE:
+        if not TORCH_AVAILABLE:
+            self.status = __import__("data_contracts").StageStatus("unavailable", "pytorch_unavailable")
+            return None
+        if not self._has_verified_weights():
+            self.status = __import__("data_contracts").StageStatus(
+                "skipped_untrained", "verified_trained_weights_not_loaded",
+            )
+            return None
+        if not isinstance(mol_grid, np.ndarray) or mol_grid.ndim != 4 or not np.isfinite(mol_grid).all():
+            self.status = __import__("data_contracts").StageStatus("error", "invalid_molecular_grid")
             return None
         try:
             with torch.no_grad():
-                tensor = torch.from_numpy(mol_grid).float().unsqueeze(0)
-                features = self.model(tensor).numpy()
-                logger.info("CNN features extracted: %s", str(features.shape))
-                return features
-        except Exception as e:
-            logger.error("CNN feature extraction failed: %s", e)
+                tensor = torch.from_numpy(mol_grid).float().unsqueeze(0).to(
+                    next(self.model.parameters()).device
+                )
+                features = self.model(tensor)
+            if not torch.is_tensor(features) or features.ndim != 2 or not torch.isfinite(features).all():
+                self.status = __import__("data_contracts").StageStatus("error", "cnn_output_shape_invalid")
+                return None
+            self.status = __import__("data_contracts").StageStatus("ready")
+            logger.info("CNN features extracted: %s", str(tuple(features.shape)))
+            return features.detach().cpu().numpy()
+        except Exception as exc:
+            self.status = __import__("data_contracts").StageStatus(
+                "error", f"cnn_inference_failed:{type(exc).__name__}",
+            )
+            logger.error("CNN feature extraction failed: %s", exc)
             return None
 
     def save_features(self, features: np.ndarray, filename: str = "cnn_features.npy"):

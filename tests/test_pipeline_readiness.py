@@ -14,7 +14,7 @@ import evidence_builder as builder
 import main as main_module
 import output_module
 import transformer_module
-from data_contracts import FeatureResult
+from data_contracts import FeatureResult, StageStatus
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "activity_pages.json"
@@ -126,8 +126,13 @@ def _framework_for_test(bundle: dict, tmp_path: Path):
     framework.ligand_extractor = None
     framework.protein_extractor = _ProteinExtractorSpy(bundle)
     framework.gnn_analyzer = None
-    framework.cnn_module = None
-    framework.transformer_module = None
+    framework.cnn_module = type("UntrainedCNN", (), {
+        "status": StageStatus("skipped_untrained", "verified_trained_weights_not_loaded"),
+    })()
+    framework.transformer_module = type("UntrainedFusion", (), {
+        "status": StageStatus("skipped_untrained", "verified_trained_weights_not_loaded"),
+        "_has_verified_weights": lambda self: False,
+    })()
     return framework
 
 
@@ -151,7 +156,9 @@ def test_main_feature_pipeline_consumes_entity_bundle_and_reports_partial(tmp_pa
 def test_feature_fusion_never_fills_missing_modalities_with_random_arrays(monkeypatch, tmp_path):
     framework = main_module.NetworkPharmacologyFramework.__new__(main_module.NetworkPharmacologyFramework)
     framework.results = {}
-    framework.transformer_module = None
+    framework.transformer_module = type("UntrainedFusion", (), {
+        "_has_verified_weights": lambda self: False,
+    })()
     random_calls = []
     monkeypatch.setattr(np.random, "randn", lambda *shape: random_calls.append(shape))
 
@@ -197,5 +204,43 @@ def test_framework_json_summary_uses_statuses_instead_of_truthy_feature_dicts(tm
     assert saved["summary"]["feature_fusion"]["status"] == "skipped_untrained"
 
 
-def test_new_local_entity_feature_pipeline_entry_point_is_available():
+def test_dashboard_html_uses_requested_output_and_preserves_legacy_path(tmp_path, monkeypatch):
+    legacy_base = tmp_path / "legacy"
+    legacy_base.mkdir()
+    legacy_dashboard = legacy_base / "output_dashboard.html"
+    legacy_dashboard.write_bytes(b"preexisting dashboard bytes")
+    monkeypatch.setattr(output_module, "_BASE_DIR", str(legacy_base))
+    target = tmp_path / "requested-output"
+    generator = output_module.OutputGenerator(output_dir=str(target))
+    report = generator.generate_summary_report({"feature_readiness": _readiness()})
+
+    dashboard_path = Path(generator.generate_dashboard_html(report))
+
+    assert dashboard_path == target / "dashboard.html"
+    assert dashboard_path.is_file()
+    assert legacy_dashboard.read_bytes() == b"preexisting dashboard bytes"
+def test_local_entity_feature_pipeline_creates_status_report_in_new_output_root(tmp_path):
     assert callable(getattr(main_module, "run_feature_pipeline", None))
+    bundle_path, _ = _bundle(tmp_path)
+    output_dir = tmp_path / "p0-output"
+
+    results = main_module.main([
+        "--entity-bundle", str(bundle_path),
+        "--output-dir", str(output_dir),
+    ])
+
+    saved_path = output_dir / "framework_results.json"
+    saved = json.loads(saved_path.read_text(encoding="utf-8"))
+    readiness = results["feature_extraction"]["feature_readiness"]
+    assert readiness["stages"]["protein"]["status"] == "unverified_source"
+    assert readiness["stages"]["cnn"]["status"] == "skipped_untrained"
+    assert readiness["stages"]["transformer"]["status"] == "skipped_untrained"
+    assert saved["summary"]["feature_extraction"]["status"] == "unavailable"
+    dashboard_path = output_dir / "output" / "dashboard.html"
+    dashboard = dashboard_path.read_text(encoding="utf-8")
+    assert dashboard_path.is_file()
+    assert "特征与模型状态" in dashboard
+    assert "skipped_untrained" in dashboard
+    assert results["output"]["feature_readiness"] == readiness
+    assert results["output"]["gnn_summary"]["model_type"] == "network_statistics_only"
+    assert output_dir.is_dir()

@@ -11,7 +11,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 from logging_config import setup_logger
 logger = setup_logger(__name__)
 
-from data_contracts import CanonicalPpiResult, canonicalize_ppi
+from data_contracts import CanonicalPpiResult, StageStatus, canonicalize_ppi
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -107,6 +107,7 @@ class NetworkPharmacologyFramework:
         if not output_dir:
             output_dir = os.path.join(_BASE_DIR, "framework_output")
         self.output_dir = os.path.abspath(output_dir)
+        self._output_dir_preexisted = os.path.exists(self.output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.data_collector = self._safe_component(globals().get('LuteolinDataCollector'), 'LuteolinDataCollector', output_dir=os.path.join(self.output_dir, "data"))
@@ -182,32 +183,132 @@ class NetworkPharmacologyFramework:
         self._ppi_result = result
         return result
 
-    def run_feature_extraction(self, dataset: Dict[str, Any]) -> Dict[str, Any]:
-        compound = dataset.get('compound', {})
-        smiles = compound.get('smiles', 'C1=CC(=C(C=C1C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O)O')
+    @staticmethod
+    def _feature_readiness(stage_statuses: Dict[str, StageStatus]) -> Dict[str, Any]:
+        stage_data = {name: status.to_dict() for name, status in stage_statuses.items()}
+        learned_names = ("protein", "cnn", "transformer")
+        learned_statuses = [stage_statuses[name].status for name in learned_names if name in stage_statuses]
+        ready_count = sum(status == "ready" for status in learned_statuses)
+        if ready_count == len(learned_names) and learned_statuses:
+            overall = "ready"
+        elif ready_count > 0 or any(status == "partial" for status in learned_statuses):
+            overall = "partial"
+        else:
+            overall = "unavailable"
+        return {"overall_status": overall, "stages": stage_data}
+
+    @staticmethod
+    def _protein_readiness(results: List[Any]) -> StageStatus:
+        if not results:
+            return StageStatus("unavailable", "no_protein_records_in_entity_bundle")
+        statuses = [getattr(result, "status", "error") for result in results]
+        ready_count = sum(status == "ready" for status in statuses)
+        details = {
+            "protein_count": len(results),
+            "statuses": statuses,
+            "sequence_sha256": [getattr(result, "sequence_sha256", None) for result in results],
+        }
+        if ready_count == len(results):
+            return StageStatus("ready", details=details)
+        if ready_count:
+            return StageStatus("partial", "some_protein_features_unavailable", details)
+        if len(set(statuses)) == 1 and statuses[0] in {
+            "skipped_untrained", "unavailable", "invalid_sequence",
+            "unsupported_length", "unverified_source", "error", "empty",
+        }:
+            reason = getattr(results[0], "reason", None) or "protein_features_not_ready"
+            return StageStatus(statuses[0], reason, details)
+        return StageStatus("unavailable", "no_protein_features_ready", details)
+
+    def run_feature_extraction(
+        self,
+        dataset: Dict[str, Any],
+        entity_bundle_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        dataset = dataset or {}
+        compound = dataset.get("compound", {}) or {}
+        smiles = compound.get("smiles")
 
         logger.info("Extracting ligand features...")
-        ligand_features = self.ligand_extractor.extract_all_features(smiles, "luteolin") if self.ligand_extractor else {}
+        if self.ligand_extractor and smiles:
+            try:
+                ligand_features = self.ligand_extractor.extract_all_features(
+                    smiles, compound.get("name", "compound"),
+                )
+                ligand_success = bool(ligand_features.get("success"))
+                ligand_status = StageStatus(
+                    "ready" if ligand_success else "unavailable",
+                    None if ligand_success else "ligand_feature_extraction_failed",
+                )
+            except Exception as exc:
+                ligand_features = {"features": {}, "status": "error", "reason": type(exc).__name__}
+                ligand_status = StageStatus("error", f"ligand_feature_extraction_failed:{type(exc).__name__}")
+        else:
+            ligand_features = {
+                "features": {},
+                "status": "unavailable",
+                "reason": "compound_smiles_or_extractor_missing",
+            }
+            ligand_status = StageStatus("unavailable", "compound_smiles_or_extractor_missing")
+        ligand_features = dict(ligand_features or {})
+        ligand_features.setdefault("status", ligand_status.status)
+        ligand_features.setdefault("reason", ligand_status.reason)
 
-        logger.info("Extracting protein features...")
-        protein_sequence = "MNSFELKQVNGLDLRLLKPVLSSKESWFKGKQGKKKPKKISKAKIVNGKQIFLSKEL"
-        if self.protein_extractor:
-            self.protein_extractor.load_esm_model(timeout=120)
-        protein_features = self.protein_extractor.extract_all_features(protein_sequence, "sample_protein") if self.protein_extractor else {}
+        logger.info("Extracting identity-bound protein features...")
+        bundle_path = entity_bundle_path or dataset.get("entity_bundle_path")
+        protein_results = []
+        if not bundle_path:
+            protein_status = StageStatus("unavailable", "verified_entity_bundle_path_required")
+            protein_features = {
+                "status": protein_status.status,
+                "reason": protein_status.reason,
+                "results": [],
+            }
+        elif self.protein_extractor is None:
+            protein_status = StageStatus("unavailable", "protein_feature_extractor_unavailable")
+            protein_features = {
+                "status": protein_status.status,
+                "reason": protein_status.reason,
+                "results": [],
+                "entity_bundle_path": str(bundle_path),
+            }
+        else:
+            try:
+                protein_results = self.protein_extractor.extract_from_bundle(str(bundle_path))
+                protein_status = self._protein_readiness(protein_results)
+            except Exception as exc:
+                logger.warning("Verified entity bundle was rejected by protein extraction: %s", exc)
+                protein_status = StageStatus(
+                    "unverified_source", f"entity_bundle_rejected:{type(exc).__name__}",
+                )
+            protein_features = {
+                "status": protein_status.status,
+                "reason": protein_status.reason,
+                "results": [
+                    result.to_dict() if hasattr(result, "to_dict") else dict(result)
+                    for result in protein_results
+                ],
+                "entity_bundle_path": str(bundle_path),
+            }
+            if protein_results:
+                protein_features["entity_version"] = getattr(protein_results[0], "entity_version", None)
+                protein_features["entity_bundle_hash"] = getattr(
+                    protein_results[0], "entity_bundle_hash", None,
+                )
 
         logger.info("Analyzing canonical PPI network statistics...")
         ppi_result = self._canonicalize_dataset_ppi(dataset)
         ppi_features = ppi_result.to_dict()
         gnn_features = {
-            'model_type': 'network_statistics_only',
-            'status': ppi_result.status,
-            'centrality': {},
-            'graph_stats': {'num_nodes': ppi_result.node_count, 'num_edges': ppi_result.edge_count},
-            'num_nodes': ppi_result.node_count,
-            'num_edges': ppi_result.edge_count,
+            "model_type": "network_statistics_only",
+            "status": ppi_result.status,
+            "centrality": {},
+            "graph_stats": {"num_nodes": ppi_result.node_count, "num_edges": ppi_result.edge_count},
+            "num_nodes": ppi_result.node_count,
+            "num_edges": ppi_result.edge_count,
         }
-        if ppi_result.status == 'empty':
-            gnn_features['status'] = 'empty'
+        if ppi_result.status == "empty":
+            gnn_features["status"] = "empty"
         elif self.gnn_analyzer:
             try:
                 import networkx as nx
@@ -226,81 +327,101 @@ class NetworkPharmacologyFramework:
                     )
                 if graph.number_of_nodes() > 0:
                     centrality = self.gnn_analyzer.compute_centrality(graph)
-                    gnn_features['centrality'] = self._json_safe_metric_keys(centrality)
-                    gnn_features['graph_stats'] = self.gnn_analyzer.compute_graph_statistics(graph)
+                    gnn_features["centrality"] = self._json_safe_metric_keys(centrality)
+                    gnn_features["graph_stats"] = self.gnn_analyzer.compute_graph_statistics(graph)
                 else:
-                    gnn_features['status'] = 'empty'
-                gnn_features['num_nodes'] = graph.number_of_nodes()
-                gnn_features['num_edges'] = graph.number_of_edges()
+                    gnn_features["status"] = "empty"
+                gnn_features["num_nodes"] = graph.number_of_nodes()
+                gnn_features["num_edges"] = graph.number_of_edges()
             except ImportError:
-                gnn_features['status'] = 'dependency_unavailable'
+                gnn_features["status"] = "dependency_unavailable"
+        network_status = (
+            StageStatus("empty", "no_canonical_ppi_edges")
+            if ppi_result.status == "empty"
+            else StageStatus("ready")
+        )
 
-        logger.info("Extracting CNN features...")
-        cnn_features = {}
-        if self.cnn_module and RDKIT_AVAILABLE and smiles:
-            try:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol:
-                    mol = Chem.AddHs(mol)
-                    AllChem.EmbedMolecule(mol, randomSeed=42)
-                    AllChem.MMFFOptimizeMolecule(mol)
-                    grid = self.cnn_module.molecule_to_grid(mol)
-                    if grid is not None:
-                        feats = self.cnn_module.extract_features(grid)
-                        cnn_features = {'features': feats}
-            except Exception as e:
-                logger.error("CNN feature extraction failed: %s", e)
-
-        features = {
-            'ligand': ligand_features,
-            'protein': protein_features,
-            'gnn': gnn_features,
-            'cnn': cnn_features,
-            'ppi': ppi_features,
+        if self.cnn_module is None:
+            cnn_status = StageStatus("unavailable", "cnn_module_unavailable")
+        else:
+            wrapper_status = getattr(self.cnn_module, "status", None)
+            cnn_status = (
+                wrapper_status
+                if isinstance(wrapper_status, StageStatus)
+                else StageStatus("skipped_untrained", "verified_trained_weights_not_loaded")
+            )
+        cnn_features = {
+            "status": cnn_status.status,
+            "reason": cnn_status.reason,
+            "features": None,
         }
 
-        self.results['feature_extraction'] = features
-        logger.info("Feature extraction completed")
-
+        transformer_module = getattr(self, "transformer_module", None)
+        if transformer_module is None:
+            transformer_status = StageStatus("unavailable", "transformer_module_unavailable")
+        else:
+            wrapper_status = getattr(transformer_module, "status", None)
+            transformer_status = (
+                wrapper_status
+                if isinstance(wrapper_status, StageStatus)
+                else StageStatus("skipped_untrained", "verified_trained_weights_not_loaded")
+            )
+        feature_readiness = self._feature_readiness({
+            "protein": protein_status,
+            "cnn": cnn_status,
+            "transformer": transformer_status,
+            "ligand": ligand_status,
+            "network_statistics": network_status,
+        })
+        features = {
+            "ligand": ligand_features,
+            "protein": protein_features,
+            "gnn": gnn_features,
+            "cnn": cnn_features,
+            "ppi": ppi_features,
+            "feature_readiness": feature_readiness,
+        }
+        self.results["feature_extraction"] = features
+        logger.info("Feature extraction completed with status=%s", feature_readiness["overall_status"])
         return features
 
     def run_feature_fusion(self, features: Dict[str, Any]) -> Dict[str, Any]:
-        import numpy as np
-        gnn_feat = features.get('gnn', {})
-        cnn_feat = features.get('cnn', {})
-        protein_feat = features.get('protein', {})
-        ligand_feat = features.get('ligand', {})
-
-        gnn_arr = np.array([v for v in gnn_feat.get('centrality', {}).values()])[:64] if gnn_feat.get('centrality') else np.random.randn(64)
-        cnn_arr = cnn_feat.get('features', np.random.randn(64)).flatten()[:64] if isinstance(cnn_feat.get('features'), np.ndarray) else np.random.randn(64)
-        esm = protein_feat.get('features', {}).get('esm_embedding', np.random.randn(64))
-        if isinstance(esm, np.ndarray):
-            esm_arr = esm.flatten()[:64]
+        features = features or {}
+        transformer = getattr(self, "transformer_module", None)
+        if transformer is None:
+            stage = StageStatus("unavailable", "transformer_module_unavailable")
+        elif (
+            not callable(getattr(transformer, "_has_verified_weights", None))
+            or not transformer._has_verified_weights()
+        ):
+            stage = StageStatus("skipped_untrained", "verified_trained_weights_not_loaded")
+        elif features.get("gnn", {}).get("model_type") != "learned_gnn":
+            stage = StageStatus("skipped_untrained", "learned_gnn_not_available")
         else:
-            esm_arr = np.random.randn(64)
-        lig_desc = ligand_feat.get('features', {}).get('descriptors', {})
-        lig_arr = np.array(list(lig_desc.values()))[:64] if lig_desc else np.random.randn(64)
+            stage = StageStatus("unavailable", "verified_fusion_inputs_not_available")
 
-        fusion_results = {}
-        if self.transformer_module:
-            import numpy as np
-            def _to_array(x, size=64):
-                if isinstance(x, np.ndarray):
-                    return x.flatten()[:size] if x.size >= size else np.pad(x.flatten(), (0, size - x.size))
-                return np.random.randn(size)
-
-            fused = self.transformer_module.fuse_features(
-                _to_array(gnn_arr).reshape(1, -1),
-                _to_array(cnn_arr).reshape(1, -1),
-                _to_array(esm_arr).reshape(1, -1)
-            )
-            fusion_results = {'fused_features': fused}
-
-        self.results['feature_fusion'] = fusion_results
-        logger.info("Feature fusion completed")
-
+        fusion_results = {
+            "status": stage.status,
+            "reason": stage.reason,
+            "fused_features": None,
+        }
+        readiness = features.get("feature_readiness", {})
+        stages = dict(readiness.get("stages", {})) if isinstance(readiness, dict) else {}
+        stages["transformer"] = stage.to_dict()
+        stage_objects = {}
+        for name, value in stages.items():
+            if isinstance(value, StageStatus):
+                stage_objects[name] = value
+            elif isinstance(value, dict):
+                status = value.get("status", "unavailable")
+                reason = value.get("reason") or (None if status == "ready" else "stage_not_ready")
+                stage_objects[name] = StageStatus(status, reason, value.get("details", {}))
+        features["feature_readiness"] = self._feature_readiness(stage_objects)
+        if "feature_extraction" in self.results:
+            self.results["feature_extraction"]["feature_readiness"] = features["feature_readiness"]
+        self.results["feature_fusion"] = fusion_results
+        logger.info("Feature fusion completed with status=%s", stage.status)
         return fusion_results
-
     _DOCKING_TARGETS = [
         {"gene": "CDK2",  "pdb_id": "1AQ1", "chain": "A", "name": "Cyclin-dependent kinase 2"},
         {"gene": "CDK6",  "pdb_id": "1XO2", "chain": "A", "name": "Cyclin-dependent kinase 6"},
@@ -430,7 +551,8 @@ class NetworkPharmacologyFramework:
                     'docking': docking_results,
                     'gnn': gnn_results,
                     'ligand': ligand_results,
-                    'knowledge_graph': knowledge_graph_results
+                    'knowledge_graph': knowledge_graph_results,
+                    'feature_readiness': feature_extraction.get('feature_readiness', {})
                 }
                 report = self.output_module.generate_summary_report(summary_input)
                 self.output_module.generate_dashboard_html(report)
@@ -452,49 +574,62 @@ class NetworkPharmacologyFramework:
 
     def save_results(self) -> str:
         filepath = os.path.join(self.output_dir, "framework_results.json")
-
         try:
-            summary_data = self.results.get('data_collection', {})
-            feature_data = self.results.get('feature_extraction', {})
-            docking_data = self.results.get('docking', {})
-            kg_data = self.results.get('knowledge_graph', {})
-            results_to_save = {
-                'framework_version': '1.0',
-                'run_time': datetime.now().isoformat(),
-                'results': self.results,
-                'summary': {
-                    'data_collection': {
-                        'compound': summary_data.get('compound', {}).get('name', 'N/A'),
-                        'num_targets': len(summary_data.get('targets', {})),
-                        'num_proteins': len(summary_data.get('proteins', [])),
-                        'num_interactions': len(summary_data.get('interactions', []))
-                    },
-                    'feature_extraction': {
-                        'ligand_features': bool(feature_data.get('ligand', {})),
-                        'protein_features': bool(feature_data.get('protein', {})),
-                        'gnn_features': bool(feature_data.get('gnn', {})),
-                        'cnn_features': bool(feature_data.get('cnn', {}))
-                    },
-                    'docking': {
-                        'best_affinity': docking_data.get('binding_affinity', 'N/A')
-                    },
-                    'knowledge_graph': {
-                        'num_nodes': kg_data.get('graph', {}).get('stats', {}).get('num_nodes', 0),
-                        'num_edges': kg_data.get('graph', {}).get('stats', {}).get('num_edges', 0)
-                    }
-                }
+            summary_data = self.results.get("data_collection", {})
+            feature_data = self.results.get("feature_extraction", {})
+            fusion_data = self.results.get("feature_fusion", {})
+            readiness = feature_data.get("feature_readiness", {})
+            stage_data = readiness.get("stages", {}) if isinstance(readiness, dict) else {}
+            stage_statuses = {
+                name: value.get("status", "unavailable")
+                for name, value in stage_data.items()
+                if isinstance(value, dict)
             }
-
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(results_to_save, f, ensure_ascii=False, indent=2, default=self._json_serialize)
-
-            logger.info("Saved framework results to %s", filepath)
+            docking_data = self.results.get("docking", {})
+            kg_data = self.results.get("knowledge_graph", {})
+            results_to_save = {
+                "framework_version": "1.0",
+                "run_time": datetime.now().isoformat(),
+                "results": self.results,
+                "summary": {
+                    "data_collection": {
+                        "compound": summary_data.get("compound", {}).get("name", "N/A"),
+                        "num_targets": len(summary_data.get("targets", {})),
+                        "num_proteins": len(summary_data.get("proteins", [])),
+                        "num_interactions": len(summary_data.get("interactions", [])),
+                    },
+                    "feature_extraction": {
+                        "status": readiness.get("overall_status", "unavailable"),
+                        "stage_statuses": stage_statuses,
+                        "ligand_features": stage_statuses.get("ligand") == "ready",
+                        "protein_features": stage_statuses.get("protein") in {"ready", "partial"},
+                        "gnn_features": bool(feature_data.get("gnn", {}).get("centrality")),
+                        "cnn_features": stage_statuses.get("cnn") == "ready",
+                    },
+                    "feature_fusion": {
+                        "status": fusion_data.get("status", "unavailable"),
+                        "reason": fusion_data.get("reason"),
+                    },
+                    "docking": {
+                        "best_affinity": docking_data.get("binding_affinity", "N/A"),
+                    },
+                    "knowledge_graph": {
+                        "num_nodes": kg_data.get("graph", {}).get("stats", {}).get("num_nodes", 0),
+                        "num_edges": kg_data.get("graph", {}).get("stats", {}).get("num_edges", 0),
+                    },
+                },
+            }
+            with open(filepath, "w", encoding="utf-8") as stream:
+                json.dump(results_to_save, stream, ensure_ascii=False, indent=2, default=self._json_serialize)
+            logger.info(
+                "Saved framework results to %s with feature status=%s",
+                filepath,
+                readiness.get("overall_status", "unavailable"),
+            )
             return filepath
-
-        except Exception as e:
-            logger.error("Error saving results: %s", e)
+        except Exception as exc:
+            logger.error("Error saving results: %s", exc)
             return ""
-
     def _json_serialize(self, obj):
         import numpy as np
         if isinstance(obj, np.ndarray):
@@ -506,48 +641,15 @@ class NetworkPharmacologyFramework:
         return str(obj)
 
     def _clean_previous_output(self):
-        dirs_to_clean = [
-            os.path.join(self.output_dir, "data"),
-            os.path.join(self.output_dir, "ligand"),
-            os.path.join(self.output_dir, "protein"),
-            os.path.join(self.output_dir, "cnn"),
-            os.path.join(self.output_dir, "gnn"),
-            os.path.join(self.output_dir, "transformer"),
-            os.path.join(self.output_dir, "docking"),
-            os.path.join(self.output_dir, "knowledge_graph"),
-            os.path.join(self.output_dir, "output"),
-        ]
-        files_to_clean = [
-            os.path.join(self.output_dir, "framework_results.json"),
-        ]
-        import shutil
-        for d in dirs_to_clean:
-            if os.path.exists(d):
-                shutil.rmtree(d, ignore_errors=True)
-        for f in files_to_clean:
-            if os.path.exists(f):
-                os.remove(f)
-        logger.info("Previous output cleaned")
-        sub_dirs = {
-            "data": ["raw", "processed"],
-            "ligand": ["structures", "descriptors"],
-            "protein": ["structures", "embeddings"],
-            "cnn": [],
-            "gnn": [],
-            "transformer": [],
-            "docking": ["structures", "receptors", "results"],
-            "knowledge_graph": ["graph"],
-            "output": ["images"],
-        }
-        for parent, subs in sub_dirs.items():
-            parent_dir = os.path.join(self.output_dir, parent)
-            os.makedirs(parent_dir, exist_ok=True)
-            for sub in subs:
-                os.makedirs(os.path.join(parent_dir, sub), exist_ok=True)
-
+        raise RuntimeError(
+            "Destructive output cleanup is disabled; use a new run output directory."
+        )
     def run_full_pipeline(self) -> Dict[str, Any]:
+        if getattr(self, "_output_dir_preexisted", True):
+            raise FileExistsError(
+                "Full pipeline requires a new output directory; existing framework outputs are read-only."
+            )
         logger.info("Starting full pipeline execution...")
-        self._clean_previous_output()
         start_time = datetime.now()
 
         dataset = self.run_data_collection()
@@ -558,61 +660,83 @@ class NetworkPharmacologyFramework:
         self.run_output_generation()
         self.save_results()
 
-        end_time = datetime.now()
-        runtime = (end_time - start_time).total_seconds()
-        logger.info("Pipeline execution completed in %.2f seconds", runtime)
-
+        runtime = (datetime.now() - start_time).total_seconds()
+        status = self.results.get("feature_extraction", {}).get(
+            "feature_readiness", {},
+        ).get("overall_status", "unavailable")
+        logger.info("Pipeline execution completed in %.2f seconds with status=%s", runtime, status)
         return self.results
 
+def run_feature_pipeline(entity_bundle_path: str, output_dir: str) -> Dict[str, Any]:
+    """Run the offline P0 feature/report path against one verified entities.json."""
+    from evidence_builder import load_entity_bundle
 
-def main():
-    output_dir = os.path.join(_BASE_DIR, "framework_output")
+    bundle_path = os.path.abspath(os.fspath(entity_bundle_path))
+    if not os.path.isfile(bundle_path):
+        raise FileNotFoundError(f"entity bundle not found: {bundle_path}")
+    load_entity_bundle(bundle_path, verify_sources=True)
 
-    log_dir = os.path.join(output_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "framework_run.log")
-    file_handler = logging.FileHandler(log_file, encoding='utf-8', mode='w')
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    ))
-    logging.getLogger().addHandler(file_handler)
-    logger.info("Log file: %s", log_file)
+    if not output_dir:
+        raise ValueError("an explicit new output directory is required")
+    resolved_output = os.path.abspath(os.path.expanduser(os.fspath(output_dir)))
+    if os.path.exists(resolved_output):
+        raise FileExistsError(f"refusing to overwrite existing output directory: {resolved_output}")
+    protected_paths = [
+        os.path.join(_BASE_DIR, "data"),
+        os.path.join(_BASE_DIR, "framework_output"),
+        os.path.join(_BASE_DIR, "offline_data.json"),
+        os.path.join(_BASE_DIR, ".model_cache"),
+        os.path.join(_BASE_DIR, "features"),
+    ]
+    for protected_path in protected_paths:
+        protected_path = os.path.abspath(protected_path)
+        try:
+            common = os.path.commonpath((resolved_output, protected_path))
+        except ValueError:
+            continue
+        if os.path.normcase(common) in {
+            os.path.normcase(resolved_output),
+            os.path.normcase(protected_path),
+        }:
+            raise ValueError("output directory intersects protected historical data or model paths")
 
-    framework = NetworkPharmacologyFramework(output_dir=output_dir)
-    results = framework.run_full_pipeline()
+    os.makedirs(resolved_output, exist_ok=False)
+    dataset = {
+        "entity_bundle_path": bundle_path,
+        "compound": {},
+        "targets": [],
+        "proteins": [],
+        "interactions": [],
+        "ppi_source_kind": "legacy_unverified",
+    }
+    framework = NetworkPharmacologyFramework(output_dir=resolved_output)
+    framework.results["data_collection"] = dataset
+    features = framework.run_feature_extraction(dataset)
+    framework.run_feature_fusion(features)
+    framework.run_output_generation()
+    results_path = framework.save_results()
+    if not results_path:
+        raise RuntimeError("framework results could not be saved")
+    logger.info(
+        "Local entity feature pipeline completed with status=%s; results=%s",
+        framework.results.get("feature_extraction", {})
+        .get("feature_readiness", {})
+        .get("overall_status", "unavailable"),
+        results_path,
+    )
+    return framework.results
 
-    data_summary = results.get('data_collection', {})
-    logger.info("Data Collection: compound=%s, targets=%d, proteins=%d, interactions=%d",
-                data_summary.get('compound', {}).get('name', 'N/A'),
-                len(data_summary.get('targets', [])),
-                len(data_summary.get('proteins', [])),
-                len(data_summary.get('interactions', [])))
 
-    feature_summary = results.get('feature_extraction', {})
-    logger.info("Feature Extraction: ligand=%s, protein=%s, gnn=%s, cnn=%s",
-                bool(feature_summary.get('ligand', {})),
-                bool(feature_summary.get('protein', {})),
-                bool(feature_summary.get('gnn', {})),
-                bool(feature_summary.get('cnn', {})))
+def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
+    import argparse
 
-    docking_summary = results.get('docking', {})
-    best_affinity = docking_summary.get('binding_affinity', 'N/A')
-    logger.info("Molecular Docking: best affinity=%s kcal/mol", best_affinity)
-
-    kg_summary = results.get('knowledge_graph', {})
-    logger.info("Knowledge Graph: nodes=%d, edges=%d",
-                kg_summary.get('graph', {}).get('stats', {}).get('num_nodes', 0),
-                kg_summary.get('graph', {}).get('stats', {}).get('num_edges', 0))
-
-    output_summary = results.get('output', {})
-    logger.info("Output Generation: target_discovery=%s, mechanism=%s, drug_dev=%s",
-                bool(output_summary.get('target_discovery', {})),
-                bool(output_summary.get('mechanism_analysis', {})),
-                bool(output_summary.get('drug_development', {})))
-
-    logger.info("All modules executed successfully!")
+    parser = argparse.ArgumentParser(
+        description="Run offline protein feature extraction from a verified entity bundle."
+    )
+    parser.add_argument("--entity-bundle", required=True, help="Path to a source-verified entities.json")
+    parser.add_argument("--output-dir", required=True, help="New output directory; existing paths are refused")
+    args = parser.parse_args(argv)
+    return run_feature_pipeline(args.entity_bundle, args.output_dir)
 
 
 if __name__ == "__main__":

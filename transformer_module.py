@@ -88,45 +88,60 @@ class TransformerFusion(nn.Module):
 
 
 class FeatureFusion:
-    def __init__(self, output_dir: str = ""):
+    def __init__(
+        self,
+        output_dir: str = "",
+        *,
+        weights_status: str = "unverified",
+        model=None,
+    ):
         if not output_dir:
             output_dir = os.path.join(_BASE_DIR, "features", "fusion")
         self.output_dir = os.path.abspath(output_dir)
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.model = None
-        if TORCH_AVAILABLE:
-            self.model = TransformerFusion()
+        self.model = model
+        self.weights_status = weights_status
+        self._verified_weights = False
+        self.status = __import__("data_contracts").StageStatus(
+            "skipped_untrained", "verified_trained_weights_not_loaded",
+        )
+
+    def _has_verified_weights(self) -> bool:
+        return self.weights_status == "verified" and self._verified_weights and self.model is not None
 
     def fuse_features(self, gnn_features: np.ndarray, cnn_features: np.ndarray,
                       seq_features: np.ndarray) -> Optional[np.ndarray]:
-        if self.model is None or not TORCH_AVAILABLE:
-            logger.warning("Transformer not available, using concatenation")
-            try:
-                fused = np.concatenate([
-                    gnn_features.flatten(),
-                    cnn_features.flatten(),
-                    seq_features.flatten()
-                ])
-                return fused.reshape(1, -1)
-            except Exception as e:
-                logger.error("Feature concatenation failed: %s", e)
-                return None
+        if not TORCH_AVAILABLE:
+            self.status = __import__("data_contracts").StageStatus("unavailable", "pytorch_unavailable")
+            return None
+        if not self._has_verified_weights():
+            self.status = __import__("data_contracts").StageStatus(
+                "skipped_untrained", "verified_trained_weights_not_loaded",
+            )
+            return None
+        arrays = (gnn_features, cnn_features, seq_features)
+        if any(
+            not isinstance(value, np.ndarray)
+            or value.size != 64
+            or not np.isfinite(value).all()
+            for value in arrays
+        ):
+            self.status = __import__("data_contracts").StageStatus("error", "fusion_input_shape_or_value_invalid")
+            return None
         try:
+            tensors = [torch.from_numpy(value.reshape(1, 64)).float() for value in arrays]
             with torch.no_grad():
-                gnn_t = torch.from_numpy(gnn_features).float()
-                cnn_t = torch.from_numpy(cnn_features).float()
-                seq_t = torch.from_numpy(seq_features).float()
-                if gnn_t.dim() == 1:
-                    gnn_t = gnn_t.unsqueeze(0)
-                if cnn_t.dim() == 1:
-                    cnn_t = cnn_t.unsqueeze(0)
-                if seq_t.dim() == 1:
-                    seq_t = seq_t.unsqueeze(0)
-                output = self.model(gnn_t, cnn_t, seq_t)
-                logger.info("Features fused via Transformer: %s", str(output.shape))
-                return output.numpy()
-        except Exception as e:
-            logger.error("Transformer fusion failed: %s", e)
+                output = self.model(*tensors)
+            if not torch.is_tensor(output) or output.ndim != 2 or not torch.isfinite(output).all():
+                self.status = __import__("data_contracts").StageStatus("error", "fusion_output_shape_invalid")
+                return None
+            self.status = __import__("data_contracts").StageStatus("ready")
+            logger.info("Features fused via Transformer: %s", str(tuple(output.shape)))
+            return output.detach().cpu().numpy()
+        except Exception as exc:
+            self.status = __import__("data_contracts").StageStatus(
+                "error", f"transformer_inference_failed:{type(exc).__name__}",
+            )
+            logger.error("Transformer fusion failed: %s", exc)
             return None
 
     def save_fused_features(self, features: np.ndarray, filename: str = "fused_features.npy"):

@@ -49,23 +49,40 @@ class OutputGenerator:
         self.results = {}
 
     def generate_summary_report(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        feature_readiness = results.get("feature_readiness", {})
+        if not isinstance(feature_readiness, dict):
+            feature_readiness = {"overall_status": "unavailable", "stages": {}}
+        stage_statuses = feature_readiness.get("stages", {})
+        if not isinstance(stage_statuses, dict):
+            stage_statuses = {}
+        feature_ready = any(
+            isinstance(stage, dict) and stage.get("status") == "ready"
+            for name, stage in stage_statuses.items()
+            if name in {"protein", "cnn", "transformer"}
+        )
         report = {
-            'generation_time': datetime.now().isoformat(),
-            'compound': results.get('compound', {}),
-            'target_analysis': self._analyze_targets(results.get('targets', [])),
-            'docking_summary': results.get('docking', {}),
-            'gnn_summary': self._summarize_gnn(results.get('gnn', {})),
-            'knowledge_graph_summary': results.get('knowledge_graph', {}),
-            'ligand_summary': results.get('ligand', {}),
-            'data_quality': {},
-            'targets_raw': results.get('targets', []),
+            "generation_time": datetime.now().isoformat(),
+            "compound": results.get("compound", {}),
+            "target_analysis": self._analyze_targets(results.get("targets", [])),
+            "docking_summary": results.get("docking", {}),
+            "gnn_summary": self._summarize_gnn(results.get("gnn", {})),
+            "knowledge_graph_summary": results.get("knowledge_graph", {}),
+            "ligand_summary": results.get("ligand", {}),
+            "feature_readiness": feature_readiness,
+            "data_quality": {
+                "targets_found": len(results.get("targets", [])),
+                "features_extracted": feature_ready,
+                "overall_status": feature_readiness.get("overall_status", "unavailable"),
+                "feature_stages": stage_statuses,
+                "docking_completed": bool(results.get("docking")),
+            },
+            "targets_raw": results.get("targets", []),
         }
-        report['data_quality']['targets_found'] = len(results.get('targets', []))
-        report['data_quality']['features_extracted'] = bool(results.get('gnn'))
-        report['data_quality']['docking_completed'] = bool(results.get('docking'))
-        logger.info("Summary report generated")
+        logger.info(
+            "Summary report generated with feature status=%s",
+            report["data_quality"]["overall_status"],
+        )
         return report
-
     def _analyze_targets(self, targets: List[Dict]) -> Dict[str, Any]:
         analysis = {'total_targets': len(targets), 'gene_symbols': [], 'activities': []}
         for t in targets:
@@ -80,12 +97,15 @@ class OutputGenerator:
         return analysis
 
     def _summarize_gnn(self, gnn_results: Dict) -> Dict[str, Any]:
-        summary = {'available': bool(gnn_results)}
+        summary = {
+            "available": bool(gnn_results),
+            "model_type": gnn_results.get("model_type", "unknown"),
+            "status": gnn_results.get("status", "unavailable"),
+        }
         if gnn_results:
-            summary['graph_nodes'] = gnn_results.get('num_nodes', 0)
-            summary['graph_edges'] = gnn_results.get('num_edges', 0)
+            summary["graph_nodes"] = gnn_results.get("num_nodes", 0)
+            summary["graph_edges"] = gnn_results.get("num_edges", 0)
         return summary
-
     def generate_dashboard_html(self, report: Dict[str, Any]) -> str:
         try:
             dt = datetime.fromisoformat(report["generation_time"])
@@ -99,6 +119,26 @@ class OutputGenerator:
         gs = report.get('gnn_summary', {})
         kg = report.get('knowledge_graph_summary', {})
         dq = report.get('data_quality', {})
+        feature_readiness = report.get("feature_readiness", {})
+        if not isinstance(feature_readiness, dict):
+            feature_readiness = {}
+        feature_stages = feature_readiness.get("stages", {})
+        feature_status_rows = ""
+        if isinstance(feature_stages, dict):
+            for stage_name, stage in sorted(feature_stages.items()):
+                if not isinstance(stage, dict):
+                    continue
+                status = html.escape(str(stage.get("status", "unavailable")))
+                reason = html.escape(str(stage.get("reason") or ""))
+                feature_status_rows += (
+                    f"<tr><td>{html.escape(str(stage_name))}</td>"
+                    f"<td>{status}</td><td>{reason}</td></tr>"
+                )
+        if not feature_status_rows:
+            feature_status_rows = '<tr><td colspan="3">No feature status available</td></tr>'
+        overall_feature_status = html.escape(
+            str(feature_readiness.get("overall_status", "unavailable"))
+        )
 
         compound_name = compound.get('name', 'Luteolin')
         compound_name_cn = compound.get('name_cn', '木犀草素')
@@ -194,7 +234,7 @@ class OutputGenerator:
     <div class="container">
         <header>
             <h1>{compound_name_cn}网络药理学分析结果</h1>
-            <p class="subtitle">基于深度学习和图神经网络的多维度分析</p>
+            <p class="subtitle">基于可追溯数据、蛋白特征与网络统计的分析结果</p>
             <p class="gen-time">生成时间: {display_time}</p>
         </header>
 
@@ -228,6 +268,14 @@ class OutputGenerator:
             </div>
         </div>
 
+        <div class="section">
+            <h2>特征与模型状态</h2>
+            <p>总体状态：{overall_feature_status}</p>
+            <table>
+                <thead><tr><th>阶段</th><th>状态</th><th>原因</th></tr></thead>
+                <tbody>{feature_status_rows}</tbody>
+            </table>
+        </div>
         <div class="section">
             <h2>化合物信息</h2>
             <div class="compound-info">
@@ -324,7 +372,7 @@ class OutputGenerator:
             html_content = html_content.replace('<h2>物种分布</h2>',
                 '<h2>知识图谱 3D 交互</h2>' + chr(10) + kg_html + '<h2>物种分布</h2>')
 
-        dashboard_path = os.path.join(_BASE_DIR, "output_dashboard.html")
+        dashboard_path = os.path.join(self.output_dir, "dashboard.html")
         with open(dashboard_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         logger.info("Dashboard HTML generated: %s", dashboard_path)

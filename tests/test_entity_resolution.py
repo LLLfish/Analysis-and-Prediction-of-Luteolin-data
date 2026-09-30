@@ -173,6 +173,19 @@ def test_bundle_loader_rejects_rehashed_protein_sequence_detached_from_source(tm
         builder.load_entity_bundle(bundle_path)
 
 
+def test_bundle_loader_rejects_rehashed_protein_component_detached_from_target_source(tmp_path):
+    output_dir = tmp_path / "protein-component"
+    builder.ingest_local_manifest(FIXTURE_PATH, output_dir)
+    bundle_path = output_dir / "entities.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    reference = bundle["proteins"][0]["component_evidence"]["references"][0]
+    reference["component"]["accession"] = "P99999"
+    _rewrite_bundle_hash(bundle_path, bundle)
+
+    with pytest.raises(ValueError, match="protein.*target component|protein.*identity"):
+        builder.load_entity_bundle(bundle_path)
+
+
 @pytest.mark.parametrize("tamper", ["identity", "structure"])
 def test_bundle_loader_rejects_rehashed_molecule_detached_from_raw_source(tmp_path, tamper):
     output_dir = tmp_path / f"molecule-{tamper}"
@@ -201,6 +214,9 @@ def test_bundle_loader_rejects_rehashed_molecule_detached_from_raw_source(tmp_pa
     "assay_confidence",
     "document_record",
     "confidence",
+    "activity_target_id",
+    "activity_assay_id",
+    "activity_document_id",
 ])
 def test_bundle_loader_rejects_rehashed_activity_evidence_detached_from_raw_sources(tmp_path, tamper):
     output_dir = tmp_path / f"activity-{tamper}"
@@ -223,6 +239,12 @@ def test_bundle_loader_rejects_rehashed_activity_evidence_detached_from_raw_sour
         activity["document_record"]["title"] = "Replacement article"
     elif tamper == "confidence":
         activity["confidence_score"] = 1
+    elif tamper == "activity_target_id":
+        activity["target_chembl_id"] = "CHEMBL900999"
+    elif tamper == "activity_assay_id":
+        activity["assay_chembl_id"] = "CHEMBL900999"
+    elif tamper == "activity_document_id":
+        activity["document_chembl_id"] = "CHEMBL900999"
     else:
         raise AssertionError(f"unexpected tamper case: {tamper}")
     _rewrite_bundle_hash(bundle_path, bundle)
@@ -558,6 +580,30 @@ def test_local_manifest_can_reference_fasta_with_separate_matching_taxonomy_meta
     assert protein["sequence_sha256"] == hashlib.sha256(protein["full_sequence"].encode("utf-8")).hexdigest()
     assert any(source["source_path"].endswith("P12345.fasta") for source in bundle["source_provenance"])
     assert any(source["source_path"].endswith("P12345-metadata.json") for source in bundle["source_provenance"])
+
+
+def test_local_manifest_can_reference_uniprot_json_with_utf8_bom(tmp_path):
+    manifest = _fixture()
+    input_dir = tmp_path / "json-input"
+    input_dir.mkdir()
+    uniprot_json = json.dumps(
+        manifest["uniprot"]["P12345"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    (input_dir / "P12345.json").write_bytes(b"\xef\xbb\xbf" + uniprot_json)
+    manifest["uniprot"]["P12345"] = {
+        "source_kind": "synthetic_test",
+        "json_path": "P12345.json",
+    }
+    manifest_path = input_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    output_dir = tmp_path / "json-bom-bundle"
+    result = builder.ingest_local_manifest(manifest_path, output_dir)
+    bundle = builder.load_entity_bundle(output_dir / "entities.json")
+
+    assert result["status"] == "complete"
+    assert bundle["proteins"][0]["sequence_status"] == "verified"
+    assert bundle["proteins"][0]["full_sequence"] == "ACDEFGHIKLMNPQRSTVWY"
 
 
 def test_default_sequence_hydration_is_offline_and_online_get_is_bounded(tmp_path, monkeypatch):

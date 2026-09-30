@@ -19,6 +19,8 @@ warnings.filterwarnings('ignore')
 from logging_config import setup_logger
 logger = setup_logger(__name__)
 
+from data_contracts import CanonicalPpiResult, canonicalize_ppi
+
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 RDKIT_AVAILABLE = False
@@ -144,6 +146,24 @@ class NetworkPharmacologyFramework:
                      compound_name, num_targets, num_proteins, num_interactions)
         return dataset
 
+    def _canonicalize_dataset_ppi(self, dataset: Dict[str, Any]) -> CanonicalPpiResult:
+        result = canonicalize_ppi(
+            dataset.get('interactions', []),
+            source_kind=dataset.get('ppi_source_kind'),
+            alias_mappings=dataset.get('ppi_alias_mappings'),
+        )
+        cached = getattr(self, '_ppi_result', None)
+        if (
+            cached is not None
+            and cached.input_sha256 == result.input_sha256
+            and cached.semantic_sha256 == result.semantic_sha256
+            and cached.provenance_sha256 == result.provenance_sha256
+            and cached.issues == result.issues
+        ):
+            return cached
+        self._ppi_result = result
+        return result
+
     def run_feature_extraction(self, dataset: Dict[str, Any]) -> Dict[str, Any]:
         compound = dataset.get('compound', {})
         smiles = compound.get('smiles', 'C1=CC(=C(C=C1C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O)O')
@@ -157,28 +177,44 @@ class NetworkPharmacologyFramework:
             self.protein_extractor.load_esm_model(timeout=120)
         protein_features = self.protein_extractor.extract_all_features(protein_sequence, "sample_protein") if self.protein_extractor else {}
 
-        logger.info("Extracting GNN features...")
-        interactions = dataset.get('interactions', [])
-        if not interactions:
-            interactions = [
-                {'protein_a': 'AKT1', 'protein_b': 'PIK3CA', 'score': 0.9},
-                {'protein_a': 'AKT1', 'protein_b': 'PTEN', 'score': 0.85},
-                {'protein_a': 'PIK3CA', 'protein_b': 'PTEN', 'score': 0.8}
-            ]
-
-        gnn_features = {}
-        if self.gnn_analyzer:
-            import networkx as nx
-            G = nx.Graph()
-            for it in interactions:
-                a = it.get('protein_a', '')
-                b = it.get('protein_b', '')
-                if a and b:
-                    G.add_edge(a, b, weight=it.get('score', 1.0))
-            if G.number_of_nodes() > 0:
-                centrality = self.gnn_analyzer.compute_centrality(G)
-                stats = self.gnn_analyzer.compute_graph_statistics(G)
-                gnn_features = {'centrality': centrality, 'graph_stats': stats, 'num_nodes': G.number_of_nodes(), 'num_edges': G.number_of_edges()}
+        logger.info("Analyzing canonical PPI network statistics...")
+        ppi_result = self._canonicalize_dataset_ppi(dataset)
+        ppi_features = ppi_result.to_dict()
+        gnn_features = {
+            'model_type': 'network_statistics_only',
+            'status': ppi_result.status,
+            'centrality': {},
+            'graph_stats': {'num_nodes': ppi_result.node_count, 'num_edges': ppi_result.edge_count},
+            'num_nodes': ppi_result.node_count,
+            'num_edges': ppi_result.edge_count,
+        }
+        if ppi_result.status == 'empty':
+            gnn_features['status'] = 'empty'
+        elif self.gnn_analyzer:
+            try:
+                import networkx as nx
+                graph = nx.Graph()
+                for edge in ppi_result.edges:
+                    endpoint_a = edge.endpoint_a.identity_key
+                    endpoint_b = edge.endpoint_b.identity_key
+                    graph.add_node(endpoint_a, display_name=edge.endpoint_a.display_name)
+                    graph.add_node(endpoint_b, display_name=edge.endpoint_b.display_name)
+                    graph.add_edge(
+                        endpoint_a,
+                        endpoint_b,
+                        weight=edge.score,
+                        semantic_sha256=edge.semantic_sha256,
+                        source_record_hashes=edge.source_record_hashes,
+                    )
+                if graph.number_of_nodes() > 0:
+                    gnn_features['centrality'] = self.gnn_analyzer.compute_centrality(graph)
+                    gnn_features['graph_stats'] = self.gnn_analyzer.compute_graph_statistics(graph)
+                else:
+                    gnn_features['status'] = 'empty'
+                gnn_features['num_nodes'] = graph.number_of_nodes()
+                gnn_features['num_edges'] = graph.number_of_edges()
+            except ImportError:
+                gnn_features['status'] = 'dependency_unavailable'
 
         logger.info("Extracting CNN features...")
         cnn_features = {}
@@ -200,7 +236,8 @@ class NetworkPharmacologyFramework:
             'ligand': ligand_features,
             'protein': protein_features,
             'gnn': gnn_features,
-            'cnn': cnn_features
+            'cnn': cnn_features,
+            'ppi': ppi_features,
         }
 
         self.results['feature_extraction'] = features
@@ -323,13 +360,11 @@ class NetworkPharmacologyFramework:
         compound_data = dataset.get('compound', {})
         target_data = dataset.get('targets', [])
         protein_data = dataset.get('proteins', [])
-        interaction_data = dataset.get('interactions', [])
-
-        kg_results = {}
+        ppi_result = self._canonicalize_dataset_ppi(dataset)
+        kg_results = {'ppi_contract': ppi_result.to_dict(include_edges=False)}
         if self.kg_module:
             try:
-                kg_data = {'compound': compound_data, 'targets': target_data, 'proteins': protein_data}
-                self.kg_module.build_from_data(compound_data, target_data, interaction_data)
+                self.kg_module.build_from_data(compound_data, target_data, ppi_result)
                 stats = self.kg_module.compute_graph_statistics()
                 graph_path = self.kg_module.save_graph()
                 triples_path = self.kg_module.save_triples()
@@ -341,20 +376,17 @@ class NetworkPharmacologyFramework:
                     kg_embedding_status['available'] = model is not None
                 nodes = list(self.kg_module.graph.nodes())[:50]
                 edges = [(u, v) for u, v in self.kg_module.graph.edges()][:100]
-                kg_results = {
-                    'graph': {
-                        'stats': stats,
-                        'nodes': nodes,
-                        'edges': edges,
-                        'graph_path': graph_path,
-                        'triples_path': triples_path,
-                        
-                        'kg_embedding': kg_embedding_status
-                    }
+                kg_results['graph'] = {
+                    'stats': stats,
+                    'nodes': nodes,
+                    'edges': edges,
+                    'graph_path': graph_path,
+                    'triples_path': triples_path,
+                    'kg_embedding': kg_embedding_status,
                 }
             except Exception as e:
                 logger.error("Knowledge graph analysis failed: %s", e)
-                kg_results = {'graph': {'stats': {'num_nodes': 0, 'num_edges': 0}}}
+                kg_results['graph'] = {'stats': {'num_nodes': 0, 'num_edges': 0}}
 
         self.results['knowledge_graph'] = kg_results
         logger.info("Knowledge graph analysis completed")

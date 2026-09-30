@@ -4,11 +4,13 @@ import logging
 import numpy as np
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
+from dataclasses import asdict
 import warnings
 warnings.filterwarnings('ignore')
 
 from logging_config import setup_logger
 logger = setup_logger(__name__)
+from data_contracts import CanonicalPpiResult, canonicalize_ppi
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -48,6 +50,7 @@ class KnowledgeGraph:
         self.entity_to_id = {}
         self.relation_to_id = {}
         self.triples = []
+        self.ppi_contract = None
 
     def add_compound_target_interaction(self, compound: str, target: str, relation: str = "binds_to",
                                         weight: float = 1.0, properties: Dict = None):
@@ -64,6 +67,8 @@ class KnowledgeGraph:
     def build_from_data(self, compound_data: Dict, target_data, ppi_data=None):
         logger.info("Building knowledge graph from data...")
         try:
+            ppi_result = canonicalize_ppi(ppi_data if ppi_data is not None else [])
+            self.ppi_contract = ppi_result.to_dict(include_edges=False)
             compound_name = compound_data.get('name', 'Luteolin') if isinstance(compound_data, dict) else 'Luteolin'
             if isinstance(target_data, dict):
                 targets = target_data.get('targets', [])
@@ -81,28 +86,49 @@ class KnowledgeGraph:
                 self.add_compound_target_interaction(compound_name, target_name)
                 if gene_symbol:
                     self.add_compound_target_interaction(compound_name, gene_symbol, "targets")
-            if ppi_data:
-                if isinstance(ppi_data, dict):
-                    interactions = ppi_data.get('interactions', [])
-                elif isinstance(ppi_data, list):
-                    interactions = ppi_data
-                else:
-                    interactions = []
-                for interaction in interactions:
-                    if not isinstance(interaction, dict):
-                        continue
-                    gene1 = interaction.get('preferredName_A', '')
-                    gene2 = interaction.get('preferredName_B', '')
-                    if gene1 and gene2:
-                        score = float(interaction.get('score', 0))
-                        self.graph.add_edge(gene1, gene2, relation="interacts_with", weight=score)
-            logger.info("Knowledge graph built: %d nodes, %d edges",
-                       self.graph.number_of_nodes(), self.graph.number_of_edges())
+            if self.graph is not None:
+                for edge in ppi_result.edges:
+                    endpoint_a = edge.endpoint_a.identity_key
+                    endpoint_b = edge.endpoint_b.identity_key
+                    self.graph.add_node(
+                        endpoint_a,
+                        identity_key=list(endpoint_a),
+                        display_name=edge.endpoint_a.display_name,
+                    )
+                    self.graph.add_node(
+                        endpoint_b,
+                        identity_key=list(endpoint_b),
+                        display_name=edge.endpoint_b.display_name,
+                    )
+                    self.graph.add_edge(
+                        endpoint_a,
+                        endpoint_b,
+                        relation="interacts_with",
+                        weight=edge.score,
+                        taxonomy_id=edge.endpoint_a.taxonomy_id,
+                        semantic_sha256=edge.semantic_sha256,
+                        source_record_hashes=list(edge.source_record_hashes),
+                        provenance=[asdict(item) for item in edge.provenance],
+                    )
+                    self.triples.append((repr(endpoint_a), "interacts_with", repr(endpoint_b)))
+                logger.info("Knowledge graph built: %d nodes, %d edges",
+                            self.graph.number_of_nodes(), self.graph.number_of_edges())
+            else:
+                logger.info("Knowledge graph unavailable; canonical PPI status=%s", ppi_result.status)
         except Exception as e:
             logger.error("Knowledge graph construction failed: %s", e)
 
     def compute_graph_statistics(self) -> Dict[str, Any]:
-        stats = {'num_nodes': 0, 'num_edges': 0, 'num_relations': 0}
+        ppi_contract = self.ppi_contract or {}
+        stats = {
+            'num_nodes': 0,
+            'num_edges': 0,
+            'num_relations': 0,
+            'ppi_status': ppi_contract.get('status', 'unavailable'),
+            'ppi_edge_count': ppi_contract.get('edge_count', 0),
+            'ppi_semantic_sha256': ppi_contract.get('semantic_sha256', ''),
+            'ppi_provenance_sha256': ppi_contract.get('provenance_sha256', ''),
+        }
         if not NETWORKX_AVAILABLE or self.graph is None:
             return stats
         try:

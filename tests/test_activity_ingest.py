@@ -615,4 +615,3 @@ def test_failed_required_assay_metadata_keeps_pagination_complete_but_bundle_inc
     assert (output_dir / "partial_ingest.json").is_file()
     assert not (output_dir / "entities.json").exists()
     assert list((output_dir / "raw" / "chembl" / "activities").rglob("*.json"))
-

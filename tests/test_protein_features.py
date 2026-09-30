@@ -166,16 +166,34 @@ def test_cache_key_separates_identity_sequence_model_revision_and_pooling_policy
     cache_key = getattr(protein_features, "build_feature_cache_key", None)
     assert callable(cache_key)
 
-    base = cache_key(record, model_revision="mock-r1", pooling_policy="residue-mask-mean-v1")
-    other_model = cache_key(record, model_revision="mock-r2", pooling_policy="residue-mask-mean-v1")
-    other_policy = cache_key(record, model_revision="mock-r1", pooling_policy="residue-only-max-v1")
+    bundle_args = {
+        "entity_version": bundle["entity_version"],
+        "entity_bundle_hash": bundle["content_sha256"],
+    }
+    base = cache_key(
+        record, model_revision="mock-r1", pooling_policy="residue-mask-mean-v1", **bundle_args,
+    )
+    other_model = cache_key(
+        record, model_revision="mock-r2", pooling_policy="residue-mask-mean-v1", **bundle_args,
+    )
+    other_policy = cache_key(
+        record, model_revision="mock-r1", pooling_policy="residue-only-max-v1", **bundle_args,
+    )
     other_identity = cache_key(
         replace(record, accession="Q54321", returned_accession="Q54321"),
         model_revision="mock-r1",
         pooling_policy="residue-mask-mean-v1",
+        **bundle_args,
+    )
+    other_bundle = cache_key(
+        record,
+        model_revision="mock-r1",
+        pooling_policy="residue-mask-mean-v1",
+        entity_version="entities-v2-aaaaaaaaaaaaaaaa",
+        entity_bundle_hash="a" * 64,
     )
 
-    assert len({base, other_model, other_policy, other_identity}) == 4
+    assert len({base, other_model, other_policy, other_identity, other_bundle}) == 5
 
 
 def test_cached_or_concurrent_extraction_does_not_leak_between_proteins(tmp_path):

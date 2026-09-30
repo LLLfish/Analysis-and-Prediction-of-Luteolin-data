@@ -1,6 +1,11 @@
 import os
 import json
 import logging
+import hashlib
+import threading
+from copy import deepcopy
+from dataclasses import asdict
+from pathlib import Path
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
@@ -8,12 +13,12 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from logging_config import setup_logger
+from data_contracts import FeatureResult, ProteinRecord, StageStatus, validate_protein_record
 logger = setup_logger(__name__)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-logger.info("HuggingFace endpoint: %s", os.environ.get("HF_ENDPOINT"))
+_STANDARD_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+_POOLING_POLICY = "residue-mask-mean-v1"
 
 TORCH_AVAILABLE = False
 try:
@@ -39,6 +44,68 @@ except ImportError:
     pass
 
 
+def build_feature_cache_key(
+    protein: ProteinRecord,
+    *,
+    model_revision: str,
+    pooling_policy: str,
+    entity_version: str,
+    entity_bundle_hash: str,
+) -> str:
+    """Build a deterministic cache key for one identity- and bundle-bound embedding."""
+    payload = {
+        "identity": [protein.taxonomy_id, protein.accession],
+        "sequence_sha256": protein.sequence_sha256,
+        "model_revision": model_revision,
+        "pooling_policy": pooling_policy,
+        "entity_version": entity_version,
+        "entity_bundle_hash": entity_bundle_hash,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def validate_sequence_identity(
+    protein: ProteinRecord,
+    bundle: Dict[str, Any],
+    *,
+    allow_synthetic: bool = False,
+) -> StageStatus:
+    """Require the exact shared protein record from a source-verified entity bundle."""
+    if type(protein) is not ProteinRecord:
+        return StageStatus("unverified_source", "shared_protein_record_required")
+    try:
+        validate_protein_record(protein)
+    except (TypeError, ValueError) as exc:
+        return StageStatus("invalid_sequence", f"invalid_protein_record:{exc}")
+    if not isinstance(bundle, dict) or bundle.get("schema_version") != 2:
+        return StageStatus("unverified_source", "verified_entity_bundle_required")
+    content_hash = bundle.get("content_sha256")
+    if (
+        not isinstance(content_hash, str)
+        or len(content_hash) != 64
+        or any(char not in "0123456789abcdef" for char in content_hash)
+        or bundle.get("entity_version") != f"entities-v2-{content_hash[:16]}"
+    ):
+        return StageStatus("unverified_source", "entity_bundle_version_or_hash_invalid")
+    proteins = bundle.get("proteins")
+    if not isinstance(proteins, list) or asdict(protein) not in proteins:
+        return StageStatus("unverified_source", "protein_not_present_in_verified_entity_bundle")
+    if protein.sequence_status == "missing":
+        return StageStatus("unavailable", protein.sequence_status_reason or "sequence_missing")
+    if protein.sequence_status == "error":
+        return StageStatus("error", protein.sequence_status_reason or "sequence_source_error")
+    if protein.sequence_status == "invalid":
+        return StageStatus("invalid_sequence", protein.sequence_status_reason or "sequence_invalid")
+    if protein.sequence_status != "verified" or protein.identity_status != "verified":
+        return StageStatus("unverified_source", protein.sequence_status_reason or "protein_identity_unverified")
+    if protein.source_kind == "synthetic_test" and not allow_synthetic:
+        return StageStatus("unverified_source", "synthetic_test_source_not_allowed_for_runtime")
+    if not protein.accession or type(protein.taxonomy_id) is not int:
+        return StageStatus("unverified_source", "protein_accession_or_taxonomy_missing")
+    return StageStatus("ready")
+
+
 class ProteinFeatureExtractor:
     """Protein feature extractor with ESM-2 model support.
 
@@ -59,33 +126,77 @@ class ProteinFeatureExtractor:
             "AI-ModelScope/esm2_t33_650M_UR50D"
         )
 
-    Download sources (in order):
-        1. ModelScope (国内优先): pip install modelscope
-        2. HuggingFace Mirror: https://hf-mirror.com
-        3. HuggingFace (original): set HF_ENDPOINT="" to use
+    Model loading is offline and local-only. A revision-verifiable snapshot must
+    already exist in the configured cache directory; no download or fallback is
+    attempted by the production feature path.
     """
 
-    def __init__(self, output_dir: str = "", esm_model_name: str = "facebook/esm2_t6_8M_UR50D", device: str = "auto"):
+    def __init__(
+        self,
+        output_dir: str = "",
+        esm_model_name: str = "facebook/esm2_t6_8M_UR50D",
+        device: str = "auto",
+        *,
+        model_revision: Optional[str] = None,
+        max_tokens: int = 1024,
+        model=None,
+        tokenizer=None,
+        cache_dir: Optional[str] = None,
+    ):
         if not output_dir:
             output_dir = os.path.join(_BASE_DIR, "features", "protein")
         self.output_dir = os.path.abspath(output_dir)
-        os.makedirs(os.path.join(self.output_dir, "structures"), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "embeddings"), exist_ok=True)
         self.esm_model_name = esm_model_name
-        self._model_cache_dir = os.path.join(_BASE_DIR, ".model_cache")
-        os.makedirs(self._model_cache_dir, exist_ok=True)
+        self._model_cache_dir = os.path.abspath(cache_dir or os.path.join(_BASE_DIR, ".model_cache"))
+        if type(max_tokens) is not int or max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        self.max_tokens = max_tokens
+        self.pooling_policy = _POOLING_POLICY
         self.device = self._get_device(device) if TORCH_AVAILABLE else "cpu"
         self.sequence = None
         self.protein_name = None
         self.features = {}
-        self.esm_model = None
-        self.esm_tokenizer = None
+        self.esm_model = model
+        self.esm_tokenizer = tokenizer
+        self.model_revision = model_revision or self._model_revision(model)
+        self._cache: Dict[str, FeatureResult] = {}
+        self._feature_lock = threading.RLock()
         self._fallback_models = []
         self._modelscope_models = {
             "facebook/esm2_t6_8M_UR50D": "AI-ModelScope/esm2_t6_8M_UR50D",
         }
-        if not TORCH_AVAILABLE:
-            raise ImportError("PyTorch is required for protein feature extraction")
+
+    @staticmethod
+    def _model_revision(model) -> Optional[str]:
+        config = getattr(model, "config", None)
+        revision = getattr(config, "_commit_hash", None)
+        return revision if isinstance(revision, str) and revision else None
+
+    @staticmethod
+    def _local_model_revision(model_dir: Path) -> Optional[str]:
+        config_path = model_dir / "config.json"
+        if not config_path.is_file():
+            return None
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        revision = config.get("_commit_hash") if isinstance(config, dict) else None
+        if isinstance(revision, str) and revision:
+            return revision
+        weight_files = sorted(
+            path for path in model_dir.rglob("*")
+            if path.is_file() and path.name in {"pytorch_model.bin", "model.safetensors"}
+        )
+        if not weight_files:
+            return None
+        digest = hashlib.sha256()
+        for path in [config_path, *weight_files]:
+            digest.update(path.relative_to(model_dir).as_posix().encode("utf-8"))
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        return f"sha256:{digest.hexdigest()}"
 
     def add_fallback_model(self, model_name: str, modelscope_name: str = ""):
         if model_name not in self._fallback_models and model_name != self.esm_model_name:
@@ -104,36 +215,38 @@ class ProteinFeatureExtractor:
         return device
 
     def load_esm_model(self, timeout: int = 120) -> bool:
+        """Load only a complete local model snapshot; never download or fall back online."""
+        if self.esm_model is not None and self.esm_tokenizer is not None:
+            if self.model_revision is None:
+                self.model_revision = self._model_revision(self.esm_model)
+            return self.model_revision is not None
         if not _TRANSFORMERS_AVAILABLE:
-            logger.error("Transformers library not installed")
+            logger.warning("Transformers library not installed; ESM is unavailable")
             return False
-        models_to_try = [self.esm_model_name] + self._fallback_models
-        for model_name in models_to_try:
-            try:
-                logger.info("Loading ESM-2 model: %s (cache: %s)", model_name, self._model_cache_dir)
-                try:
-                    local_dir = os.path.join(self._model_cache_dir, model_name.replace("/", "--"))
-                    self.esm_tokenizer = AutoTokenizer.from_pretrained(local_dir, local_files_only=True)
-                    self.esm_model = AutoModel.from_pretrained(local_dir, local_files_only=True)
-                    logger.info("ESM-2 model loaded from local cache: %s", model_name)
-                except Exception:
-                    loaded = self._download_from_modelscope(model_name, timeout)
-                    if not loaded:
-                        loaded = self._download_from_hf(model_name, timeout)
-                    if not loaded:
-                        raise RuntimeError(f"Failed to download {model_name} from all sources")
-
-                self.esm_model.to(self.device)
-                self.esm_model.eval()
-                logger.info("ESM-2 model loaded successfully: %s", model_name)
-                return True
-            except Exception as e:
-                if model_name == self.esm_model_name:
-                    logger.warning("Primary ESM-2 model failed (%s), trying fallback...", e)
-                else:
-                    logger.warning("Fallback model %s also failed: %s", model_name, e)
-        logger.error("All ESM-2 models failed to load, using rule-based features only")
-        return False
+        if not TORCH_AVAILABLE:
+            logger.warning("PyTorch not installed; ESM is unavailable")
+            return False
+        local_dir = Path(self._model_cache_dir) / self.esm_model_name.replace("/", "--")
+        revision = self._local_model_revision(local_dir)
+        if revision is None:
+            logger.info("No revision-verifiable local ESM snapshot at %s", local_dir)
+            return False
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(str(local_dir), local_files_only=True)
+            model = AutoModel.from_pretrained(str(local_dir), local_files_only=True)
+            model.to(self.device)
+            model.eval()
+            self.esm_tokenizer = tokenizer
+            self.esm_model = model
+            self.model_revision = revision
+            logger.info("Loaded local ESM snapshot %s at revision %s", self.esm_model_name, revision)
+            return True
+        except Exception as exc:
+            self.esm_model = None
+            self.esm_tokenizer = None
+            self.model_revision = None
+            logger.warning("Local ESM snapshot is unavailable: %s", exc)
+            return False
 
     def _download_from_hf(self, model_name: str, timeout: int = 120) -> bool:
         hf_endpoint = os.environ.get("HF_ENDPOINT", "huggingface.co")
@@ -212,11 +325,15 @@ class ProteinFeatureExtractor:
         return True
 
     def load_sequence(self, sequence: str, protein_name: str = "protein") -> bool:
-        sequence = sequence.upper().replace(" ", "").replace("\n", "").replace("\t", "")
-        valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
-        sequence = ''.join(c for c in sequence if c in valid_aa)
-        if len(sequence) == len(sequence) == 0:
+        if not isinstance(sequence, str):
+            logger.error("Protein sequence must be text")
+            return False
+        sequence = "".join(sequence.split()).upper()
+        if not sequence:
             logger.error("Empty sequence after validation")
+            return False
+        if any(residue not in _STANDARD_AMINO_ACIDS for residue in sequence):
+            logger.error("Protein sequence contains nonstandard residues; preserving and rejecting it")
             return False
         self.sequence = sequence
         self.protein_name = protein_name
@@ -287,21 +404,229 @@ class ProteinFeatureExtractor:
             logger.error("Secondary structure prediction failed: %s", e)
         return ss
 
-    def extract_esm_embeddings(self) -> Optional[np.ndarray]:
-        if self.esm_model is None or self.sequence is None:
-            return None
+    def _token_limit(self) -> int:
+        limits = [self.max_tokens]
+        model_limit = getattr(getattr(self.esm_model, "config", None), "max_position_embeddings", None)
+        if type(model_limit) is int and 0 < model_limit < 1_000_000:
+            limits.append(model_limit)
+        tokenizer_limit = getattr(self.esm_tokenizer, "model_max_length", None)
+        if type(tokenizer_limit) is int and 0 < tokenizer_limit < 1_000_000:
+            limits.append(tokenizer_limit)
+        return min(limits)
+
+    def _extract_residue_embedding(self, sequence: str) -> tuple[Optional[np.ndarray], str, Optional[str]]:
+        if not TORCH_AVAILABLE:
+            return None, "unavailable", "pytorch_unavailable"
+        if self.esm_model is None or self.esm_tokenizer is None:
+            return None, "unavailable", "esm_model_or_tokenizer_unavailable"
         try:
-            inputs = self.esm_tokenizer(self.sequence, return_tensors="pt", truncation=True, max_length=1024)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            encoded = self.esm_tokenizer(
+                sequence,
+                return_tensors="pt",
+                truncation=False,
+                padding=False,
+                return_special_tokens_mask=True,
+            )
+            if "input_ids" not in encoded:
+                return None, "error", "tokenizer_input_ids_missing"
+            input_ids = encoded["input_ids"]
+            if not torch.is_tensor(input_ids):
+                input_ids = torch.as_tensor(input_ids, dtype=torch.long)
+            if input_ids.ndim == 1:
+                input_ids = input_ids.unsqueeze(0)
+            if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+                return None, "error", "tokenizer_input_shape_invalid"
+            token_count = int(input_ids.shape[1])
+            token_limit = self._token_limit()
+            if token_count > token_limit:
+                return None, "unsupported_length", f"token_count_exceeds_budget:{token_count}>{token_limit}"
+
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            else:
+                if not torch.is_tensor(attention_mask):
+                    attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)
+                if attention_mask.ndim == 1:
+                    attention_mask = attention_mask.unsqueeze(0)
+            special_tokens_mask = encoded.get("special_tokens_mask")
+            if special_tokens_mask is None:
+                get_mask = getattr(self.esm_tokenizer, "get_special_tokens_mask", None)
+                if not callable(get_mask):
+                    return None, "error", "tokenizer_special_token_mask_unavailable"
+                special_tokens_mask = torch.tensor(
+                    [get_mask(input_ids[0].detach().cpu().tolist(), already_has_special_tokens=True)],
+                    dtype=torch.long,
+                )
+            else:
+                if not torch.is_tensor(special_tokens_mask):
+                    special_tokens_mask = torch.as_tensor(special_tokens_mask, dtype=torch.long)
+                if special_tokens_mask.ndim == 1:
+                    special_tokens_mask = special_tokens_mask.unsqueeze(0)
+            if attention_mask.shape != input_ids.shape or special_tokens_mask.shape != input_ids.shape:
+                return None, "error", "tokenizer_mask_shape_mismatch"
+
+            valid_residues = attention_mask.to(dtype=torch.bool) & ~special_tokens_mask.to(dtype=torch.bool)
+            if int(valid_residues.sum().item()) != len(sequence):
+                return None, "invalid_sequence", "tokenizer_residue_count_mismatch"
+            model_inputs = {
+                key: encoded[key].to(self.device) if torch.is_tensor(encoded.get(key)) else input_ids.to(self.device)
+                for key in ("input_ids", "attention_mask")
+                if key == "input_ids" or encoded.get(key) is not None
+            }
+            model_inputs["input_ids"] = input_ids.to(self.device)
+            model_inputs["attention_mask"] = attention_mask.to(self.device)
             with torch.no_grad():
-                outputs = self.esm_model(**inputs)
-            embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
-            self.features['esm_embedding'] = embeddings
-            logger.info("ESM embeddings extracted: %s", str(embeddings.shape))
-            return embeddings
-        except Exception as e:
-            logger.error("ESM embedding extraction failed: %s", e)
-            return None
+                outputs = self.esm_model(**model_inputs)
+            hidden = getattr(outputs, "last_hidden_state", None)
+            if hidden is None or hidden.ndim != 3 or hidden.shape[:2] != input_ids.shape:
+                return None, "error", "model_hidden_state_shape_invalid"
+            mask = valid_residues.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            vector = pooled[0].detach().cpu().numpy()
+            if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+                return None, "error", "pooled_embedding_invalid"
+            return vector, "ready", None
+        except Exception as exc:
+            logger.error("ESM residue pooling failed: %s", exc)
+            return None, "error", f"esm_inference_failed:{type(exc).__name__}"
+
+    @staticmethod
+    def _clear_sample_state(extractor: "ProteinFeatureExtractor") -> None:
+        extractor.sequence = None
+        extractor.protein_name = None
+        extractor.features = {}
+
+    @staticmethod
+    def _result(
+        protein: ProteinRecord,
+        bundle: Dict[str, Any],
+        status: str,
+        reason: Optional[str],
+        *,
+        model_revision: Optional[str] = None,
+        pooling_policy: Optional[str] = None,
+        cache_key: Optional[str] = None,
+        features: Optional[Dict[str, Any]] = None,
+    ) -> FeatureResult:
+        return FeatureResult(
+            status=status,
+            reason=reason,
+            features=features or {},
+            accession=protein.accession,
+            taxonomy_id=protein.taxonomy_id,
+            sequence_length=protein.sequence_length,
+            sequence_sha256=protein.sequence_sha256,
+            entity_version=bundle.get("entity_version"),
+            entity_bundle_hash=bundle.get("content_sha256"),
+            source_kind=protein.source_kind,
+            model_revision=model_revision,
+            pooling_policy=pooling_policy,
+            cache_key=cache_key,
+        )
+
+    def _extract_validated_record(
+        self,
+        protein: ProteinRecord,
+        bundle: Dict[str, Any],
+        *,
+        allow_synthetic: bool,
+    ) -> FeatureResult:
+        self._clear_sample_state(self)
+        identity_status = validate_sequence_identity(protein, bundle, allow_synthetic=allow_synthetic)
+        if identity_status.status != "ready":
+            return self._result(protein, bundle, identity_status.status, identity_status.reason)
+        sequence = protein.full_sequence or ""
+        if len(sequence) > self.max_tokens:
+            return self._result(
+                protein, bundle, "unsupported_length",
+                f"residue_count_exceeds_token_budget:{len(sequence)}>{self.max_tokens}",
+            )
+        if self.esm_model is None or self.esm_tokenizer is None:
+            if not self.load_esm_model():
+                return self._result(protein, bundle, "unavailable", "revision_verified_local_esm_unavailable")
+        if not self.model_revision:
+            return self._result(protein, bundle, "unavailable", "esm_model_revision_unavailable")
+
+        self.sequence = sequence
+        self.protein_name = protein.accession
+        pooling_policy = f"{self.pooling_policy}:max_tokens={self.max_tokens}"
+        cache_key = build_feature_cache_key(
+            protein,
+            model_revision=self.model_revision,
+            pooling_policy=pooling_policy,
+            entity_version=bundle["entity_version"],
+            entity_bundle_hash=bundle["content_sha256"],
+        )
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self.features = deepcopy(cached.features)
+            return deepcopy(cached)
+
+        embedding, status, reason = self._extract_residue_embedding(sequence)
+        if status != "ready" or embedding is None:
+            return self._result(
+                protein, bundle, status, reason,
+                model_revision=self.model_revision,
+                pooling_policy=pooling_policy,
+                cache_key=cache_key,
+            )
+        features = {"esm_embedding": embedding.astype(float).tolist()}
+        self.features = deepcopy(features)
+        result = self._result(
+            protein, bundle, "ready", None,
+            model_revision=self.model_revision,
+            pooling_policy=pooling_policy,
+            cache_key=cache_key,
+            features=features,
+        )
+        self._cache[cache_key] = deepcopy(result)
+        return result
+
+    def extract_from_bundle(
+        self,
+        bundle_path: str,
+        *,
+        allow_synthetic: bool = False,
+    ) -> List[FeatureResult]:
+        """Verify one entities.json and extract each source-bound protein independently."""
+        from evidence_builder import load_entity_bundle
+
+        with self._feature_lock:
+            bundle = load_entity_bundle(bundle_path, verify_sources=True)
+            results = []
+            for protein_data in bundle.get("proteins", []):
+                try:
+                    protein = ProteinRecord(**protein_data)
+                except (TypeError, ValueError) as exc:
+                    results.append(FeatureResult(
+                        status="invalid_sequence",
+                        reason=f"invalid_protein_record:{exc}",
+                        entity_version=bundle.get("entity_version"),
+                        entity_bundle_hash=bundle.get("content_sha256"),
+                        source_kind=protein_data.get("source_kind"),
+                    ))
+                    continue
+                results.append(self._extract_validated_record(
+                    protein, bundle, allow_synthetic=allow_synthetic,
+                ))
+            return results
+
+    def extract_for_protein(
+        self,
+        protein: ProteinRecord,
+        *,
+        bundle_path: str,
+        allow_synthetic: bool = False,
+    ) -> FeatureResult:
+        """Extract only when the exact record is present in a verified source bundle."""
+        from evidence_builder import load_entity_bundle
+
+        with self._feature_lock:
+            bundle = load_entity_bundle(bundle_path, verify_sources=True)
+            return self._extract_validated_record(
+                protein, bundle, allow_synthetic=allow_synthetic,
+            )
 
     def predict_3d_structure_esmfold(self, sequence: str) -> Optional[str]:
         logger.warning("ESMFold requires Colab/GPU environment. Returning placeholder.")
@@ -311,20 +636,13 @@ class ProteinFeatureExtractor:
         return {'binding_sites': [], 'binding_score': 0.0}
 
     def extract_all_features(self, sequence: str, protein_name: str = "protein") -> Dict[str, Any]:
-        result = {'name': protein_name, 'success': False}
-        if not self.load_sequence(sequence, protein_name):
-            return result
-        if self.esm_model is None:
-            self.load_esm_model()
-        self.extract_sequence_features()
-        self.calculate_physicochemical_properties()
-        self.predict_secondary_structure()
-        esm_emb = self.extract_esm_embeddings()
-        result['success'] = True
-        result['features'] = self.features
-        result['embedding_shape'] = str(esm_emb.shape) if esm_emb is not None else None
-        logger.info("All protein features extracted for %s", protein_name)
-        return result
+        return {
+            "name": protein_name,
+            "status": "unverified_source",
+            "reason": "entity_bundle_required_for_protein_features",
+            "success": False,
+            "features": {},
+        }
 
     def save_features(self, filename: str = "protein_features.json") -> str:
         filepath = os.path.join(self.output_dir, "embeddings", filename)

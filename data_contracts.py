@@ -1127,3 +1127,89 @@ def validate_protein_record(record: ProteinRecord) -> None:
             raise ValueError("verified sequence contains a nonstandard amino-acid residue")
     elif not record.sequence_status_reason:
         raise ValueError("non-verified sequence status requires a reason")
+
+
+_FEATURE_STATUSES = {
+    "ready",
+    "partial",
+    "skipped_untrained",
+    "unavailable",
+    "invalid_sequence",
+    "unsupported_length",
+    "unverified_source",
+    "error",
+    "empty",
+}
+
+
+@dataclass(frozen=True)
+class StageStatus:
+    """Machine-readable readiness for one pipeline stage."""
+
+    status: str
+    reason: Optional[str] = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.status not in _FEATURE_STATUSES:
+            raise ValueError(f"unsupported stage status: {self.status}")
+        if self.status != "ready" and not self.reason:
+            raise ValueError("non-ready stage status requires a reason")
+        if not isinstance(self.details, dict):
+            raise TypeError("stage status details must be an object")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": self.status, "reason": self.reason, "details": dict(self.details)}
+
+
+@dataclass(frozen=True)
+class FeatureResult:
+    """Per-protein features tied to a verified entity bundle and sequence hash."""
+
+    status: str
+    reason: Optional[str] = None
+    features: dict[str, Any] = field(default_factory=dict)
+    accession: Optional[str] = None
+    taxonomy_id: Optional[int] = None
+    sequence_length: Optional[int] = None
+    sequence_sha256: Optional[str] = None
+    entity_version: Optional[str] = None
+    entity_bundle_hash: Optional[str] = None
+    source_kind: Optional[str] = None
+    model_revision: Optional[str] = None
+    pooling_policy: Optional[str] = None
+    cache_key: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.status not in _FEATURE_STATUSES:
+            raise ValueError(f"unsupported feature status: {self.status}")
+        if self.status != "ready" and not self.reason:
+            raise ValueError("non-ready feature result requires a reason")
+        if not isinstance(self.features, dict):
+            raise TypeError("feature result features must be an object")
+        if self.status != "ready" and self.features:
+            raise ValueError("non-ready feature result cannot contain features")
+        if self.status == "ready":
+            if not self.accession or type(self.taxonomy_id) is not int:
+                raise ValueError("ready feature result requires a protein identity")
+            if not self.sequence_sha256 or not self.entity_version or not self.entity_bundle_hash:
+                raise ValueError("ready feature result requires sequence and entity bundle provenance")
+            if not self.model_revision or not self.pooling_policy or not self.cache_key:
+                raise ValueError("ready feature result requires model and pooling cache provenance")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "features": dict(self.features),
+            "accession": self.accession,
+            "taxonomy_id": self.taxonomy_id,
+            "sequence_length": self.sequence_length,
+            "sequence_sha256": self.sequence_sha256,
+            "entity_version": self.entity_version,
+            "entity_bundle_hash": self.entity_bundle_hash,
+            "source_kind": self.source_kind,
+            "model_revision": self.model_revision,
+            "pooling_policy": self.pooling_policy,
+            "cache_key": self.cache_key,
+        }

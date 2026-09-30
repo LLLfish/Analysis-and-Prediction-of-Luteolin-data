@@ -42,6 +42,19 @@ def _protein_record_type():
     return record_type
 
 
+def _rewrite_bundle_hash(bundle_path, bundle):
+    content_hash = builder.canonical_json_sha256(builder._bundle_hash_payload(bundle))
+    bundle["content_sha256"] = content_hash
+    bundle["entity_version"] = f"entities-v{builder.ENTITY_SCHEMA_VERSION}-{content_hash[:16]}"
+    for activity in bundle["activities"]:
+        activity["entity_bundle_hash"] = content_hash
+        activity["entity_bundle_version"] = bundle["entity_version"]
+    bundle_path.write_text(
+        json.dumps(bundle, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
 def test_shared_protein_record_is_strictly_identity_and_sequence_bound():
     record_type = _protein_record_type()
     validate = getattr(data_contracts, "validate_protein_record", None)
@@ -63,6 +76,8 @@ def test_shared_protein_record_is_strictly_identity_and_sequence_bound():
             "raw_sha256": "b" * 64,
         }],
         component_evidence={"target_chembl_id": "CHEMBL900201"},
+        returned_accession="P12345",
+        returned_taxonomy_id=9606,
     )
 
     assert validate(record) is None
@@ -72,6 +87,148 @@ def test_shared_protein_record_is_strictly_identity_and_sequence_bound():
         validate(replace(record, taxonomy_id="9606"))
     with pytest.raises((TypeError, ValueError)):
         validate(replace(record, sequence_sha256="0" * 64))
+
+
+@pytest.mark.parametrize("changes", [
+    {"returned_accession": "P99999"},
+    {"returned_taxonomy_id": 10090},
+    {
+        "full_sequence": "AAAA",
+        "sequence_sha256": hashlib.sha256(b"AAAA").hexdigest(),
+    },
+    {"source_kind": "legacy_unverified"},
+])
+def test_verified_protein_rejects_returned_identity_sequence_or_source_mismatch(changes):
+    record_type = _protein_record_type()
+    record = record_type(
+        accession="P12345",
+        taxonomy_id=9606,
+        raw_sequence="ACDE",
+        full_sequence="ACDE",
+        sequence_length=4,
+        sequence_sha256=hashlib.sha256(b"ACDE").hexdigest(),
+        sequence_status="verified",
+        sequence_status_reason=None,
+        identity_status="verified",
+        source_kind="synthetic_test",
+        source_provenance=[{
+            "source_path": "raw/uniprot/P12345.json",
+            "raw_sha256": "b" * 64,
+        }],
+        returned_accession="P12345",
+        returned_taxonomy_id=9606,
+    )
+    if "full_sequence" in changes:
+        changes = {**changes, "sequence_length": 4}
+
+    with pytest.raises((TypeError, ValueError)):
+        data_contracts.validate_protein_record(replace(record, **changes))
+
+
+@pytest.mark.parametrize("uniprot_source", ["json", "fasta"])
+def test_bundle_loader_rejects_rehashed_protein_sequence_detached_from_source(tmp_path, uniprot_source):
+    manifest = _fixture()
+    manifest_path = FIXTURE_PATH
+    if uniprot_source == "fasta":
+        input_dir = tmp_path / "fasta-input"
+        input_dir.mkdir()
+        (input_dir / "P12345.fasta").write_text(
+            ">sp|P12345|SYNTHETIC_HUMAN\nACDEFGHIKL\nMNPQRSTVWY\n", encoding="utf-8"
+        )
+        (input_dir / "P12345-metadata.json").write_text(json.dumps({
+            "primaryAccession": "P12345",
+            "organism": {"scientificName": "Homo sapiens", "taxonId": 9606},
+            "sequence": {"length": 20},
+        }), encoding="utf-8")
+        manifest["uniprot"]["P12345"] = {
+            "source_kind": "synthetic_test",
+            "fasta_path": "P12345.fasta",
+            "taxonomy_metadata_path": "P12345-metadata.json",
+        }
+        manifest_path = input_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    output_dir = tmp_path / f"protein-{uniprot_source}"
+    builder.ingest_local_manifest(manifest_path, output_dir)
+    bundle_path = output_dir / "entities.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    protein = bundle["proteins"][0]
+    source_paths = [source["source_path"] for source in protein["source_provenance"]]
+    source_bytes_before = {
+        source_path: (output_dir / source_path).read_bytes()
+        for source_path in source_paths
+    }
+
+    forged_sequence = "A" * protein["sequence_length"]
+    protein["raw_sequence"] = forged_sequence
+    protein["full_sequence"] = forged_sequence
+    protein["sequence_sha256"] = hashlib.sha256(forged_sequence.encode("utf-8")).hexdigest()
+    _rewrite_bundle_hash(bundle_path, bundle)
+
+    assert all(
+        (output_dir / source_path).read_bytes() == original
+        for source_path, original in source_bytes_before.items()
+    )
+    with pytest.raises(ValueError, match="protein.*source|source.*protein|sequence differs"):
+        builder.load_entity_bundle(bundle_path)
+
+
+@pytest.mark.parametrize("tamper", ["identity", "structure"])
+def test_bundle_loader_rejects_rehashed_molecule_detached_from_raw_source(tmp_path, tamper):
+    output_dir = tmp_path / f"molecule-{tamper}"
+    builder.ingest_local_manifest(FIXTURE_PATH, output_dir)
+    bundle_path = output_dir / "entities.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    molecule = next(row for row in bundle["molecules"] if row["molecule_chembl_id"] == "CHEMBL151")
+    source_path = molecule["source_provenance"][0]["source_path"]
+    source_bytes = (output_dir / source_path).read_bytes()
+    if tamper == "identity":
+        molecule["molecule_chembl_id"] = "CHEMBL999999"
+    else:
+        molecule["canonical_smiles"] = "CCO"
+        molecule["structure_sha256"] = hashlib.sha256(b"CCO").hexdigest()
+    _rewrite_bundle_hash(bundle_path, bundle)
+
+    assert (output_dir / source_path).read_bytes() == source_bytes
+    with pytest.raises(ValueError, match="molecule.*source|source.*molecule|identity differs|structure differs"):
+        builder.load_entity_bundle(bundle_path)
+
+
+@pytest.mark.parametrize("tamper", [
+    "raw_activity",
+    "standard_value",
+    "target_record",
+    "assay_confidence",
+    "document_record",
+    "confidence",
+])
+def test_bundle_loader_rejects_rehashed_activity_evidence_detached_from_raw_sources(tmp_path, tamper):
+    output_dir = tmp_path / f"activity-{tamper}"
+    builder.ingest_local_manifest(FIXTURE_PATH, output_dir)
+    bundle_path = output_dir / "entities.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    activity = next(row for row in bundle["activities"] if row["activity_id"] == 700001)
+    if tamper == "raw_activity":
+        activity["raw_activity_record"]["standard_value"] = "999"
+        activity["standard_value"] = "999"
+    elif tamper == "standard_value":
+        activity["standard_value"] = "999"
+    elif tamper == "target_record":
+        activity["target_record"]["target_chembl_id"] = "CHEMBL999201"
+    elif tamper == "assay_confidence":
+        activity["assay_record"]["confidence_score"] = 1
+        activity["assay_confidence_score"] = 1
+        activity["confidence_score"] = 1
+    elif tamper == "document_record":
+        activity["document_record"]["title"] = "Replacement article"
+    elif tamper == "confidence":
+        activity["confidence_score"] = 1
+    else:
+        raise AssertionError(f"unexpected tamper case: {tamper}")
+    _rewrite_bundle_hash(bundle_path, bundle)
+
+    with pytest.raises(ValueError, match="activity.*source|source.*activity|activity.*does not match"):
+        builder.load_entity_bundle(bundle_path)
 
 
 def test_rdkit_molecule_normalization_keeps_raw_structure_and_native_identity():

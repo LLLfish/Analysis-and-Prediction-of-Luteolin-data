@@ -1,0 +1,246 @@
+{
+  "fixture_kind": "synthetic_test",
+  "source_documentation": {
+    "chembl": "https://chembl.gitbook.io/chembl-interface-documentation/web-services/chembl-data-web-services",
+    "uniprot": "https://www.uniprot.org/api-documentation"
+  },
+  "chembl": {
+    "molecules": [
+      {
+        "molecule_chembl_id": "CHEMBL151",
+        "pref_name": "Luteolin",
+        "molecule_type": "Small molecule",
+        "molecule_structures": {
+          "canonical_smiles": "C1=CC(=C(C=C1C2=CC(=O)C3=C(C=C(C=C3O2)O)O)O)O",
+          "standard_inchi": "InChI=1S/C15H10O6/c16-8-3-1-7(2-4-8)15-14(20)13-11(19)5-9(17)6-10(13)12(18)21-15/h1-6,16-18H"
+        }
+      },
+      {
+        "molecule_chembl_id": "CHEMBL123456",
+        "pref_name": "Caffeine",
+        "molecule_type": "Small molecule",
+        "molecule_structures": {
+          "canonical_smiles": "Cn1c(=O)c2c(ncn2C)n(C)c1=O",
+          "standard_inchi": "InChI=1S/C8H10N4O2/c1-10-4-9-6-5(10)7(13)12(3)8(14)11(6)2/h4H,1-3H3"
+        }
+      }
+    ],
+    "activities_by_molecule": {
+      "CHEMBL151": {
+        "pages": [
+          {
+            "page_meta": {
+              "limit": 2,
+              "next": "/chembl/api/data/activity.json?limit=2&offset=2",
+              "offset": 0,
+              "previous": null,
+              "total_count": 3
+            },
+            "activities": [
+              {
+                "activity_id": 700001,
+                "assay_chembl_id": "CHEMBL900001",
+                "document_chembl_id": "CHEMBL900101",
+                "molecule_chembl_id": "CHEMBL151",
+                "target_chembl_id": "CHEMBL900201",
+                "target_organism": "Homo sapiens",
+                "target_tax_id": 9606,
+                "confidence_score": 9,
+                "standard_type": "Ki",
+                "standard_relation": "=",
+                "standard_value": "120",
+                "standard_units": "nM",
+                "pchembl_value": "6.92",
+                "bao_label": "single protein format",
+                "assay_description": "synthetic binding assay one",
+                "activity_comment": null,
+                "data_validity_comment": null,
+                "recorded_extra_field": "preserve-me-1"
+              },
+              {
+                "activity_id": 700002,
+                "assay_chembl_id": "CHEMBL900002",
+                "document_chembl_id": "CHEMBL900102",
+                "molecule_chembl_id": "CHEMBL151",
+                "target_chembl_id": "CHEMBL900202",
+                "target_organism": "Homo sapiens",
+                "target_tax_id": 9606,
+                "confidence_score": 8,
+                "standard_type": "Kd",
+                "standard_relation": ">",
+                "standard_value": "500",
+                "standard_units": "nM",
+                "pchembl_value": null,
+                "bao_label": "single protein format",
+                "assay_description": "synthetic binding assay two",
+                "activity_comment": "right-censored",
+                "data_validity_comment": null,
+                "recorded_extra_field": "preserve-me-2"
+              }
+            ]
+          },
+          {
+            "page_meta": {
+              "limit": 2,
+              "next": null,
+              "offset": 2,
+              "previous": "/chembl/api/data/activity.json?limit=2&offset=0",
+              "total_count": 3
+            },
+            "activities": [
+              {
+                "activity_id": 700003,
+                "assay_chembl_id": "CHEMBL900003",
+                "document_chembl_id": "CHEMBL900103",
+                "molecule_chembl_id": "CHEMBL151",
+                "target_chembl_id": "CHEMBL900203",
+                "target_organism": "Rattus norvegicus",
+                "target_tax_id": 10116,
+                "confidence_score": 7,
+                "standard_type": "IC50",
+                "standard_relation": "<",
+                "standard_value": "300",
+                "standard_units": "nM",
+                "pchembl_value": "6.52",
+                "bao_label": "single protein format",
+                "assay_description": "synthetic non-human assay",
+                "activity_comment": null,
+                "data_validity_comment": null
+              }
+            ]
+          }
+        ]
+      },
+      "CHEMBL123456": {
+        "pages": [
+          {
+            "page_meta": {
+              "limit": 2,
+              "next": null,
+              "offset": 0,
+              "previous": null,
+              "total_count": 1
+            },
+            "activities": [
+              {
+                "activity_id": 800001,
+                "assay_chembl_id": "CHEMBL910001",
+                "document_chembl_id": "CHEMBL910101",
+                "molecule_chembl_id": "CHEMBL123456",
+                "target_chembl_id": "CHEMBL910201",
+                "target_organism": "Homo sapiens",
+                "target_tax_id": 9606,
+                "confidence_score": 9,
+                "standard_type": "Ki",
+                "standard_relation": "<",
+                "standard_value": "80",
+                "standard_units": "nM",
+                "pchembl_value": "7.10",
+                "bao_label": "single protein format",
+                "assay_description": "synthetic caffeine assay",
+                "activity_comment": null,
+                "data_validity_comment": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "targets": [
+      {
+        "target_chembl_id": "CHEMBL900201",
+        "target_type": "SINGLE PROTEIN",
+        "pref_name": "Synthetic human protein target one",
+        "organism": "Homo sapiens",
+        "tax_id": 9606,
+        "target_components": [
+          {
+            "component_id": 901,
+            "accession": "P12345",
+            "component_type": "PROTEIN",
+            "component_tax_id": 9606,
+            "organism": "Homo sapiens"
+          }
+        ]
+      },
+      {
+        "target_chembl_id": "CHEMBL900202",
+        "target_type": "PROTEIN COMPLEX",
+        "pref_name": "Synthetic human protein complex",
+        "organism": "Homo sapiens",
+        "tax_id": 9606,
+        "target_components": [
+          {
+            "component_id": 902,
+            "accession": "Q12345",
+            "component_type": "PROTEIN",
+            "component_tax_id": 9606,
+            "organism": "Homo sapiens"
+          },
+          {
+            "component_id": 903,
+            "accession": "Q67890",
+            "component_type": "PROTEIN",
+            "component_tax_id": 9606,
+            "organism": "Homo sapiens"
+          }
+        ]
+      },
+      {
+        "target_chembl_id": "CHEMBL900203",
+        "target_type": "SINGLE PROTEIN",
+        "pref_name": "Synthetic rat protein target",
+        "organism": "Rattus norvegicus",
+        "tax_id": 10116,
+        "target_components": [
+          {
+            "component_id": 904,
+            "accession": "Q99999",
+            "component_type": "PROTEIN",
+            "component_tax_id": 10116,
+            "organism": "Rattus norvegicus"
+          }
+        ]
+      },
+      {
+        "target_chembl_id": "CHEMBL910201",
+        "target_type": "SINGLE PROTEIN",
+        "pref_name": "Synthetic caffeine protein target",
+        "organism": "Homo sapiens",
+        "tax_id": 9606,
+        "target_components": [
+          {
+            "component_id": 905,
+            "accession": "P12345",
+            "component_type": "PROTEIN",
+            "component_tax_id": 9606,
+            "organism": "Homo sapiens"
+          }
+        ]
+      }
+    ]
+  },
+  "uniprot": {
+    "P12345": {
+      "primaryAccession": "P12345",
+      "organism": {"scientificName": "Homo sapiens", "taxonId": 9606},
+      "sequence": {"value": "ACDEFGHIKLMNPQRSTVWY", "length": 20, "molWeight": 2395},
+      "entryType": "UniProtKB reviewed (Swiss-Prot)"
+    },
+    "Q12345": {
+      "primaryAccession": "Q12345",
+      "organism": {"scientificName": "Homo sapiens", "taxonId": 9606},
+      "sequence": {"value": "MKWVTFISLLFLFSSAYS", "length": 18, "molWeight": 2014},
+      "entryType": "UniProtKB reviewed (Swiss-Prot)"
+    }
+  },
+  "tcmsp_static_reference": {
+    "mol_id": "MOL000006",
+    "name": "Luteolin",
+    "source_kind": "static_reference",
+    "adme": {"oral_bioavailability": 0.33},
+    "herbs": [],
+    "targets": [],
+    "diseases": []
+  }
+}

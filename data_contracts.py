@@ -151,6 +151,21 @@ def _record_taxonomy(record: Mapping[str, Any], side: str, native_id: str) -> tu
     return None, "taxonomy_id"
 
 
+def _adapt_string_source_record(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Normalize the STRING API's decimal-string taxonomy at the raw-source edge."""
+    if (
+        "stringId_A" not in record
+        or "stringId_B" not in record
+        or "ncbiTaxonId" not in record
+        or not isinstance(record["ncbiTaxonId"], str)
+        or re.fullmatch(r"[0-9]+", record["ncbiTaxonId"]) is None
+    ):
+        return record
+    adapted = dict(record)
+    adapted["ncbiTaxonId"] = int(record["ncbiTaxonId"])
+    return adapted
+
+
 def _score_value(record: Mapping[str, Any]) -> tuple[Optional[float], Optional[str]]:
     candidates = []
     if "score" in record:
@@ -720,6 +735,7 @@ def canonicalize_ppi(
             continue
 
         input_rows.append(_plain(row))
+        row = _adapt_string_source_record(row)
         row_source = row.get("source_kind")
         if "source_kind" in row:
             if not isinstance(row_source, str):

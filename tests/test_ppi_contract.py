@@ -97,6 +97,15 @@ def _dataset(interactions, **extra):
     }
 
 
+def _store_ppi_snapshot(tmp_path, raw_bytes):
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    snapshot_root = tmp_path / "snapshot-root"
+    relative_path = Path("raw") / "string" / f"{digest}.json"
+    snapshot = snapshot_root / relative_path
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_bytes(raw_bytes)
+    return snapshot_root, relative_path.as_posix(), digest
+
 def _framework(tmp_path, label):
     # Avoid __init__: it constructs every feature/model component. The methods
     # under test are production methods, with only their dependencies replaced.
@@ -300,6 +309,7 @@ def test_online_ppi_snapshot_binding_resolves_and_checks_actual_bytes(tmp_path):
     assert valid.status == "ready"
     assert valid.edge_count == 1
     assert valid.ppi_trace["snapshot_root"] == str(snapshot_root.resolve())
+    assert canonicalize_ppi(valid).to_dict() == valid.to_dict()
 
     snapshot.write_bytes(b"changed snapshot bytes")
     tampered = canonicalize_ppi([ONLINE_EDGE], snapshot_root=str(snapshot_root), **metadata)
@@ -375,6 +385,128 @@ def test_fixture_manifest_accounts_for_every_synthetic_and_legacy_record(ppi_fix
             assert matching, fixture["id"]
             assert matching[0].record_index == 0
             assert len(matching[0].source_record_hash) == 64
+
+
+def test_online_snapshot_rows_are_semantically_bound_to_the_receipt(tmp_path):
+    extra = {
+        **ONLINE_EDGE,
+        "stringId_A": "9606.ENSP00000000001",
+        "stringId_B": "9606.ENSP00000000002",
+    }
+    cases = (
+        ([], [ONLINE_EDGE]),
+        ([ONLINE_EDGE], [{**ONLINE_EDGE, "score": 0.75}]),
+        ([ONLINE_EDGE], [ONLINE_EDGE, extra]),
+        ([ONLINE_EDGE], []),
+    )
+    for index, (snapshot_rows, records) in enumerate(cases):
+        raw_bytes = json.dumps(snapshot_rows, separators=(",", ":")).encode("utf-8")
+        snapshot_root, snapshot_path, digest = _store_ppi_snapshot(tmp_path / str(index), raw_bytes)
+        result = canonicalize_ppi(
+            records,
+            source_kind="online_snapshot",
+            request_status="complete",
+            snapshot_root=str(snapshot_root),
+            snapshot_path=snapshot_path,
+            snapshot_sha256=digest,
+        )
+
+        assert result.status == "invalid"
+        assert result.edge_count == 0
+        assert "snapshot_records_mismatch" in {issue.code for issue in result.issues}
+        assert canonicalize_ppi(result).to_dict() == result.to_dict()
+
+
+def test_online_snapshot_semantic_rows_allow_json_formatting_differences(tmp_path):
+    raw_bytes = json.dumps([ONLINE_EDGE], indent=2).encode("utf-8")
+    snapshot_root, snapshot_path, digest = _store_ppi_snapshot(tmp_path, raw_bytes)
+    same_record_different_key_order = dict(reversed(list(ONLINE_EDGE.items())))
+
+    result = canonicalize_ppi(
+        [same_record_different_key_order],
+        source_kind="online_snapshot",
+        request_status="complete",
+        snapshot_root=str(snapshot_root),
+        snapshot_path=snapshot_path,
+        snapshot_sha256=digest,
+    )
+
+    assert result.status == "ready"
+    assert result.edge_count == 1
+    assert result.snapshot_sha256 == hashlib.sha256(raw_bytes).hexdigest()
+    assert result.input_sha256 == canonical_json_sha256([same_record_different_key_order])
+
+
+@pytest.mark.parametrize(
+    ("raw_bytes", "expected_issue"),
+    [
+        (b'{"interactions":[]}', "snapshot_not_array"),
+        (b"[null]", "snapshot_record_not_object"),
+        (b'[{"score":NaN}]', "snapshot_json_invalid"),
+        (b'[{"score":0.9,"score":0.5}]', "snapshot_json_invalid"),
+    ],
+)
+def test_online_snapshot_requires_strict_json_interaction_arrays(tmp_path, raw_bytes, expected_issue):
+    snapshot_root, snapshot_path, digest = _store_ppi_snapshot(tmp_path, raw_bytes)
+    result = canonicalize_ppi(
+        [ONLINE_EDGE],
+        source_kind="online_snapshot",
+        request_status="complete",
+        snapshot_root=str(snapshot_root),
+        snapshot_path=snapshot_path,
+        snapshot_sha256=digest,
+    )
+
+    assert result.status == "invalid"
+    assert result.edge_count == 0
+    assert expected_issue in {issue.code for issue in result.issues}
+
+
+@pytest.mark.parametrize(
+    ("trace_field", "trace_value", "expected_issue"),
+    [
+        ("source_kind", "legacy_unverified", "conflicting_source_kind"),
+        ("request_status", "failed", "conflicting_request_status"),
+        ("snapshot_root", "other-root", "conflicting_source_snapshot"),
+        ("snapshot_sha256", "f" * 64, "conflicting_source_snapshot"),
+    ],
+)
+def test_framework_rejects_top_level_and_nested_ppi_trace_conflicts(
+    tmp_path, trace_field, trace_value, expected_issue,
+):
+    raw_bytes = json.dumps([ONLINE_EDGE], separators=(",", ":")).encode("utf-8")
+    snapshot_root, snapshot_path, digest = _store_ppi_snapshot(tmp_path, raw_bytes)
+    trace = {
+        "source_kind": "online_snapshot",
+        "request_status": "complete",
+        "snapshot_path": snapshot_path,
+        "snapshot_root": str(snapshot_root),
+        "snapshot_sha256": digest,
+    }
+    trace[trace_field] = trace_value
+    dataset = _dataset(
+        [ONLINE_EDGE],
+        ppi_source_kind="online_snapshot",
+        ppi_request_status="complete",
+        ppi_snapshot_path=snapshot_path,
+        ppi_snapshot_root=str(snapshot_root),
+        ppi_snapshot_sha256=digest,
+        ppi_trace=trace,
+    )
+
+    framework, features, kg_results = _run_consumers(
+        tmp_path, f"trace-conflict-{trace_field}", dataset,
+    )
+
+    ppi = features["ppi"]
+    kg_ppi = kg_results["ppi_contract"]
+    assert ppi["status"] == kg_ppi["status"] == "invalid"
+    assert ppi["edge_count"] == kg_ppi["edge_count"] == 0
+    assert expected_issue in {issue["code"] for issue in ppi["issues"]}
+    assert features["gnn"]["num_edges"] == 0
+    assert _ppi_graph_edges(framework.kg_module.graph) == set()
+
+
 
 
 def test_conflicting_direct_native_identity_fields_are_quarantined_as_a_group():

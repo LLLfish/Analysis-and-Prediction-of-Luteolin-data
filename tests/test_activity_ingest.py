@@ -483,6 +483,54 @@ def test_missing_verified_gene_symbols_do_not_trigger_string_request(tmp_path, m
     assert result["resolution_status"] == "empty"
 
 
+def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_request(tmp_path, monkeypatch):
+    no_request = LuteolinDataCollector(
+        output_dir=str(tmp_path / "ppi-not-requested"), allow_online=False,
+    )
+    unrequested = no_request.fetch_string_data([])
+    unrequested_clean = no_request.clean_and_standardize()
+    assert unrequested["request_status"] == "not_requested"
+    assert unrequested_clean["ppi_trace"]["request_status"] == "not_requested"
+
+    class EmptyResponse:
+        status_code = 200
+        content = b"[]"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    successful_empty = LuteolinDataCollector(
+        output_dir=str(tmp_path / "ppi-empty-success"), allow_online=True,
+    )
+    monkeypatch.setattr(
+        "data_collection.requests.post", lambda *args, **kwargs: EmptyResponse(),
+    )
+    empty_result = successful_empty.fetch_string_data(["AKT1"])
+    empty_clean = successful_empty.clean_and_standardize()
+    assert empty_result["request_status"] == "complete"
+    assert empty_result["source_kind"] == "online_snapshot"
+    assert empty_result["interactions"] == []
+    assert empty_clean["ppi_trace"]["request_status"] == "complete"
+    assert empty_clean["ppi_trace"]["snapshot_sha256"] == "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+
+    failed = LuteolinDataCollector(
+        output_dir=str(tmp_path / "ppi-failed"), allow_online=True,
+    )
+    monkeypatch.setattr(
+        "data_collection.requests.post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline fixture")),
+    )
+    failed_result = failed.fetch_string_data(["AKT1"])
+    failed_clean = failed.clean_and_standardize()
+    assert failed_result["request_status"] == "failed"
+    assert failed_result["source_kind"] == "legacy_unverified"
+    assert failed_clean["ppi_trace"]["request_status"] == "failed"
+    assert failed_clean["interactions"] == []
+
+
 def test_run_pipeline_hands_complete_raw_evidence_to_cleaning(tmp_path):
     fixture = _fixture()
     collector = LuteolinDataCollector(output_dir=str(tmp_path / "pipeline"))

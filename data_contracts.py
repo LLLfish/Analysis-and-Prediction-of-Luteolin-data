@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 import csv
 import hashlib
+import io
 import json
 import math
 from numbers import Real
@@ -316,6 +317,8 @@ class CanonicalPpiResult:
     request_status: Optional[str] = None
     snapshot_path: Optional[str] = None
     snapshot_sha256: Optional[str] = None
+    source_file_path: Optional[str] = None
+    source_file_sha256: Optional[str] = None
 
     @property
     def node_count(self) -> int:
@@ -331,12 +334,16 @@ class CanonicalPpiResult:
 
     @property
     def ppi_trace(self) -> dict[str, Any]:
-        return {
+        trace = {
             "source_kind": self.source_kind,
             "request_status": self.request_status,
             "snapshot_path": self.snapshot_path,
             "snapshot_sha256": self.snapshot_sha256,
         }
+        if self.source_file_path is not None:
+            trace["source_file_path"] = self.source_file_path
+            trace["source_file_sha256"] = self.source_file_sha256
+        return trace
 
     def to_dict(self, include_edges: bool = True) -> dict[str, Any]:
         result = {
@@ -355,6 +362,8 @@ class CanonicalPpiResult:
             "request_status": self.request_status,
             "snapshot_path": self.snapshot_path,
             "snapshot_sha256": self.snapshot_sha256,
+            "source_file_path": self.source_file_path,
+            "source_file_sha256": self.source_file_sha256,
             "ppi_trace": self.ppi_trace,
             "issues": [issue.to_dict() for issue in self.issues],
         }
@@ -556,6 +565,14 @@ def _validate_canonical_result(value: CanonicalPpiResult) -> CanonicalPpiResult:
             or not _is_sha256(value.snapshot_sha256)
         ):
             return _invalid_canonical_result(value, "Canonical PPI result snapshot path/hash is invalid.")
+    if (value.source_file_path is None) != (value.source_file_sha256 is None):
+        return _invalid_canonical_result(value, "Canonical PPI result source file path/hash must be paired.")
+    if value.source_file_path is not None and (
+        not isinstance(value.source_file_path, str)
+        or not value.source_file_path
+        or not _is_sha256(value.source_file_sha256)
+    ):
+        return _invalid_canonical_result(value, "Canonical PPI result source file provenance is invalid.")
     if (
         value.source_kind == "online_snapshot"
         and value.request_status == "complete"
@@ -611,6 +628,8 @@ def _validate_canonical_result(value: CanonicalPpiResult) -> CanonicalPpiResult:
         request_status=value.request_status,
         snapshot_path=value.snapshot_path,
         snapshot_sha256=value.snapshot_sha256,
+        source_file_path=value.source_file_path,
+        source_file_sha256=value.source_file_sha256,
     )
     if (
         value.edges != expected.edges
@@ -678,6 +697,8 @@ def _metadata_failure(
     request_status: Optional[str] = None,
     snapshot_path: Optional[str] = None,
     snapshot_sha256: Optional[str] = None,
+    source_file_path: Optional[str] = None,
+    source_file_sha256: Optional[str] = None,
 ) -> CanonicalPpiResult:
     source_hash = canonical_json_sha256(records)
     if isinstance(records, Mapping) and isinstance(records.get("interactions"), list):
@@ -698,6 +719,11 @@ def _metadata_failure(
         and all(part not in {"", ".", ".."} for part in snapshot_path.replace("\\", "/").split("/"))
         and _is_sha256(snapshot_sha256)
     )
+    valid_source_file = (
+        isinstance(source_file_path, str)
+        and bool(source_file_path)
+        and _is_sha256(source_file_sha256)
+    )
     issue_source = source_kind if valid_source_kind else "legacy_unverified"
     for code, message, field in errors:
         if rows:
@@ -713,6 +739,8 @@ def _metadata_failure(
         request_status=request_status if valid_request_status else None,
         snapshot_path=snapshot_path if valid_snapshot else None,
         snapshot_sha256=snapshot_sha256 if valid_snapshot else None,
+        source_file_path=source_file_path if valid_source_file else None,
+        source_file_sha256=source_file_sha256 if valid_source_file else None,
     )
 
 
@@ -732,6 +760,21 @@ def canonicalize_ppi(
     weights for the same unordered pair are rejected as a group.
     """
     metadata_errors = []
+    source_file_path = getattr(records, "source_file_path", None)
+    source_file_sha256 = getattr(records, "source_file_sha256", None)
+    if (source_file_path is None) != (source_file_sha256 is None) or (
+        source_file_path is not None
+        and (
+            not isinstance(source_file_path, str)
+            or not source_file_path
+            or not _is_sha256(source_file_sha256)
+        )
+    ):
+        metadata_errors.append((
+            "invalid_source_file_provenance",
+            "Source file path and actual-byte SHA-256 must be supplied together.",
+            "source_file_sha256",
+        ))
     if source_kind is not None:
         if not isinstance(source_kind, str):
             metadata_errors.append(("invalid_source_kind", "source_kind must be a string.", "source_kind"))
@@ -769,6 +812,8 @@ def canonicalize_ppi(
             request_status=request_status,
             snapshot_path=snapshot_path,
             snapshot_sha256=snapshot_sha256,
+            source_file_path=source_file_path,
+            source_file_sha256=source_file_sha256,
         )
 
     if isinstance(records, CanonicalPpiResult):
@@ -807,6 +852,8 @@ def canonicalize_ppi(
                 records, envelope_errors, source_kind=source_kind,
                 request_status=request_status, snapshot_path=snapshot_path,
                 snapshot_sha256=snapshot_sha256,
+                source_file_path=source_file_path,
+                source_file_sha256=source_file_sha256,
             )
 
         unknown_envelope = sorted(set(envelope) - _ENVELOPE_FIELDS)
@@ -827,6 +874,8 @@ def canonicalize_ppi(
                 source_kind=source_kind or envelope_source_kind,
                 request_status=request_status, snapshot_path=snapshot_path,
                 snapshot_sha256=snapshot_sha256,
+                source_file_path=source_file_path,
+                source_file_sha256=source_file_sha256,
             )
     elif isinstance(records, list):
         mappings = alias_mappings if alias_mappings is not None else {}
@@ -836,6 +885,8 @@ def canonicalize_ppi(
             records, [("invalid_collection", "PPI input must be a list or a versioned object containing interactions.", None)],
             source_kind=source_kind, request_status=request_status,
             snapshot_path=snapshot_path, snapshot_sha256=snapshot_sha256,
+            source_file_path=source_file_path,
+            source_file_sha256=source_file_sha256,
         )
 
     for alias, mapping in mappings.items():
@@ -845,6 +896,8 @@ def canonicalize_ppi(
                 source_kind=source_kind or envelope_source_kind,
                 request_status=request_status, snapshot_path=snapshot_path,
                 snapshot_sha256=snapshot_sha256,
+                source_file_path=source_file_path,
+                source_file_sha256=source_file_sha256,
             )
 
     requested_source = source_kind if source_kind is not None else envelope_source_kind
@@ -1094,6 +1147,8 @@ def canonicalize_ppi(
         request_status=request_status,
         snapshot_path=snapshot_path,
         snapshot_sha256=snapshot_sha256,
+        source_file_path=source_file_path,
+        source_file_sha256=source_file_sha256,
     )
 
 
@@ -1108,6 +1163,8 @@ def _build_result(
     request_status: Optional[str] = None,
     snapshot_path: Optional[str] = None,
     snapshot_sha256: Optional[str] = None,
+    source_file_path: Optional[str] = None,
+    source_file_sha256: Optional[str] = None,
 ) -> CanonicalPpiResult:
     sorted_edges = tuple(sorted(edges, key=lambda edge: (edge.edge_key, edge.score)))
     sorted_issues = tuple(sorted(
@@ -1135,6 +1192,9 @@ def _build_result(
         "snapshot_path": snapshot_path,
         "snapshot_sha256": snapshot_sha256,
     }
+    if source_file_path is not None:
+        trace_payload["source_file_path"] = source_file_path
+        trace_payload["source_file_sha256"] = source_file_sha256
     if input_count == 0 and not sorted_issues:
         status = "unavailable" if request_status in {"failed", "not_requested"} else "empty"
     elif sorted_edges and sorted_issues:
@@ -1163,19 +1223,62 @@ def _build_result(
         request_status=request_status,
         snapshot_path=snapshot_path,
         snapshot_sha256=snapshot_sha256,
+        source_file_path=source_file_path,
+        source_file_sha256=source_file_sha256,
     )
 
 
+class _PpiFileList(list):
+    def __init__(self, values, source_file_path: str, source_file_sha256: str):
+        super().__init__(values)
+        self.source_file_path = source_file_path
+        self.source_file_sha256 = source_file_sha256
+
+
+class _PpiFileDict(dict):
+    def __init__(self, values, source_file_path: str, source_file_sha256: str):
+        super().__init__(values)
+        self.source_file_path = source_file_path
+        self.source_file_sha256 = source_file_sha256
+
+
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-standard JSON numeric constant: {value}")
+
+
 def read_ppi_records(path: os.PathLike[str] | str) -> Any:
-    """Read UTF-8 JSON or UTF-8-SIG CSV PPI data, preserving non-ASCII IDs."""
+    """Read strict UTF-8 JSON or UTF-8-SIG CSV while retaining actual file-byte provenance."""
     filename = os.fspath(path)
+    if not isinstance(filename, str):
+        raise ValueError("PPI input path must be a string or text path")
     extension = os.path.splitext(filename)[1].lower()
+    with open(filename, "rb") as stream:
+        raw_bytes = stream.read()
+    source_file_path = os.path.abspath(filename)
+    source_file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    text = raw_bytes.decode("utf-8-sig")
     if extension == ".json":
-        with open(filename, "r", encoding="utf-8-sig") as stream:
-            return json.load(stream)
+        value = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+        if isinstance(value, dict):
+            return _PpiFileDict(value, source_file_path, source_file_sha256)
+        if isinstance(value, list):
+            return _PpiFileList(value, source_file_path, source_file_sha256)
+        raise ValueError("PPI JSON root must be an array or object")
     if extension == ".csv":
-        with open(filename, "r", encoding="utf-8-sig", newline="") as stream:
-            rows = list(csv.DictReader(stream))
+        rows = list(csv.DictReader(io.StringIO(text, newline="")))
         numeric_fields = {
             "score", "combined_score", "taxonomy_id", "ncbiTaxonId", "ncbi_taxon_id",
             "taxon_id", "taxonomy_id_a", "taxonomy_id_b", "taxonomy_id_A", "taxonomy_id_B",
@@ -1199,7 +1302,7 @@ def read_ppi_records(path: os.PathLike[str] | str) -> Any:
                         row[field] = float(value)
                 except (TypeError, ValueError):
                     continue
-        return rows
+        return _PpiFileList(rows, source_file_path, source_file_sha256)
     raise ValueError("PPI input file must end in .json or .csv")
 
 

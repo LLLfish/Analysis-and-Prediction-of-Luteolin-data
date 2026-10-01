@@ -129,10 +129,83 @@ def test_public_online_collection_requires_explicit_opt_in(tmp_path, monkeypatch
     assert calls == []
 
 
+def test_collector_output_root_resolution_rejects_junction_into_protected_data(tmp_path, monkeypatch):
+    import os
+    import data_collection
+
+    alias = tmp_path / "junction"
+    candidate = alias / "new-run"
+    protected = APL_ROOT / "data"
+    original_realpath = os.path.realpath
+
+    def resolve_junction(path, *args, **kwargs):
+        candidate_path = os.path.abspath(os.fspath(path))
+        alias_path = os.path.abspath(os.fspath(alias))
+        try:
+            common = os.path.commonpath((candidate_path, alias_path))
+        except ValueError:
+            common = None
+        if common and os.path.normcase(common) == os.path.normcase(alias_path):
+            suffix = os.path.relpath(candidate_path, alias_path)
+            return os.path.join(os.fspath(protected), suffix)
+        return original_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(data_collection.os.path, "realpath", resolve_junction)
+    with pytest.raises(ValueError, match="protected"):
+        LuteolinDataCollector(output_dir=str(candidate))
+    assert not candidate.exists()
+
+
+def test_collector_output_root_rejects_protected_and_existing_paths(tmp_path):
+    protected = APL_ROOT / "data"
+    with pytest.raises(ValueError, match="protected"):
+        LuteolinDataCollector(output_dir=str(protected))
+
+    existing = tmp_path / "existing-output"
+    existing.mkdir()
+    marker = existing / "keep.json"
+    marker.write_bytes(b"keep-existing-data")
+    with pytest.raises(FileExistsError, match="existing"):
+        LuteolinDataCollector(output_dir=str(existing))
+    assert marker.read_bytes() == b"keep-existing-data"
+
+
+def test_string_snapshots_are_content_addressed_and_conflicts_never_overwrite(tmp_path, monkeypatch):
+    raw_bytes = b"[]"
+
+    class EmptyResponse:
+        status_code = 200
+        content = raw_bytes
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    collector = LuteolinDataCollector(
+        output_dir=str(tmp_path / "immutable-string"), allow_online=True,
+    )
+    monkeypatch.setattr(
+        "data_collection.requests.post", lambda *args, **kwargs: EmptyResponse(),
+    )
+    first = collector.fetch_string_data(["AKT1"])
+    first_path = Path(collector.output_dir) / first["snapshot_path"]
+    assert first_path.read_bytes() == raw_bytes
+    second = collector.fetch_string_data(["AKT1"])
+    assert second["snapshot_path"] == first["snapshot_path"]
+    assert first_path.read_bytes() == raw_bytes
+
+    first_path.write_bytes(b"keep-conflicting-bytes")
+    failed = collector.fetch_string_data(["AKT1"])
+    assert failed["request_status"] == "failed"
+    assert first_path.read_bytes() == b"keep-conflicting-bytes"
+
+
 def test_collector_fetches_and_hands_off_complete_activity_pages(tmp_path, monkeypatch):
     fixture = _fixture()
     calls = []
-    collector = LuteolinDataCollector(output_dir=str(tmp_path / "collector"))
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "collector"), allow_online=True)
     collector.source_kind = fixture["fixture_kind"]
     monkeypatch.setattr(
         "data_collection.requests.get", _chembl_get_from_fixture(fixture, calls)
@@ -203,7 +276,7 @@ def test_legacy_rows_remain_unverified_and_missing_ids_stay_null(tmp_path):
 
 
 def test_static_tcmsp_payload_stays_static_after_http_success(tmp_path, monkeypatch):
-    collector = LuteolinDataCollector(output_dir=str(tmp_path / "tcmsp"))
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "tcmsp"), allow_online=True)
     calls = []
 
     def successful_static_probe(url, **kwargs):
@@ -553,8 +626,7 @@ def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_r
         def json(self):
             return []
 
-    successful_empty = LuteolinDataCollector(output_dir=str(tmp_path / "ppi-empty-success"))
-    successful_empty.allow_online = True
+    successful_empty = LuteolinDataCollector(output_dir=str(tmp_path / "ppi-empty-success"), allow_online=True)
     monkeypatch.setattr(
         "data_collection.requests.post", lambda *args, **kwargs: EmptyResponse(),
     )
@@ -569,8 +641,7 @@ def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_r
     assert empty_contract["status"] == "empty"
     assert empty_network["status"] == "empty"
 
-    failed = LuteolinDataCollector(output_dir=str(tmp_path / "ppi-failed"))
-    failed.allow_online = True
+    failed = LuteolinDataCollector(output_dir=str(tmp_path / "ppi-failed"), allow_online=True)
     monkeypatch.setattr(
         "data_collection.requests.post",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline fixture")),
@@ -589,7 +660,7 @@ def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_r
 
 def test_run_pipeline_hands_complete_raw_evidence_to_cleaning(tmp_path):
     fixture = _fixture()
-    collector = LuteolinDataCollector(output_dir=str(tmp_path / "pipeline"))
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "pipeline"), allow_online=True)
     collector.source_kind = "synthetic_test"
     collector.gene_mapping = {"AKT1": "AKT1"}
     collector.fetch_pubchem_data = lambda: collector.raw_data.setdefault("pubchem", {
@@ -644,7 +715,7 @@ def test_run_pipeline_hands_complete_raw_evidence_to_cleaning(tmp_path):
 def test_collector_groups_multiple_molecule_page_chains_without_discarding_capture(tmp_path, monkeypatch):
     fixture = _fixture()
     calls = []
-    collector = LuteolinDataCollector(output_dir=str(tmp_path / "multi-collector"))
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "multi-collector"), allow_online=True)
     collector.source_kind = "synthetic_test"
     collector.chembl_molecule_ids = ["CHEMBL151", "CHEMBL123456"]
     monkeypatch.setattr(
@@ -671,7 +742,7 @@ def test_collector_groups_multiple_molecule_page_chains_without_discarding_captu
 def test_projection_error_does_not_replace_successfully_captured_raw_pages(tmp_path, monkeypatch):
     fixture = _fixture()
     calls = []
-    collector = LuteolinDataCollector(output_dir=str(tmp_path / "projection-error"))
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "projection-error"), allow_online=True)
     collector.source_kind = "synthetic_test"
     monkeypatch.setattr(
         "data_collection.requests.get", _chembl_get_from_fixture(fixture, calls)

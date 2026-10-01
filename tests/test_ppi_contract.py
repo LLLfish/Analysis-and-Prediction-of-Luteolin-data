@@ -178,8 +178,7 @@ def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, 
         def json(self):
             return [ONLINE_EDGE]
 
-    collector = LuteolinDataCollector(output_dir=str(tmp_path / "collector-run"))
-    collector.allow_online = True
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "collector-run"), allow_online=True)
     monkeypatch.setattr(
         "data_collection.requests.post", lambda *args, **kwargs: Response(),
     )

@@ -103,32 +103,84 @@ except ImportError as e:
 
 class NetworkPharmacologyFramework:
 
-    def __init__(self, output_dir: str = ""):
-        if not output_dir:
-            output_dir = os.path.join(_BASE_DIR, "framework_output")
-        self.output_dir = os.path.abspath(output_dir)
-        self._output_dir_preexisted = os.path.exists(self.output_dir)
-        os.makedirs(self.output_dir, exist_ok=True)
+    def __init__(self, output_dir: Optional[str] = None, *, allow_online: bool = False):
+        if type(allow_online) is not bool:
+            raise TypeError("allow_online must be an explicit boolean")
+        if output_dir is None or output_dir == "":
+            if allow_online:
+                raise ValueError("online collection requires an explicit new output directory")
+            self.output_dir = None
+        else:
+            self.output_dir = _resolve_new_output_dir(output_dir)
+            os.makedirs(self.output_dir, exist_ok=False)
+            created_output = os.path.realpath(self.output_dir)
+            if os.path.normcase(created_output) != os.path.normcase(self.output_dir):
+                raise ValueError("output directory changed resolution after creation")
+            _assert_output_path_is_unprotected(created_output, created_output)
+        self._output_dir_preexisted = False
+        self.allow_online = allow_online
 
-        self.data_collector = self._safe_component(globals().get('LuteolinDataCollector'), 'LuteolinDataCollector', output_dir=os.path.join(self.output_dir, "data"))
-        self.gnn_encoder = self._safe_component(globals().get('GraphEncoder'), 'GraphEncoder')
-        self.gnn_analyzer = self._safe_component(globals().get('NetworkAnalyzer'), 'NetworkAnalyzer', output_dir=os.path.join(self.output_dir, "gnn"))
-        self.cnn_module = self._safe_component(globals().get('MolecularCNN'), 'MolecularCNN', output_dir=os.path.join(self.output_dir, "cnn"))
-        self.protein_extractor = self._safe_component(globals().get('ProteinFeatureExtractor'), 'ProteinFeatureExtractor', output_dir=os.path.join(self.output_dir, "protein"))
-        self.ligand_extractor = self._safe_component(globals().get('LigandFeatureExtractor'), 'LigandFeatureExtractor', output_dir=os.path.join(self.output_dir, "ligand"))
-        self.transformer_module = self._safe_component(globals().get('FeatureFusion'), 'FeatureFusion', output_dir=os.path.join(self.output_dir, "transformer"))
-        self.docking_module = self._safe_component(globals().get('DockingValidator'), 'DockingValidator', output_dir=os.path.join(self.output_dir, "docking"))
-        self.kg_module = self._safe_component(globals().get('KnowledgeGraph'), 'KnowledgeGraph', output_dir=os.path.join(self.output_dir, "knowledge_graph"))
-        self.kg_embedder = self._safe_component(globals().get('KGEmbedder'), 'KGEmbedder', output_dir=os.path.join(self.output_dir, "knowledge_graph", "embeddings"))
-        self.output_module = self._safe_component(
-            globals().get('OutputGenerator'),
-            'OutputGenerator',
-            output_dir=os.path.join(self.output_dir, "output"),
-            run_root=self.output_dir,
-        )
+        if self.output_dir is None:
+            self.data_collector = self._safe_component(
+                globals().get("LuteolinDataCollector"), "LuteolinDataCollector",
+            )
+            self.gnn_encoder = None
+            self.gnn_analyzer = None
+            self.cnn_module = None
+            self.protein_extractor = None
+            self.ligand_extractor = None
+            self.transformer_module = None
+            self.docking_module = None
+            self.kg_module = None
+            self.kg_embedder = None
+            self.output_module = None
+        else:
+            self.data_collector = self._safe_component(
+                globals().get("LuteolinDataCollector"), "LuteolinDataCollector",
+                output_dir=os.path.join(self.output_dir, "data"),
+                allow_online=self.allow_online,
+            )
+            self.gnn_encoder = self._safe_component(globals().get("GraphEncoder"), "GraphEncoder")
+            self.gnn_analyzer = self._safe_component(
+                globals().get("NetworkAnalyzer"), "NetworkAnalyzer",
+                output_dir=os.path.join(self.output_dir, "gnn"),
+            )
+            self.cnn_module = self._safe_component(
+                globals().get("MolecularCNN"), "MolecularCNN",
+                output_dir=os.path.join(self.output_dir, "cnn"),
+            )
+            self.protein_extractor = self._safe_component(
+                globals().get("ProteinFeatureExtractor"), "ProteinFeatureExtractor",
+                output_dir=os.path.join(self.output_dir, "protein"),
+            )
+            self.ligand_extractor = self._safe_component(
+                globals().get("LigandFeatureExtractor"), "LigandFeatureExtractor",
+                output_dir=os.path.join(self.output_dir, "ligand"),
+            )
+            self.transformer_module = self._safe_component(
+                globals().get("FeatureFusion"), "FeatureFusion",
+                output_dir=os.path.join(self.output_dir, "transformer"),
+            )
+            self.docking_module = self._safe_component(
+                globals().get("DockingValidator"), "DockingValidator",
+                output_dir=os.path.join(self.output_dir, "docking"),
+            )
+            self.kg_module = self._safe_component(
+                globals().get("KnowledgeGraph"), "KnowledgeGraph",
+                output_dir=os.path.join(self.output_dir, "knowledge_graph"),
+            )
+            self.kg_embedder = self._safe_component(
+                globals().get("KGEmbedder"), "KGEmbedder",
+                output_dir=os.path.join(self.output_dir, "knowledge_graph", "embeddings"),
+            )
+            self.output_module = self._safe_component(
+                globals().get("OutputGenerator"),
+                "OutputGenerator",
+                output_dir=os.path.join(self.output_dir, "output"),
+                run_root=self.output_dir,
+            )
 
         self.results = {}
-
     def _safe_component(self, cls, import_key: str, *args, **kwargs):
         if cls is None or not _module_imports.get(import_key):
             return None
@@ -139,19 +191,66 @@ class NetworkPharmacologyFramework:
             return None
 
     def run_data_collection(self) -> Dict[str, Any]:
-        if not self.data_collector:
-            logger.error("Data collector is unavailable")
-            return {}
-        dataset = self.data_collector.run_pipeline()
-        self.results['data_collection'] = dataset
-        compound_name = dataset.get('compound', {}).get('name', 'N/A')
-        num_targets = len(dataset.get('targets', []))
-        num_proteins = len(dataset.get('proteins', []))
-        num_interactions = len(dataset.get('interactions', []))
-        logger.info("Data collection: compound=%s, targets=%d, proteins=%d, interactions=%d",
-                     compound_name, num_targets, num_proteins, num_interactions)
-        return dataset
+        reason = None
+        if self.output_dir is None:
+            reason = "explicit_new_output_dir_required"
+        elif not getattr(self, "allow_online", False):
+            reason = "explicit_online_collection_opt_in_required"
+        elif not self.data_collector:
+            reason = "data_collector_unavailable"
 
+        if reason is not None:
+            dataset = {
+                "compound": {},
+                "targets": [],
+                "activity_evidence": [],
+                "proteins": [],
+                "interactions": [],
+                "ppi_source_kind": "legacy_unverified",
+                "ppi_request_status": "not_requested",
+                "ppi_trace": {
+                    "source_kind": "legacy_unverified",
+                    "request_status": "not_requested",
+                    "snapshot_path": None,
+                    "snapshot_sha256": None,
+                },
+                "collection_status": "not_requested",
+                "status": "partial",
+                "reason": reason,
+            }
+        else:
+            try:
+                dataset = self.data_collector.run_pipeline()
+            except Exception as exc:
+                logger.warning("Data collection stopped safely: %s", exc)
+                dataset = {
+                    "compound": {},
+                    "targets": [],
+                    "activity_evidence": [],
+                    "proteins": [],
+                    "interactions": [],
+                    "ppi_source_kind": "legacy_unverified",
+                    "ppi_request_status": "failed",
+                    "ppi_trace": {
+                        "source_kind": "legacy_unverified",
+                        "request_status": "failed",
+                        "snapshot_path": None,
+                        "snapshot_sha256": None,
+                    },
+                    "collection_status": "incomplete",
+                    "status": "partial",
+                    "reason": f"collection_failed:{type(exc).__name__}",
+                }
+        self.results["data_collection"] = dataset
+        compound_name = dataset.get("compound", {}).get("name", "N/A")
+        num_targets = len(dataset.get("targets", []))
+        num_proteins = len(dataset.get("proteins", []))
+        num_interactions = len(dataset.get("interactions", []))
+        logger.info(
+            "Data collection: status=%s compound=%s targets=%d proteins=%d interactions=%d",
+            dataset.get("status", "partial"), compound_name, num_targets, num_proteins, num_interactions,
+        )
+        return dataset
     @staticmethod
     def _json_safe_metric_keys(value):
         """Project tuple graph identities to reversible JSON object keys."""
@@ -776,8 +875,21 @@ class NetworkPharmacologyFramework:
         }
 
     def save_results(self) -> str:
-        filepath = os.path.join(self.output_dir, "framework_results.json")
+        if self.output_dir is None:
+            logger.warning("Framework results were not saved because no isolated output directory is configured")
+            return ""
+        output_root = os.path.abspath(os.fspath(self.output_dir))
+        resolved_root = os.path.realpath(output_root)
+        _assert_output_path_is_unprotected(output_root, resolved_root)
+        if os.path.normcase(output_root) != os.path.normcase(resolved_root):
+            logger.error("Framework output root changed through a symlink or junction")
+            return ""
+        filepath = os.path.join(output_root, "framework_results.json")
+        resolved_file = os.path.realpath(filepath)
         try:
+            if os.path.normcase(os.path.commonpath((resolved_root, resolved_file))) != os.path.normcase(resolved_root):
+                raise ValueError("framework result path resolves outside the configured output directory")
+            _assert_output_path_is_unprotected(filepath, resolved_file)
             summary_data = self.results.get("data_collection", {})
             feature_data = self.results.get("feature_extraction", {})
             fusion_data = self.results.get("feature_fusion", {})
@@ -822,7 +934,7 @@ class NetworkPharmacologyFramework:
                     },
                 },
             }
-            with open(filepath, "w", encoding="utf-8") as stream:
+            with open(filepath, "x", encoding="utf-8") as stream:
                 json.dump(results_to_save, stream, ensure_ascii=False, indent=2, default=self._json_serialize)
             logger.info(
                 "Saved framework results to %s with feature status=%s",
@@ -852,6 +964,13 @@ class NetworkPharmacologyFramework:
             raise FileExistsError(
                 "Full pipeline requires a new output directory; existing framework outputs are read-only."
             )
+        if self.output_dir is None or not getattr(self, "allow_online", False):
+            dataset = self.run_data_collection()
+            self.results["pipeline_status"] = "partial"
+            self.results["pipeline_status_reason"] = dataset.get("reason", "explicit_output_and_online_opt_in_required")
+            logger.info("Pipeline remains partial because collection is not configured")
+            return self.results
+
         logger.info("Starting full pipeline execution...")
         start_time = datetime.now()
 
@@ -867,7 +986,17 @@ class NetworkPharmacologyFramework:
         status = self.results.get("feature_extraction", {}).get(
             "feature_readiness", {},
         ).get("overall_status", "unavailable")
-        logger.info("Pipeline execution completed in %.2f seconds with status=%s", runtime, status)
+        fusion_status = self.results.get("feature_fusion", {}).get("status", "unavailable")
+        collection_status = dataset.get("collection_status", "incomplete")
+        self.results["pipeline_status"] = (
+            "complete"
+            if collection_status == "complete" and status == "ready" and fusion_status == "ready"
+            else "partial"
+        )
+        logger.info(
+            "Pipeline execution completed in %.2f seconds with status=%s",
+            runtime, self.results["pipeline_status"],
+        )
         return self.results
 
 def _paths_intersect(first: str, second: str) -> bool:
@@ -885,7 +1014,10 @@ def _assert_output_path_is_unprotected(requested_output: str, resolved_output: s
         os.path.join(_BASE_DIR, "framework_output"),
         os.path.join(_BASE_DIR, "offline_data.json"),
         os.path.join(_BASE_DIR, ".model_cache"),
+        os.path.join(_BASE_DIR, "model_cache"),
         os.path.join(_BASE_DIR, "features"),
+        os.path.join(_BASE_DIR, "history"),
+        os.path.join(_BASE_DIR, "output_dashboard.html"),
     ]
     for protected_path in protected_paths:
         lexical_protected = os.path.abspath(protected_path)
@@ -902,14 +1034,13 @@ def _resolve_new_output_dir(output_dir: str) -> str:
     if not output_dir:
         raise ValueError("an explicit new output directory is required")
     requested_output = os.path.abspath(os.path.expanduser(os.fspath(output_dir)))
-    if os.path.lexists(requested_output):
-        raise FileExistsError(f"refusing to overwrite existing output directory: {requested_output}")
     resolved_output = os.path.realpath(requested_output)
     _assert_output_path_is_unprotected(requested_output, resolved_output)
+    if os.path.lexists(requested_output):
+        raise FileExistsError(f"refusing to overwrite existing output directory: {requested_output}")
     if os.path.lexists(resolved_output):
         raise FileExistsError(f"refusing to overwrite existing output directory: {resolved_output}")
     return resolved_output
-
 
 def run_feature_pipeline(entity_bundle_path: str, output_dir: str) -> Dict[str, Any]:
     """Run the offline P0 feature/report path against one verified entities.json."""
@@ -923,11 +1054,6 @@ def run_feature_pipeline(entity_bundle_path: str, output_dir: str) -> Dict[str, 
     if not output_dir:
         raise ValueError("an explicit new output directory is required")
     resolved_output = _resolve_new_output_dir(output_dir)
-    os.makedirs(resolved_output, exist_ok=False)
-    post_create_output = os.path.realpath(resolved_output)
-    if os.path.normcase(post_create_output) != os.path.normcase(resolved_output):
-        raise ValueError("output directory changed resolution after creation")
-    _assert_output_path_is_unprotected(post_create_output, post_create_output)
     dataset = {
         "entity_bundle_path": bundle_path,
         "compound": {},

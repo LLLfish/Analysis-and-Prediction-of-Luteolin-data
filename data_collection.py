@@ -27,23 +27,178 @@ logger = setup_logger(__name__)
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+_PROTECTED_OUTPUT_NAMES = (
+    "data", "framework_output", "offline_data.json", ".model_cache",
+    "model_cache", "features", "history", "output_dashboard.html",
+)
+
+
+def _paths_intersect(first: str, second: str) -> bool:
+    try:
+        common = os.path.commonpath((first, second))
+    except ValueError:
+        return False
+    normalized = os.path.normcase(common)
+    return normalized in {os.path.normcase(first), os.path.normcase(second)}
+
+
+def _assert_output_path_is_unprotected(requested: str, resolved: str) -> None:
+    protected_paths = [os.path.join(_BASE_DIR, name) for name in _PROTECTED_OUTPUT_NAMES]
+    candidates = (os.path.abspath(requested), os.path.realpath(resolved))
+    for protected_path in protected_paths:
+        lexical_protected = os.path.abspath(protected_path)
+        resolved_protected = os.path.realpath(lexical_protected)
+        if any(
+            _paths_intersect(candidate, protected)
+            for candidate in candidates
+            for protected in (lexical_protected, resolved_protected)
+        ):
+            raise ValueError("output directory intersects protected historical data or model paths")
+
+
+def _resolve_new_output_dir(output_dir: Optional[str]) -> str:
+    if not output_dir:
+        raise ValueError("an explicit new output directory is required")
+    requested = os.path.abspath(os.path.expanduser(os.fspath(output_dir)))
+    resolved = os.path.realpath(requested)
+    _assert_output_path_is_unprotected(requested, resolved)
+    if os.path.lexists(requested):
+        raise FileExistsError(f"refusing to overwrite existing output directory: {requested}")
+    if os.path.lexists(resolved):
+        raise FileExistsError(f"refusing to overwrite existing output directory: {resolved}")
+    return resolved
+
+def _validate_existing_output_dir(output_dir: Optional[str]) -> str:
+    if not output_dir:
+        raise ValueError("an explicit new output directory is required")
+    requested = os.path.abspath(os.fspath(output_dir))
+    resolved = os.path.realpath(requested)
+    _assert_output_path_is_unprotected(requested, resolved)
+    if os.path.normcase(requested) != os.path.normcase(resolved):
+        raise ValueError("configured output directory changed through a symlink or junction")
+    if not os.path.isdir(resolved):
+        raise FileNotFoundError(f"configured output directory is unavailable: {resolved}")
+    return resolved
+
+
 class LuteolinDataCollector:
 
-    def __init__(self, output_dir: str = ""):
-        if not output_dir:
-            output_dir = os.path.join(_BASE_DIR, "data")
-        self.output_dir = os.path.abspath(output_dir)
+    def __init__(self, output_dir: Optional[str] = None, *, allow_online: bool = False):
+        if type(allow_online) is not bool:
+            raise TypeError("allow_online must be an explicit boolean")
+        if output_dir is None or output_dir == "":
+            if allow_online:
+                raise ValueError("online collection requires an explicit new output directory")
+            self.output_dir = None
+        else:
+            self.output_dir = _resolve_new_output_dir(output_dir)
+        self.allow_online = allow_online
+        self._output_root_claimed = False
         self.compound_name = "Luteolin"
         self.compound_name_cn = "木犀草素"
         self.pubchem_cid = 5280445
-
-        os.makedirs(os.path.join(self.output_dir, "raw"), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "processed"), exist_ok=True)
-
         self.raw_data = {}
         self.processed_data = {}
         self._init_offline_data()
 
+    def _prepare_output_root(self) -> str:
+        if self.output_dir is None:
+            raise ValueError("an explicit new output directory is required before writing")
+        if self._output_root_claimed:
+            self.output_dir = _validate_existing_output_dir(self.output_dir)
+            return self.output_dir
+        requested_output = os.path.abspath(os.fspath(self.output_dir))
+        if os.path.normcase(os.path.realpath(requested_output)) != os.path.normcase(requested_output):
+            raise ValueError("configured output directory changed through a symlink or junction")
+        output_root = _resolve_new_output_dir(requested_output)
+        os.makedirs(output_root, exist_ok=False)
+        self.output_dir = _validate_existing_output_dir(output_root)
+        self._output_root_claimed = True
+        return self.output_dir
+
+    def _assert_output_tree_safe(self, output_root: str) -> None:
+        for current_root, directories, files in os.walk(output_root, followlinks=False):
+            for name in [*directories, *files]:
+                path = os.path.join(current_root, name)
+                if os.path.normcase(os.path.realpath(path)) != os.path.normcase(os.path.abspath(path)):
+                    raise ValueError("configured output tree contains a symlink or junction")
+
+    def _require_online_collection(self) -> str:
+        if self.output_dir is None:
+            raise ValueError("online collection requires an explicit new output directory")
+        if not self.allow_online:
+            raise PermissionError("online collection requires allow_online=True")
+        output_root = self._prepare_output_root()
+        self._assert_output_tree_safe(output_root)
+        return output_root
+
+    def _write_immutable_bytes(self, relative_path: str, raw_bytes: bytes) -> tuple[str, str]:
+        if not isinstance(raw_bytes, bytes):
+            raise TypeError("snapshot content must be bytes")
+        output_root = self._prepare_output_root()
+        relative = Path(relative_path)
+        if (
+            relative.is_absolute()
+            or relative.drive
+            or relative.root
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("snapshot path must remain inside the configured output root")
+        destination = Path(output_root) / relative
+        resolved_root = os.path.realpath(output_root)
+        resolved_parent = os.path.realpath(destination.parent)
+        resolved_destination = os.path.realpath(destination)
+        if os.path.normcase(resolved_parent) != os.path.normcase(os.path.abspath(destination.parent)):
+            raise ValueError("snapshot parent must not be a symlink or junction")
+        try:
+            if (
+                os.path.normcase(os.path.commonpath((resolved_root, resolved_destination)))
+                != os.path.normcase(resolved_root)
+                or os.path.normcase(os.path.commonpath((resolved_root, resolved_parent)))
+                != os.path.normcase(resolved_root)
+            ):
+                raise ValueError("snapshot path resolves outside the configured output root")
+        except ValueError as exc:
+            if "snapshot path resolves" in str(exc):
+                raise
+            raise ValueError("snapshot path resolves outside the configured output root") from exc
+        _assert_output_path_is_unprotected(str(destination), resolved_destination)
+        _assert_output_path_is_unprotected(str(destination.parent), resolved_parent)
+
+        if os.path.lexists(destination):
+            if os.path.normcase(os.path.realpath(destination)) != os.path.normcase(os.path.abspath(destination)):
+                raise ValueError("snapshot destination must not be a symlink or junction")
+            if destination.read_bytes() != raw_bytes:
+                raise FileExistsError(f"immutable snapshot conflict: {relative.as_posix()}")
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            resolved_parent = os.path.realpath(destination.parent)
+            resolved_destination = os.path.realpath(destination)
+            if os.path.normcase(resolved_parent) != os.path.normcase(os.path.abspath(destination.parent)):
+                raise ValueError("snapshot parent changed through a symlink or junction")
+            if (
+                os.path.normcase(os.path.commonpath((resolved_root, resolved_parent)))
+                != os.path.normcase(resolved_root)
+                or os.path.normcase(os.path.commonpath((resolved_root, resolved_destination)))
+                != os.path.normcase(resolved_root)
+            ):
+                raise ValueError("snapshot path changed resolution during directory creation")
+            _assert_output_path_is_unprotected(str(destination), resolved_destination)
+            with destination.open("xb") as stream:
+                stream.write(raw_bytes)
+        return relative.as_posix(), hashlib.sha256(raw_bytes).hexdigest()
+    def _save_json_snapshot(self, folder: str, prefix: str, payload: Any) -> tuple[str, str]:
+        raw_bytes = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        relative_path = (Path(folder) / f"{prefix}-{digest}.json").as_posix()
+        return self._write_immutable_bytes(relative_path, raw_bytes)
+
+    def _save_csv_snapshot(self, folder: str, prefix: str, dataframe) -> tuple[str, str]:
+        csv_text = dataframe.to_csv(index=False)
+        raw_bytes = csv_text.encode("utf-8-sig")
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        relative_path = (Path(folder) / f"{prefix}-{digest}.csv").as_posix()
+        return self._write_immutable_bytes(relative_path, raw_bytes)
     def _init_offline_data(self):
         json_path = os.path.join(os.path.dirname(__file__), 'offline_data.json')
         try:
@@ -63,28 +218,13 @@ class LuteolinDataCollector:
             self.gene_mapping = data['gene_mapping']
             self.offline_tcmsp = data.get('tcmsp', {})
         except FileNotFoundError:
-            logger.info("Offline data file not found, generating from embedded fallback: %s", json_path)
+            logger.info("Offline data file not found; using embedded fallback in memory: %s", json_path)
             self._init_fallback_data()
         self.gene_mapping = {
             **self._default_gene_mapping(),
             **getattr(self, "gene_mapping", {}),
         }
-        # Auto-generate offline_data.json if it does not exist yet
-        if not os.path.exists(json_path):
-            try:
-                offline_save = {
-                    'compound': self.offline_compound,
-                    'targets': self.offline_targets,
-                    'proteins': self.offline_proteins,
-                    'interactions': self.offline_interactions,
-                    'gene_mapping': self.gene_mapping,
-                    'tcmsp': self.offline_tcmsp,
-                }
-                with open(json_path, 'w', encoding='utf-8') as f:
-                    json.dump(offline_save, f, ensure_ascii=False, indent=2)
-                logger.info("Offline data file auto-generated: %s", json_path)
-            except Exception as save_err:
-                logger.warning("Failed to save offline data file: %s", save_err)
+        # The embedded fallback remains in memory; offline_data.json is read-only.
 
     def _default_gene_mapping(self) -> Dict[str, str]:
         return {
@@ -143,103 +283,60 @@ class LuteolinDataCollector:
             raise RuntimeError(f"PubChemPy failed: {e}") from e
 
     def fetch_pubchem_data(self) -> Dict[str, Any]:
+        self._require_online_collection()
         logger.info("Step 1: Fetching data from PubChem...")
         try:
-            # Primary: try PubChemPy (richer data, same API but better parsing)
             try:
                 result = self._fetch_pubchem_via_pubchempy()
-                self.raw_data['pubchem'] = result
-                return result
             except Exception as py_err:
-                logger.info("PubChemPy unavailable (%s), trying direct REST API...", py_err)
-
-            # Secondary: try NCBI E-utilities (often works when PUG-REST is IP-blocked)
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LuteolinAnalyzer/1.0"}
-            eutils_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pccompound&id={self.pubchem_cid}&retmode=json"
-            eu_response = requests.get(eutils_url, headers=headers, timeout=30)
-            eu_response.raise_for_status()
-            eu_data = eu_response.json()
-            uids = eu_data.get('result', {}).get('uids', [])
-            if not uids:
-                raise ValueError("E-utilities returned no compound data")
-            summary = eu_data['result'][uids[0]]
-            result = {
-                'cid': self.pubchem_cid,
-                'name': self.compound_name,
-                'name_cn': self.compound_name_cn,
-                'fetch_time': datetime.now().isoformat(),
-                'source': 'eutils',
-                'properties': {
-                    'Molecular_Formula': summary.get('molecularformula', ''),
-                    'Molecular_Weight': float(summary.get('molecularweight', 0)),
-                    'Canonical_SMILES': summary.get('canonicalsmiles', ''),
-                    'InChIKey': summary.get('inchikey', ''),
+                logger.info("PubChemPy unavailable (%s), trying NCBI E-utilities...", py_err)
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LuteolinAnalyzer/1.0"}
+                eutils_url = (
+                    f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                    f"?db=pccompound&id={self.pubchem_cid}&retmode=json"
+                )
+                response = requests.get(eutils_url, headers=headers, timeout=30)
+                response.raise_for_status()
+                payload = response.json()
+                uids = payload.get("result", {}).get("uids", [])
+                if not uids:
+                    raise ValueError("E-utilities returned no compound data")
+                summary = payload["result"][uids[0]]
+                result = {
+                    "cid": self.pubchem_cid,
+                    "name": self.compound_name,
+                    "name_cn": self.compound_name_cn,
+                    "fetch_time": datetime.now().isoformat(),
+                    "source": "eutils",
+                    "properties": {
+                        "Molecular_Formula": summary.get("molecularformula", ""),
+                        "Molecular_Weight": float(summary.get("molecularweight", 0)),
+                        "Canonical_SMILES": summary.get("canonicalsmiles", ""),
+                        "InChIKey": summary.get("inchikey", ""),
+                    },
                 }
-            }
-            self.raw_data['pubchem'] = result
-            logger.info("E-utilities: CID=%d, Formula=%s, Weight=%s",
-                        result['cid'], result['properties']['Molecular_Formula'],
-                        result['properties']['Molecular_Weight'])
-            return result
-            compound = data['PC_Compounds'][0]
-            props = compound.get('props', [])
-            result = {
-                'cid': self.pubchem_cid,
-                'name': self.compound_name,
-                'name_cn': self.compound_name_cn,
-                'fetch_time': datetime.now().isoformat(),
-                'properties': {}
-            }
-            for prop in props:
-                urn = prop.get('urn', {})
-                label = urn.get('label', '')
-                name = urn.get('name', '')
-                if 'value' in prop:
-                    if 'fval' in prop['value']:
-                        value = prop['value']['fval']
-                    elif 'sval' in prop['value']:
-                        value = prop['value']['sval']
-                    elif 'ival' in prop['value']:
-                        value = prop['value']['ival']
-                    else:
-                        value = str(prop['value'])
-                    key = f"{label}_{name}" if name else label
-                    result['properties'][key] = value
-
-            smiles_url = (
-                f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{self.pubchem_cid}"
-                "/property/CanonicalSMILES,IsomericSMILES,MolecularFormula,"
-                "MolecularWeight,InChI,InChIKey/JSON"
+            snapshot_path, snapshot_sha256 = self._save_json_snapshot(
+                "raw/pubchem", "pubchem_luteolin", result,
             )
-            smiles_response = requests.get(smiles_url, headers=headers, timeout=30)
-            if smiles_response.status_code == 200:
-                smiles_data = smiles_response.json()
-                props = smiles_data.get('PropertyTable', {}).get('Properties', [{}])[0]
-                result['properties']['Canonical_SMILES'] = props.get('CanonicalSMILES', '')
-                result['properties']['Isomeric_SMILES'] = props.get('IsomericSMILES', '')
-                result['properties']['Molecular_Formula'] = props.get('MolecularFormula', '')
-                result['properties']['Molecular_Weight'] = props.get('MolecularWeight', 0)
-                result['properties']['InChI'] = props.get('InChI', '')
-                result['properties']['InChIKey'] = props.get('InChIKey', '')
-
-            self.raw_data['pubchem'] = result
-            logger.info("PubChem: CID=%s, Formula=%s, Weight=%s",
-                        result['cid'], result['properties'].get('Molecular_Formula', 'N/A'),
-                        result['properties'].get('Molecular_Weight', 'N/A'))
-        except Exception as e:
-            logger.info("PubChem network error (offline data will be used): %s", e)
-            self.raw_data['pubchem'] = self.offline_compound.copy()
-            self.raw_data['pubchem']['fetch_time'] = datetime.now().isoformat()
-            logger.info("Offline data loaded successfully")
-
-        raw_dir = os.path.join(self.output_dir, "raw")
-        json_path = os.path.join(raw_dir, "pubchem_luteolin.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(self.raw_data['pubchem'], f, ensure_ascii=False, indent=2)
-        return self.raw_data['pubchem']
-
+            result["raw_snapshot_path"] = snapshot_path
+            result["raw_snapshot_sha256"] = snapshot_sha256
+            self.raw_data["pubchem"] = result
+            return result
+        except Exception as exc:
+            logger.info("PubChem retrieval failed; retaining the local legacy record: %s", exc)
+            result = dict(self.offline_compound)
+            result["source_kind"] = "legacy_unverified"
+            result["fetch_time"] = datetime.now().isoformat()
+            snapshot_path, snapshot_sha256 = self._save_json_snapshot(
+                "raw/pubchem", "pubchem_luteolin", result,
+            )
+            result["raw_snapshot_path"] = snapshot_path
+            result["raw_snapshot_sha256"] = snapshot_sha256
+            self.raw_data["pubchem"] = result
+            return result
     def fetch_chembl_data(self) -> Dict[str, Any]:
         """Capture bounded ChEMBL pages and linked metadata without projection loss."""
+        self._require_online_collection()
         logger.info("Step 2: Fetching bounded activity evidence from ChEMBL...")
         from evidence_builder import _collect_chembl, activity_evidence_from_collector_payload, LegacyDisplayAdapter
 
@@ -289,23 +386,20 @@ class LuteolinDataCollector:
             relative_path = f"raw/chembl/activities/{molecule_id}/{page_hash}.json"
             snapshot_path = Path(self.output_dir) / Path(relative_path)
             try:
-                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-                if snapshot_path.exists():
-                    if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != page_hash:
-                        raise ValueError(f"immutable snapshot collision: {relative_path}")
-                else:
-                    with snapshot_path.open("xb") as snapshot:
-                        snapshot.write(raw_text.encode("utf-8"))
-                page["source_path"] = relative_path
-                page["source_sha256"] = page_hash
+                saved_path, saved_hash = self._write_immutable_bytes(
+                    relative_path, raw_text.encode("utf-8"),
+                )
+                if saved_hash != page_hash:
+                    raise ValueError(f"immutable snapshot hash mismatch: {relative_path}")
+                page["source_path"] = saved_path
+                page["source_sha256"] = saved_hash
                 for receipt in result.get("page_receipts", []):
                     if receipt.get("source_id", "").startswith(f"chembl_activity:{molecule_id}:") and receipt.get("response_sha256") == page.get("response_sha256"):
                         receipt["source_kind"] = source_kind
-                        receipt["source_path"] = relative_path
-                        receipt["source_sha256"] = page_hash
+                        receipt["source_path"] = saved_path
+                        receipt["source_sha256"] = saved_hash
             except Exception as exc:
                 snapshot_failures.append(f"{relative_path}:{exc}")
-
         for receipt in result.get("page_receipts", []):
             source_id = receipt.get("source_id", "")
             if not source_id.startswith(("chembl_molecule:", "chembl_target:", "chembl_assay:", "chembl_document:")):
@@ -322,16 +416,14 @@ class LuteolinDataCollector:
             relative_path = f"raw/chembl/{category.removeprefix('chembl_')}/{identifier}/{source_hash}.json"
             snapshot_path = Path(self.output_dir) / Path(relative_path)
             try:
-                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-                if snapshot_path.exists():
-                    if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != source_hash:
-                        raise ValueError(f"immutable snapshot collision: {relative_path}")
-                else:
-                    with snapshot_path.open("xb") as snapshot:
-                        snapshot.write(raw_text.encode("utf-8"))
+                saved_path, saved_hash = self._write_immutable_bytes(
+                    relative_path, raw_text.encode("utf-8"),
+                )
+                if saved_hash != source_hash:
+                    raise ValueError(f"immutable source snapshot hash mismatch: {relative_path}")
                 receipt["source_kind"] = source_kind
-                receipt["source_path"] = relative_path
-                receipt["source_sha256"] = source_hash
+                receipt["source_path"] = saved_path
+                receipt["source_sha256"] = saved_hash
             except Exception as exc:
                 snapshot_failures.append(f"{relative_path}:{exc}")
         if snapshot_failures:
@@ -370,13 +462,12 @@ class LuteolinDataCollector:
             result["total_activities"], result.get("pagination_status"), result.get("metadata_status"),
         )
 
-        raw_dir = os.path.join(self.output_dir, "raw")
-        json_path = os.path.join(raw_dir, "chembl_luteolin_targets.json")
         try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-            result["raw_snapshot_path"] = os.path.relpath(json_path, self.output_dir).replace(os.sep, "/")
-            result["raw_snapshot_sha256"] = hashlib.sha256(Path(json_path).read_bytes()).hexdigest()
+            snapshot_path, snapshot_sha256 = self._save_json_snapshot(
+                "raw/chembl", "chembl_luteolin_targets", result,
+            )
+            result["raw_snapshot_path"] = snapshot_path
+            result["raw_snapshot_sha256"] = snapshot_sha256
         except Exception as exc:
             result["raw_snapshot_status"] = "error"
             result.setdefault("incomplete_reasons", []).append(f"aggregate_snapshot:{exc}")
@@ -387,6 +478,7 @@ class LuteolinDataCollector:
 
     def fetch_tcmsp_data(self) -> Dict[str, Any]:
         """Return the embedded TCMSP reference without calling it online evidence."""
+        self._require_online_collection()
         logger.info("Step 2.5: Recording TCMSP static reference provenance...")
         request_status = "not_attempted"
         http_status = None
@@ -445,14 +537,16 @@ class LuteolinDataCollector:
             "TCMSP retained as static_reference: herbs=%d, targets=%d",
             len(result["herbs"]), len(result["targets"]),
         )
-        raw_dir = os.path.join(self.output_dir, "raw")
-        json_path = os.path.join(raw_dir, "tcmsp_luteolin.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+        snapshot_path, snapshot_sha256 = self._save_json_snapshot(
+            "raw/tcmsp", "tcmsp_luteolin", result,
+        )
+        result["raw_snapshot_path"] = snapshot_path
+        result["raw_snapshot_sha256"] = snapshot_sha256
         return result
 
     def fetch_uniprot_data(self, gene_symbols: List[str]) -> Dict[str, Any]:
         """Reject symbol-only target guesses; sequence hydration needs exact components."""
+        self._prepare_output_root()
         logger.info("Step 3: UniProt symbol search disabled pending verified target components...")
         unresolved = []
         for value in gene_symbols or []:
@@ -472,32 +566,21 @@ class LuteolinDataCollector:
             "reason": "verified ChEMBL target component accession and taxonomy are required",
         }
         self.raw_data["uniprot"] = result
-        raw_dir = os.path.join(self.output_dir, "raw")
-        json_path = os.path.join(raw_dir, "uniprot_proteins.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+        snapshot_path, snapshot_sha256 = self._save_json_snapshot(
+            "raw/uniprot", "uniprot_proteins", result,
+        )
+        result["raw_snapshot_path"] = snapshot_path
+        result["raw_snapshot_sha256"] = snapshot_sha256
         return result
 
     def _save_string_response(self, response) -> tuple[str, str]:
         raw_body = getattr(response, "content", None)
-        if isinstance(raw_body, (bytes, bytearray)):
-            raw_bytes = bytes(raw_body)
-        else:
-            response_text = getattr(response, "text", None)
-            if not isinstance(response_text, str):
-                raise ValueError("STRING response did not expose raw response bytes")
-            raw_bytes = response_text.encode("utf-8")
-        snapshot_sha256 = hashlib.sha256(raw_bytes).hexdigest()
-        relative_path = Path("raw") / "string" / f"{snapshot_sha256}.json"
-        snapshot_path = Path(self.output_dir) / relative_path
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        if snapshot_path.exists():
-            if snapshot_path.read_bytes() != raw_bytes:
-                raise ValueError(f"immutable STRING snapshot collision: {relative_path.as_posix()}")
-        else:
-            with snapshot_path.open("xb") as stream:
-                stream.write(raw_bytes)
-        return relative_path.as_posix(), snapshot_sha256
+        if not isinstance(raw_body, (bytes, bytearray)):
+            raise ValueError("STRING response did not expose exact raw response bytes")
+        raw_bytes = bytes(raw_body)
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        relative_path = (Path("raw") / "string" / f"{digest}.json").as_posix()
+        return self._write_immutable_bytes(relative_path, raw_bytes)
 
     def fetch_string_data(self, gene_symbols: List[str]) -> Dict[str, Any]:
         """Fetch STRING for explicit seeds and retain exact response-byte provenance."""
@@ -522,6 +605,7 @@ class LuteolinDataCollector:
             self.raw_data["string"] = result
             return result
 
+        self._require_online_collection()
         logger.info("Step 4: Fetching STRING PPI for %d explicit seed symbols...", len(symbols))
         response = None
         snapshot_path = None
@@ -699,47 +783,45 @@ class LuteolinDataCollector:
         self.processed_data = cleaned_data
         return cleaned_data
     def save_processed_data(self) -> str:
-        processed_dir = os.path.join(self.output_dir, "processed")
+        self._prepare_output_root()
         if not self.processed_data:
             self.processed_data = self.clean_and_standardize()
-        json_path = os.path.join(processed_dir, "unified_luteolin_dataset.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(self.processed_data, f, ensure_ascii=False, indent=2)
-        compound_df = pd.DataFrame([self.processed_data['compound']])
-        compound_df.to_csv(os.path.join(processed_dir, "compound_info.csv"),
-                          index=False, encoding='utf-8-sig')
-        if self.processed_data['targets']:
-            targets_df = pd.DataFrame(self.processed_data['targets'])
-            targets_df.to_csv(os.path.join(processed_dir, "targets.csv"),
-                            index=False, encoding='utf-8-sig')
-        proteins_df = pd.DataFrame(self.processed_data['proteins'])
-        proteins_df.to_csv(os.path.join(processed_dir, "proteins.csv"),
-                    index=False, encoding='utf-8-sig')
-        if self.processed_data['interactions']:
-            interactions_df = pd.DataFrame(self.processed_data['interactions'])
-            interactions_df.to_csv(os.path.join(processed_dir, "interactions.csv"),
-                                  index=False, encoding='utf-8-sig')
+        json_relative, _ = self._save_json_snapshot(
+            "processed", "unified_luteolin_dataset", self.processed_data,
+        )
+        compound_df = pd.DataFrame([self.processed_data["compound"]])
+        self._save_csv_snapshot("processed", "compound_info", compound_df)
+        if self.processed_data["targets"]:
+            self._save_csv_snapshot(
+                "processed", "targets", pd.DataFrame(self.processed_data["targets"]),
+            )
+        self._save_csv_snapshot(
+            "processed", "proteins", pd.DataFrame(self.processed_data["proteins"]),
+        )
+        if self.processed_data["interactions"]:
+            self._save_csv_snapshot(
+                "processed", "interactions", pd.DataFrame(self.processed_data["interactions"]),
+            )
         summary = {
-            'compound_name': 'Luteolin (木犀草素)',
-            'pubchem_cid': self.processed_data['compound'].get('pubchem_cid'),
-            'molecular_formula': self.processed_data['compound'].get('molecular_formula'),
-            'molecular_weight': self.processed_data['compound'].get('molecular_weight'),
-            'total_targets': len(self.processed_data['targets']),
-            'total_proteins': len(self.processed_data['proteins']),
-            'total_interactions': len(self.processed_data['interactions']),
-            'processing_time': datetime.now().isoformat()
+            "compound_name": "Luteolin (木犀草素)",
+            "pubchem_cid": self.processed_data["compound"].get("pubchem_cid"),
+            "molecular_formula": self.processed_data["compound"].get("molecular_formula"),
+            "molecular_weight": self.processed_data["compound"].get("molecular_weight"),
+            "total_targets": len(self.processed_data["targets"]),
+            "total_proteins": len(self.processed_data["proteins"]),
+            "total_interactions": len(self.processed_data["interactions"]),
+            "processing_time": datetime.now().isoformat(),
         }
-        summary_path = os.path.join(processed_dir, "dataset_summary.json")
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
+        self._save_json_snapshot("processed", "dataset_summary", summary)
 
-        logger.info("Processed data saved to: %s", processed_dir)
-        logger.info("Summary: %d targets, %d proteins, %d interactions",
-                    summary['total_targets'], summary['total_proteins'],
-                    summary['total_interactions'])
-        return json_path
-
+        logger.info("Processed data saved to: %s", os.path.join(self.output_dir, "processed"))
+        logger.info(
+            "Summary: %d targets, %d proteins, %d interactions",
+            summary["total_targets"], summary["total_proteins"], summary["total_interactions"],
+        )
+        return os.path.join(self.output_dir, json_relative)
     def run_pipeline(self) -> Dict[str, Any]:
+        self._require_online_collection()
         self.fetch_pubchem_data()
         self.fetch_chembl_data()
         self.fetch_tcmsp_data()
@@ -755,10 +837,15 @@ class LuteolinDataCollector:
         self.fetch_uniprot_data(gene_symbols)
         self.fetch_string_data(gene_symbols)
         self.clean_and_standardize()
+        chembl_status = self.raw_data.get("chembl", {}).get("collection_status")
+        ppi_status = self.raw_data.get("string", {}).get("request_status")
+        overall_status = "complete" if chembl_status == "complete" and ppi_status == "complete" else "partial"
+        self.processed_data["status"] = overall_status
+        self.processed_data["collection_status"] = overall_status
+        self.processed_data.setdefault("metadata", {})["collection_status"] = overall_status
         self.save_processed_data()
-        logger.info("Pipeline completed successfully")
+        logger.info("Pipeline completed with status=%s", overall_status)
         return self.processed_data
-
     def _init_fallback_data(self):
         self.offline_compound = {
             'cid': 5280445,

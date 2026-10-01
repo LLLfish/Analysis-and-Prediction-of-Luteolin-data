@@ -27,11 +27,11 @@ import leak_audit
 APL_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "activity_pages.json"
 READY_MOCK_SMILES = (
-    "C1CCCCC1", "C1CCCC1", "C1CCCCCC1", "C1CCCCCCC1", "C1CCCCCCCC1",
-    "C1CCOC1", "C1CCNC1", "C1CCSC1", "C1COCCO1", "C1CCNCC1",
-    "C1COCCN1", "C1CCOCC1", "c1ccccc1", "c1ccncc1", "c1ccoc1",
-    "c1ccsc1", "c1ncc[nH]1", "c1ccc2ccccc2c1", "c1ccc2ncccc2c1",
-    "C1C2CC3CC1CC(C2)C3",
+    "C1CCCCC1", "C1CCOC1", "C1CCNC1", "C1CCSC1", "C1COCCO1",
+    "C1COCCN1", "c1ccccc1", "c1ccncc1", "c1ccoc1", "c1ccsc1",
+    "c1ncc[nH]1", "c1ccc2ccccc2c1", "c1ccc2ncccc2c1", "C1C2CC3CC1CC(C2)C3",
+    "c1cncnc1", "c1cnccn1", "c1ccnnc1", "c1ncncn1", "c1cn[nH]c1",
+    "c1cc[nH]c1",
 )
 
 
@@ -137,7 +137,7 @@ def _source_verified_ready_mock_bundle(tmp_path: Path) -> Path:
 
                 protein = deepcopy(base_component)
                 protein["primaryAccession"] = accession
-                sequence = "".join(random.Random(7000 + protein_index).choices(amino_acids, k=40))
+                sequence = "".join(random.Random(7000 + protein_index).choices(amino_acids, k=60))
                 protein["sequence"]["value"] = sequence
                 protein["sequence"]["length"] = len(sequence)
                 uniprot[accession] = protein

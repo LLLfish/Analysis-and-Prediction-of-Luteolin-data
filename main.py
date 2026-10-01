@@ -271,33 +271,29 @@ class NetworkPharmacologyFramework:
         return value
 
     def _canonicalize_dataset_ppi(self, dataset: Dict[str, Any]) -> CanonicalPpiResult:
-        trace = dataset.get("ppi_trace")
-        trace = trace if isinstance(trace, dict) else {}
-        source_kind = dataset.get("ppi_source_kind")
-        if source_kind is None:
-            source_kind = trace.get("source_kind")
-        request_status = dataset.get("ppi_request_status")
-        if request_status is None:
-            request_status = trace.get("request_status")
-        snapshot_path = dataset.get("ppi_snapshot_path")
-        snapshot_root = dataset.get("ppi_snapshot_root")
-        if snapshot_root is None:
-            snapshot_root = trace.get("snapshot_root")
-        if snapshot_path is None:
-            snapshot_path = trace.get("snapshot_path")
-        snapshot_sha256 = dataset.get("ppi_snapshot_sha256")
-        if snapshot_sha256 is None:
-            snapshot_sha256 = trace.get("snapshot_sha256")
+        metadata_names = {
+            "ppi_source_kind": "source_kind",
+            "ppi_request_status": "request_status",
+            "ppi_snapshot_path": "snapshot_path",
+            "ppi_snapshot_root": "snapshot_root",
+            "ppi_snapshot_sha256": "snapshot_sha256",
+        }
+        top_level_metadata = {
+            contract_name: dataset[dataset_name]
+            for dataset_name, contract_name in metadata_names.items()
+            if dataset_name in dataset
+        }
+        metadata_sources = []
+        if top_level_metadata:
+            metadata_sources.append(top_level_metadata)
+        if "ppi_trace" in dataset:
+            metadata_sources.append(dataset["ppi_trace"])
         result = canonicalize_ppi(
-            dataset.get('interactions', []),
-            source_kind=source_kind,
-            alias_mappings=dataset.get('ppi_alias_mappings'),
-            request_status=request_status,
-            snapshot_path=snapshot_path,
-            snapshot_root=snapshot_root,
-            snapshot_sha256=snapshot_sha256,
+            dataset.get("interactions", []),
+            alias_mappings=dataset.get("ppi_alias_mappings"),
+            ppi_trace=metadata_sources or None,
         )
-        cached = getattr(self, '_ppi_result', None)
+        cached = getattr(self, "_ppi_result", None)
         if (
             cached is not None
             and cached.input_sha256 == result.input_sha256
@@ -307,11 +303,13 @@ class NetworkPharmacologyFramework:
             and cached.snapshot_path == result.snapshot_path
             and cached.snapshot_root == result.snapshot_root
             and cached.snapshot_sha256 == result.snapshot_sha256
+            and cached.snapshot_records_sha256 == result.snapshot_records_sha256
             and cached.issues == result.issues
         ):
             return cached
         self._ppi_result = result
         return result
+
     @staticmethod
     def _feature_readiness(stage_statuses: Dict[str, StageStatus]) -> Dict[str, Any]:
         stage_data = {name: status.to_dict() for name, status in stage_statuses.items()}

@@ -49,7 +49,7 @@ _OFFLINE_FIELDS = {
 }
 _ENVELOPE_FIELDS = {
     "schema_version", "interactions", "source_kind", "alias_mappings",
-    "request_status", "snapshot_path", "snapshot_root", "snapshot_sha256",
+    "request_status", "snapshot_path", "snapshot_root", "snapshot_sha256", "snapshot_records_sha256", "ppi_trace",
     "retrieved_at", "source_uri", "source_sha256",
 }
 _TIME_FIELDS = frozenset({"retrieved_at", "created_at", "generated_at", "timestamp"})
@@ -321,6 +321,7 @@ class CanonicalPpiResult:
     snapshot_sha256: Optional[str] = None
     source_file_path: Optional[str] = None
     source_file_sha256: Optional[str] = None
+    snapshot_records_sha256: Optional[str] = None
 
     @property
     def node_count(self) -> int:
@@ -347,6 +348,8 @@ class CanonicalPpiResult:
             trace["source_file_sha256"] = self.source_file_sha256
         if self.snapshot_root is not None:
             trace["snapshot_root"] = self.snapshot_root
+        if self.snapshot_records_sha256 is not None:
+            trace["snapshot_records_sha256"] = self.snapshot_records_sha256
         return trace
 
     def to_dict(self, include_edges: bool = True) -> dict[str, Any]:
@@ -369,6 +372,7 @@ class CanonicalPpiResult:
             "snapshot_sha256": self.snapshot_sha256,
             "source_file_path": self.source_file_path,
             "source_file_sha256": self.source_file_sha256,
+            "snapshot_records_sha256": self.snapshot_records_sha256,
             "ppi_trace": self.ppi_trace,
             "issues": [issue.to_dict() for issue in self.issues],
         }
@@ -456,27 +460,27 @@ def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
-def _snapshot_binding_error(
+def _read_bound_snapshot_bytes(
     snapshot_root: Optional[str],
     snapshot_path: Optional[str],
     snapshot_sha256: Optional[str],
-) -> Optional[str]:
+) -> tuple[Optional[str], Optional[bytes]]:
     if snapshot_root is None and snapshot_path is None and snapshot_sha256 is None:
-        return None
+        return None, None
     if (snapshot_path is None) != (snapshot_sha256 is None):
-        return "incomplete_source_snapshot"
+        return "incomplete_source_snapshot", None
     if snapshot_path is None or snapshot_sha256 is None:
-        return "incomplete_source_snapshot"
+        return "incomplete_source_snapshot", None
     if snapshot_root is None:
-        return "missing_snapshot_root"
+        return "missing_snapshot_root", None
     if not isinstance(snapshot_root, str) or not snapshot_root or not os.path.isabs(snapshot_root):
-        return "invalid_snapshot_root"
+        return "invalid_snapshot_root", None
     root_path = os.path.abspath(snapshot_root)
     resolved_root = os.path.realpath(root_path)
     if os.path.normcase(root_path) != os.path.normcase(resolved_root):
-        return "invalid_snapshot_root"
+        return "invalid_snapshot_root", None
     if not os.path.isdir(resolved_root):
-        return "source_snapshot_unavailable"
+        return "source_snapshot_unavailable", None
 
     path_parts = snapshot_path.replace("\\", "/").split("/") if isinstance(snapshot_path, str) else []
     if (
@@ -486,23 +490,58 @@ def _snapshot_binding_error(
         or any(part in {"", ".", ".."} for part in path_parts)
         or not _is_sha256(snapshot_sha256)
     ):
-        return "invalid_source_snapshot"
+        return "invalid_source_snapshot", None
     candidate = os.path.join(resolved_root, *path_parts)
     resolved_snapshot = os.path.realpath(candidate)
     try:
         if os.path.normcase(os.path.commonpath((resolved_root, resolved_snapshot))) != os.path.normcase(resolved_root):
-            return "invalid_source_snapshot"
+            return "invalid_source_snapshot", None
     except ValueError:
-        return "invalid_source_snapshot"
+        return "invalid_source_snapshot", None
     try:
         with open(resolved_snapshot, "rb") as stream:
-            actual_sha256 = hashlib.sha256(stream.read()).hexdigest()
+            raw_bytes = stream.read()
     except OSError:
-        return "source_snapshot_unavailable"
-    if actual_sha256 != snapshot_sha256:
-        return "snapshot_hash_mismatch"
-    return None
+        return "source_snapshot_unavailable", None
+    if hashlib.sha256(raw_bytes).hexdigest() != snapshot_sha256:
+        return "snapshot_hash_mismatch", None
+    return None, raw_bytes
 
+
+def _snapshot_binding_error(
+    snapshot_root: Optional[str],
+    snapshot_path: Optional[str],
+    snapshot_sha256: Optional[str],
+) -> Optional[str]:
+    error, _ = _read_bound_snapshot_bytes(snapshot_root, snapshot_path, snapshot_sha256)
+    return error
+
+
+def _parse_snapshot_interactions(raw_bytes: bytes) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    try:
+        parsed = json.loads(
+            raw_bytes.decode("utf-8-sig"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError):
+        return "snapshot_json_invalid", None
+    if not isinstance(parsed, list):
+        return "snapshot_not_array", None
+    if any(not isinstance(row, dict) for row in parsed):
+        return "snapshot_record_not_object", None
+    return None, parsed
+
+
+def _read_bound_snapshot_interactions(
+    snapshot_root: Optional[str],
+    snapshot_path: Optional[str],
+    snapshot_sha256: Optional[str],
+) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    error, raw_bytes = _read_bound_snapshot_bytes(snapshot_root, snapshot_path, snapshot_sha256)
+    if error is not None or raw_bytes is None:
+        return error, None
+    return _parse_snapshot_interactions(raw_bytes)
 
 def _canonical_edge_error(edge: Any) -> Optional[str]:
     if not isinstance(edge, CanonicalPpiEdge):
@@ -636,6 +675,13 @@ def _validate_canonical_result(value: CanonicalPpiResult) -> CanonicalPpiResult:
         )
     ):
         return _invalid_canonical_result(value, f"Canonical PPI snapshot binding failed: {snapshot_error}.")
+    if value.snapshot_records_sha256 is not None and not _is_sha256(value.snapshot_records_sha256):
+        return _invalid_canonical_result(value, "Canonical PPI snapshot records SHA-256 is invalid.")
+    if value.snapshot_records_sha256 is not None and not (
+        value.source_kind == "online_snapshot"
+        and value.request_status == "complete"
+    ):
+        return _invalid_canonical_result(value, "Snapshot row hash is only valid for complete online PPI snapshots.")
     if (value.source_file_path is None) != (value.source_file_sha256 is None):
         return _invalid_canonical_result(value, "Canonical PPI result source file path/hash must be paired.")
     if value.source_file_path is not None and (
@@ -713,6 +759,68 @@ def _validate_canonical_result(value: CanonicalPpiResult) -> CanonicalPpiResult:
         ):
             return _invalid_canonical_result(value, "Canonical PPI result contains a malformed issue record.")
 
+    if value.source_kind == "online_snapshot" and value.request_status == "complete":
+        snapshot_parse_error, snapshot_rows = _read_bound_snapshot_interactions(
+            value.snapshot_root,
+            value.snapshot_path,
+            value.snapshot_sha256,
+        )
+        recorded_snapshot_error = (
+            value.status == "invalid"
+            and isinstance(value.edges, tuple)
+            and not value.edges
+            and isinstance(value.issues, tuple)
+            and any(
+                isinstance(issue, ValidationIssue)
+                and issue.code == snapshot_parse_error
+                for issue in value.issues
+            )
+        )
+        recorded_nonaccepted_result = (
+            value.status == "invalid"
+            and isinstance(value.edges, tuple)
+            and not value.edges
+            and value.accepted_record_count == 0
+        )
+        if snapshot_parse_error is not None:
+            if not recorded_snapshot_error or not recorded_nonaccepted_result:
+                return _invalid_canonical_result(
+                    value, f"Canonical PPI snapshot rows cannot be parsed: {snapshot_parse_error}."
+                )
+        elif recorded_nonaccepted_result:
+            if (
+                value.snapshot_records_sha256 is not None
+                and value.snapshot_records_sha256 != canonical_json_sha256(snapshot_rows)
+            ):
+                return _invalid_canonical_result(
+                    value, "Canonical PPI snapshot row hash does not match the source snapshot."
+                )
+        else:
+            expected_rows_sha256 = canonical_json_sha256(snapshot_rows)
+            if value.snapshot_records_sha256 != expected_rows_sha256:
+                return _invalid_canonical_result(
+                    value, "Canonical PPI snapshot row hash does not match the source snapshot."
+                )
+            derived = canonicalize_ppi(
+                snapshot_rows,
+                source_kind=value.source_kind,
+                request_status=value.request_status,
+                snapshot_path=value.snapshot_path,
+                snapshot_root=value.snapshot_root,
+                snapshot_sha256=value.snapshot_sha256,
+            )
+            if (
+                value.edges != derived.edges
+                or value.issues != derived.issues
+                or value.status != derived.status
+                or value.input_count != derived.input_count
+                or value.accepted_record_count != derived.accepted_record_count
+                or value.semantic_sha256 != derived.semantic_sha256
+            ):
+                return _invalid_canonical_result(
+                    value, "Canonical PPI result does not re-derive from its complete source snapshot."
+                )
+
     expected = _build_result(
         value.edges,
         value.issues,
@@ -726,6 +834,7 @@ def _validate_canonical_result(value: CanonicalPpiResult) -> CanonicalPpiResult:
         snapshot_sha256=value.snapshot_sha256,
         source_file_path=value.source_file_path,
         source_file_sha256=value.source_file_sha256,
+        snapshot_records_sha256=value.snapshot_records_sha256,
     )
     if (
         value.edges != expected.edges
@@ -850,15 +959,32 @@ def _resolve_effective_ppi_metadata(
     snapshot_path: Optional[str],
     snapshot_root: Optional[str],
     snapshot_sha256: Optional[str],
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], list[tuple[str, str, Optional[str]]]]:
+    ppi_trace: Any = None,
+) -> tuple[
+    Optional[str], Optional[str], Optional[str], Optional[str], Optional[str],
+    Optional[list[dict[str, Any]]], list[tuple[str, str, Optional[str]]],
+]:
     envelope = records if isinstance(records, Mapping) and "interactions" in records else {}
-    envelope_values = {
-        "source_kind": envelope.get("source_kind"),
-        "request_status": envelope.get("request_status"),
-        "snapshot_path": envelope.get("snapshot_path"),
-        "snapshot_root": envelope.get("snapshot_root"),
-        "snapshot_sha256": envelope.get("snapshot_sha256"),
-    }
+    errors: list[tuple[str, str, Optional[str]]] = []
+    trace_sources: list[Mapping[str, Any]] = []
+    embedded_trace = envelope.get("ppi_trace")
+    if embedded_trace is not None:
+        if isinstance(embedded_trace, Mapping):
+            trace_sources.append(embedded_trace)
+        else:
+            errors.append(("invalid_ppi_trace", "PPI envelope ppi_trace must be an object.", "ppi_trace"))
+    if ppi_trace is not None:
+        if isinstance(ppi_trace, Mapping):
+            trace_sources.append(ppi_trace)
+        elif isinstance(ppi_trace, (list, tuple)):
+            for trace_item in ppi_trace:
+                if isinstance(trace_item, Mapping):
+                    trace_sources.append(trace_item)
+                else:
+                    errors.append(("invalid_ppi_trace", "PPI trace sources must be objects.", "ppi_trace"))
+        else:
+            errors.append(("invalid_ppi_trace", "ppi_trace must be an object or a sequence of objects.", "ppi_trace"))
+
     explicit_values = {
         "source_kind": source_kind,
         "request_status": request_status,
@@ -873,17 +999,32 @@ def _resolve_effective_ppi_metadata(
         "snapshot_root": "conflicting_source_snapshot",
         "snapshot_sha256": "conflicting_source_snapshot",
     }
-    errors: list[tuple[str, str, Optional[str]]] = []
-    effective = {}
+    effective: dict[str, Any] = {}
     for name, explicit_value in explicit_values.items():
-        envelope_value = envelope_values[name]
-        if explicit_value is not None and envelope_value is not None and explicit_value != envelope_value:
+        candidates: list[Any] = []
+        if name in envelope and envelope[name] is not None:
+            candidates.append(envelope[name])
+        candidates.extend(
+            trace[name] for trace in trace_sources
+            if name in trace and trace[name] is not None
+        )
+        if explicit_value is not None:
+            candidates.append(explicit_value)
+        if candidates and any(candidate != candidates[0] for candidate in candidates[1:]):
             errors.append((
                 conflict_codes[name],
-                f"Explicit {name} conflicts with the PPI envelope.",
+                f"PPI metadata sources disagree on {name}.",
                 name,
             ))
-        effective[name] = explicit_value if explicit_value is not None else envelope_value
+        if explicit_value is not None:
+            effective[name] = explicit_value
+        elif name in envelope and envelope[name] is not None:
+            effective[name] = envelope[name]
+        else:
+            effective[name] = next((
+                trace[name] for trace in trace_sources
+                if name in trace and trace[name] is not None
+            ), None)
 
     effective_source_kind = effective["source_kind"]
     if effective_source_kind is not None:
@@ -912,11 +1053,26 @@ def _resolve_effective_ppi_metadata(
             "snapshot_path and snapshot_sha256 must be supplied together.",
             "snapshot_path",
         ))
-    snapshot_error = _snapshot_binding_error(
-        effective_snapshot_root,
-        effective_snapshot_path,
-        effective_snapshot_sha256,
-    )
+
+    snapshot_records = None
+    snapshot_records_error = None
+    if (
+        effective_source_kind == "online_snapshot"
+        and effective_request_status == "complete"
+        and effective_snapshot_sha256 is not None
+    ):
+        snapshot_records_error, snapshot_records = _read_bound_snapshot_interactions(
+            effective_snapshot_root,
+            effective_snapshot_path,
+            effective_snapshot_sha256,
+        )
+        snapshot_error = snapshot_records_error
+    else:
+        snapshot_error = _snapshot_binding_error(
+            effective_snapshot_root,
+            effective_snapshot_path,
+            effective_snapshot_sha256,
+        )
     if snapshot_error is not None:
         snapshot_messages = {
             "missing_snapshot_root": "A byte-bound PPI snapshot requires an explicit snapshot_root.",
@@ -925,6 +1081,9 @@ def _resolve_effective_ppi_metadata(
             "snapshot_hash_mismatch": "PPI snapshot bytes do not match snapshot_sha256.",
             "invalid_source_snapshot": "PPI snapshot path/hash is invalid or escapes snapshot_root.",
             "incomplete_source_snapshot": "snapshot_root, snapshot_path, and snapshot_sha256 must describe one snapshot.",
+            "snapshot_json_invalid": "The PPI snapshot is not strict UTF-8 JSON.",
+            "snapshot_not_array": "The PPI snapshot root must be a JSON array.",
+            "snapshot_record_not_object": "Every PPI snapshot row must be a JSON object.",
         }
         error_field = (
             "snapshot_root"
@@ -943,15 +1102,46 @@ def _resolve_effective_ppi_metadata(
             "snapshot_sha256",
         ))
 
+    declared_row_hashes = []
+    for metadata_source in (envelope, *trace_sources):
+        row_hash = metadata_source.get("snapshot_records_sha256")
+        if row_hash is not None:
+            declared_row_hashes.append(row_hash)
+    if declared_row_hashes and any(item != declared_row_hashes[0] for item in declared_row_hashes[1:]):
+        errors.append((
+            "conflicting_source_snapshot",
+            "PPI metadata sources disagree on snapshot_records_sha256.",
+            "snapshot_records_sha256",
+        ))
+    if declared_row_hashes:
+        row_hash = declared_row_hashes[0]
+        if not _is_sha256(row_hash):
+            errors.append((
+                "invalid_snapshot_records_sha256",
+                "snapshot_records_sha256 must be a lowercase SHA-256 digest.",
+                "snapshot_records_sha256",
+            ))
+        elif (
+            effective_source_kind != "online_snapshot"
+            or effective_request_status != "complete"
+            or snapshot_records is None
+            or canonical_json_sha256(snapshot_records) != row_hash
+        ):
+            errors.append((
+                "snapshot_records_mismatch",
+                "snapshot_records_sha256 does not match the complete bound PPI snapshot rows.",
+                "snapshot_records_sha256",
+            ))
+
     return (
         effective_source_kind,
         effective_request_status,
         effective_snapshot_path,
         effective_snapshot_root,
         effective_snapshot_sha256,
+        snapshot_records,
         errors,
     )
-
 
 def canonicalize_ppi(
     records: Any,
@@ -962,6 +1152,7 @@ def canonicalize_ppi(
     snapshot_path: Optional[str] = None,
     snapshot_root: Optional[str] = None,
     snapshot_sha256: Optional[str] = None,
+    ppi_trace: Any = None,
 ) -> CanonicalPpiResult:
     """Normalize raw PPI records without turning display aliases into identities.
 
@@ -982,6 +1173,22 @@ def canonicalize_ppi(
                 records,
                 "Explicit PPI metadata conflicts with the canonical PPI result.",
             )
+        if ppi_trace is not None:
+            trace_sources = (
+                [ppi_trace] if isinstance(ppi_trace, Mapping) else
+                list(ppi_trace) if isinstance(ppi_trace, (list, tuple)) else None
+            )
+            trace_fields = (
+                "source_kind", "request_status", "snapshot_path", "snapshot_root",
+                "snapshot_sha256", "snapshot_records_sha256",
+            )
+            if trace_sources is None or any(not isinstance(source, Mapping) for source in trace_sources):
+                return _invalid_canonical_result(records, "Explicit PPI trace metadata is malformed.")
+            if any(
+                name in source and source[name] != getattr(records, name)
+                for source in trace_sources for name in trace_fields
+            ):
+                return _invalid_canonical_result(records, "Explicit PPI trace conflicts with the canonical PPI result.")
         return _validate_canonical_result(records)
 
     metadata_errors = []
@@ -1006,6 +1213,7 @@ def canonicalize_ppi(
         effective_snapshot_path,
         effective_snapshot_root,
         effective_snapshot_sha256,
+        effective_snapshot_records,
         effective_metadata_errors,
     ) = _resolve_effective_ppi_metadata(
         records,
@@ -1014,6 +1222,7 @@ def canonicalize_ppi(
         snapshot_path=snapshot_path,
         snapshot_root=snapshot_root,
         snapshot_sha256=snapshot_sha256,
+        ppi_trace=ppi_trace,
     )
     metadata_errors.extend(effective_metadata_errors)
     if alias_mappings is not None and not isinstance(alias_mappings, Mapping):
@@ -1044,6 +1253,27 @@ def canonicalize_ppi(
                 source_file_path=source_file_path,
                 source_file_sha256=source_file_sha256,
             )
+        if effective_source_kind == "online_snapshot" and effective_request_status == "complete":
+            snapshot_result = canonicalize_ppi(
+                effective_snapshot_records or [],
+                source_kind=effective_source_kind,
+                request_status=effective_request_status,
+                snapshot_path=effective_snapshot_path,
+                snapshot_root=effective_snapshot_root,
+                snapshot_sha256=effective_snapshot_sha256,
+            )
+            edge_result = _canonicalize_edge_sequence(records)
+            if edge_result.edges != snapshot_result.edges:
+                return _metadata_failure(
+                    records,
+                    [("snapshot_records_mismatch", "Canonical edges do not match the bound PPI snapshot rows.", "interactions")],
+                    source_kind=effective_source_kind,
+                    request_status=effective_request_status,
+                    snapshot_path=effective_snapshot_path,
+                    snapshot_root=effective_snapshot_root,
+                    snapshot_sha256=effective_snapshot_sha256,
+                )
+            return snapshot_result
         return _canonicalize_edge_sequence(records)
 
     source_hash = canonical_json_sha256(records)
@@ -1137,6 +1367,33 @@ def canonicalize_ppi(
     issues = list(root_issues)
     candidate_records = []
     input_count = len(rows)
+    snapshot_records_sha256 = None
+    if effective_source_kind == "online_snapshot" and effective_request_status == "complete":
+        if effective_snapshot_records is None:
+            return _metadata_failure(
+                records,
+                [("snapshot_json_invalid", "The bound PPI snapshot rows could not be reconstructed.", "snapshot_path")],
+                source_kind=effective_source_kind,
+                request_status=effective_request_status,
+                snapshot_path=effective_snapshot_path,
+                snapshot_root=effective_snapshot_root,
+                snapshot_sha256=effective_snapshot_sha256,
+                source_file_path=source_file_path,
+                source_file_sha256=source_file_sha256,
+            )
+        snapshot_records_sha256 = canonical_json_sha256(effective_snapshot_records)
+        if canonical_json_sha256(rows) != snapshot_records_sha256:
+            return _metadata_failure(
+                records,
+                [("snapshot_records_mismatch", "PPI rows do not semantically match the bound snapshot rows.", "interactions")],
+                source_kind=effective_source_kind,
+                request_status=effective_request_status,
+                snapshot_path=effective_snapshot_path,
+                snapshot_root=effective_snapshot_root,
+                snapshot_sha256=effective_snapshot_sha256,
+                source_file_path=source_file_path,
+                source_file_sha256=source_file_sha256,
+            )
     if effective_request_status in {"failed", "not_requested"} and rows:
         code = f"ppi_request_{effective_request_status}_with_records"
         return _metadata_failure(
@@ -1395,6 +1652,7 @@ def canonicalize_ppi(
         snapshot_sha256=effective_snapshot_sha256,
         source_file_path=source_file_path,
         source_file_sha256=source_file_sha256,
+        snapshot_records_sha256=snapshot_records_sha256,
     )
 
 
@@ -1412,6 +1670,7 @@ def _build_result(
     snapshot_sha256: Optional[str] = None,
     source_file_path: Optional[str] = None,
     source_file_sha256: Optional[str] = None,
+    snapshot_records_sha256: Optional[str] = None,
 ) -> CanonicalPpiResult:
     sorted_edges = tuple(sorted(edges, key=lambda edge: (edge.edge_key, edge.score)))
     sorted_issues = tuple(sorted(
@@ -1441,6 +1700,8 @@ def _build_result(
     }
     if snapshot_root is not None:
         trace_payload["snapshot_root"] = snapshot_root
+    if snapshot_records_sha256 is not None:
+        trace_payload["snapshot_records_sha256"] = snapshot_records_sha256
     if source_file_path is not None:
         trace_payload["source_file_path"] = source_file_path
         trace_payload["source_file_sha256"] = source_file_sha256
@@ -1475,6 +1736,7 @@ def _build_result(
         snapshot_sha256=snapshot_sha256,
         source_file_path=source_file_path,
         source_file_sha256=source_file_sha256,
+        snapshot_records_sha256=snapshot_records_sha256,
     )
 
 

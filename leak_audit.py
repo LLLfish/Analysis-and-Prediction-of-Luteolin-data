@@ -28,6 +28,11 @@ from label_policy import apply_label_policy, group_evidence
 
 
 _POLICY_PATH = Path(__file__).resolve().parent / "policies" / "split_policy.json"
+_LABEL_POLICY_PATH = Path(__file__).resolve().parent / "policies" / "label_policy.json"
+_POLICY_RELATIVE_PATHS = {
+    "split": "policies/split_policy.json",
+    "label": "policies/label_policy.json",
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CHEMBL_ID = re.compile(r"^CHEMBL[0-9]+$")
 _SPLITS = ("train", "val", "test")
@@ -124,6 +129,9 @@ class AuditReport:
     split_policy_sha256: Optional[str] = None
     source_provenance: tuple[Mapping[str, Any], ...] = ()
     error: Optional[str] = None
+    split_policy_file_sha256: Optional[str] = None
+    label_policy_sha256: Optional[str] = None
+    label_policy_semantic_sha256: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +144,9 @@ class AuditReport:
             "entity_version": self.entity_version,
             "entity_bundle_hash": self.entity_bundle_hash,
             "split_policy_sha256": self.split_policy_sha256,
+            "split_policy_file_sha256": self.split_policy_file_sha256,
+            "label_policy_sha256": self.label_policy_sha256,
+            "label_policy_semantic_sha256": self.label_policy_semantic_sha256,
             "source_provenance": [_json_safe(item) for item in self.source_provenance],
             "error": self.error,
         }
@@ -324,12 +335,113 @@ def _safe_relative_file(root: Path, relative_path: Any, label: str) -> Path:
         raise AuditInputError(f"{label} path resolves outside its frozen root")
     cursor = unresolved
     while cursor != root and root in cursor.parents:
-        if cursor.is_symlink():
+        is_junction = getattr(cursor, "is_junction", None)
+        try:
+            import stat
+            reparse = bool(getattr(cursor.lstat(), "st_file_attributes", 0)
+                           & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        except (OSError, AttributeError):
+            reparse = False
+        if cursor.is_symlink() or (callable(is_junction) and is_junction()) or reparse:
             raise AuditInputError(f"{label} path crosses a symbolic link or junction")
         cursor = cursor.parent
     if not resolved.is_file():
         raise AuditInputError(f"{label} path is not a file")
     return resolved
+
+
+def _load_policy_snapshot(
+    manifest_root: Path,
+    policy_bindings: Any,
+    kind: str,
+    override_path: Any = None,
+) -> tuple[Optional[Path], Optional[bytes], Optional[dict[str, Any]], Optional[AuditFinding]]:
+    if not isinstance(policy_bindings, Mapping) or set(policy_bindings) != {"split", "label"}:
+        return None, None, None, AuditFinding(
+            code="policy_bindings_invalid", message="manifest policies must bind exactly split and label snapshots",
+        )
+    reference = policy_bindings.get(kind)
+    required = {"path", "file_sha256", "semantic_sha256", "schema_version", "policy_version"}
+    if not isinstance(reference, Mapping) or set(reference) != required:
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_binding_invalid", message=f"frozen {kind} policy binding is incomplete or has unknown fields",
+        )
+    expected_path = _POLICY_RELATIVE_PATHS[kind]
+    if reference.get("path") != expected_path:
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_path_mismatch",
+            message=f"frozen {kind} policy path must be the canonical version-relative snapshot path",
+            entity_ids=(str(reference.get("path")), expected_path),
+        )
+    for field_name in ("file_sha256", "semantic_sha256"):
+        if not isinstance(reference.get(field_name), str) or not _SHA256.fullmatch(reference[field_name]):
+            return None, None, None, AuditFinding(
+                code=f"{kind}_policy_binding_invalid",
+                message=f"frozen {kind} policy {field_name} is missing or malformed",
+            )
+    if type(reference.get("schema_version")) is not int or not isinstance(reference.get("policy_version"), str):
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_binding_invalid", message=f"frozen {kind} policy version metadata is malformed",
+        )
+    try:
+        snapshot_path = _safe_relative_file(manifest_root, reference.get("path"), f"{kind} policy snapshot")
+        raw = snapshot_path.read_bytes()
+    except (AuditInputError, OSError) as exc:
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_snapshot_missing", message=str(exc),
+            entity_ids=(expected_path,),
+        )
+    actual_file_sha256 = _sha256(raw)
+    if actual_file_sha256 != reference.get("file_sha256"):
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_snapshot_hash_mismatch",
+            message=f"frozen {kind} policy bytes differ from their manifest file hash",
+            entity_ids=(actual_file_sha256, str(reference.get("file_sha256"))),
+        )
+    try:
+        policy = _read_json_bytes(raw, f"frozen {kind} policy")
+    except AuditInputError as exc:
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_snapshot_invalid", message=str(exc), entity_ids=(expected_path,),
+        )
+    if not isinstance(policy, Mapping):
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_snapshot_invalid", message=f"frozen {kind} policy root must be an object",
+        )
+    actual_semantic_sha256 = _canonical_hash(policy)
+    if actual_semantic_sha256 != reference.get("semantic_sha256"):
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_semantic_mismatch",
+            message=f"frozen {kind} policy meaning differs from its manifest semantic hash",
+            entity_ids=(actual_semantic_sha256, str(reference.get("semantic_sha256"))),
+        )
+    if (type(policy.get("schema_version")) is not int
+            or policy.get("schema_version") != reference.get("schema_version")
+            or policy.get("policy_version") != reference.get("policy_version")):
+        return None, None, None, AuditFinding(
+            code=f"{kind}_policy_version_mismatch",
+            message=f"frozen {kind} policy schema/version differs from its manifest reference",
+            entity_ids=(str(policy.get("schema_version")), str(policy.get("policy_version")),
+                        str(reference.get("schema_version")), str(reference.get("policy_version"))),
+        )
+    if override_path is not None:
+        try:
+            override = Path(override_path).expanduser()
+            if override.is_symlink() or not override.is_file():
+                raise OSError("override must be a regular non-symlink policy file")
+            override_bytes = override.read_bytes()
+        except (OSError, TypeError, ValueError) as exc:
+            return None, None, None, AuditFinding(
+                code=f"{kind}_policy_override_mismatch",
+                message=f"explicit {kind} policy override cannot be verified against the frozen bytes: {exc}",
+            )
+        if override_bytes != raw:
+            return None, None, None, AuditFinding(
+                code=f"{kind}_policy_override_mismatch",
+                message=f"explicit {kind} policy override bytes differ from the frozen policy snapshot",
+                entity_ids=(_sha256(override_bytes), actual_file_sha256),
+            )
+    return snapshot_path, raw, dict(policy), None
 
 
 def _load_entity_for_audit(entity_path: Path) -> tuple[dict[str, Any], bytes, list[AuditFinding]]:
@@ -888,8 +1000,30 @@ def _manifest_failure(message: str, code: str = "manifest_invalid") -> AuditRepo
     return AuditReport("invalid_input", 2, (finding,), _empty_support(), False, error=message)
 
 
-def _not_auditable(status: str, message: str, *, findings: Sequence[AuditFinding] = ()) -> AuditReport:
-    return AuditReport(status, 4, tuple(findings), _empty_support(), False, error=message)
+def _not_auditable(
+    status: str,
+    message: str,
+    *,
+    findings: Sequence[AuditFinding] = (),
+    entity_version: Optional[str] = None,
+    entity_bundle_hash: Optional[str] = None,
+    split_policy_sha256: Optional[str] = None,
+    source_provenance: tuple[Mapping[str, Any], ...] = (),
+    split_policy_file_sha256: Optional[str] = None,
+    label_policy_sha256: Optional[str] = None,
+    label_policy_semantic_sha256: Optional[str] = None,
+) -> AuditReport:
+    return AuditReport(
+        status, 4, tuple(findings), _empty_support(), False,
+        entity_version=entity_version,
+        entity_bundle_hash=entity_bundle_hash,
+        split_policy_sha256=split_policy_sha256,
+        source_provenance=source_provenance,
+        error=message,
+        split_policy_file_sha256=split_policy_file_sha256,
+        label_policy_sha256=label_policy_sha256,
+        label_policy_semantic_sha256=label_policy_semantic_sha256,
+    )
 
 
 def _integrity_code_for_bundle_error(message: str) -> str:
@@ -911,18 +1045,20 @@ def audit_split(
     manifest_path: os.PathLike[str] | str,
     *,
     policy_path: Any = None,
+    label_policy_path: Any = None,
     budget_overrides: Optional[Mapping[str, Any]] = None,
 ) -> AuditReport:
     """Audit a frozen split manifest without trusting its cluster IDs or counts."""
     findings: list[AuditFinding] = []
+    policy_report_context: dict[str, Any] = {}
     try:
         manifest_file = Path(manifest_path)
         if not manifest_file.is_file() or manifest_file.is_symlink():
             return _manifest_failure("manifest path must be a regular, non-symlink file")
         manifest_root = manifest_file.resolve(strict=True).parent
         manifest = _read_json_bytes(manifest_file.read_bytes(), "split manifest")
-        if not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 1:
-            return _manifest_failure("split manifest requires supported integer schema_version")
+        if not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 2:
+            return _manifest_failure("split manifest requires supported integer schema_version 2 with frozen policy bindings")
         entity_ref = manifest.get("entities")
         if not isinstance(entity_ref, Mapping):
             return _manifest_failure("split manifest entities reference is missing")
@@ -984,13 +1120,63 @@ def audit_split(
                 source_evidence=tuple(_json_safe(item) for item in bundle.get("source_provenance", []) if isinstance(item, Mapping)),
             ))
 
-        try:
-            policy, policy_sha256, limits = _load_policy(policy_path, budget_overrides)
-        except AuditInputError as exc:
-            return _manifest_failure(str(exc), "policy_invalid")
         split = manifest.get("split")
         if not isinstance(split, Mapping):
             return _manifest_failure("split manifest split object is missing")
+        policy_bindings = manifest.get("policies")
+        split_policy_path, split_policy_bytes, split_policy_value, split_policy_error = _load_policy_snapshot(
+            manifest_root, policy_bindings, "split", policy_path,
+        )
+        label_policy_path_frozen, label_policy_bytes, label_policy_value, label_policy_error = _load_policy_snapshot(
+            manifest_root, policy_bindings, "label", label_policy_path,
+        )
+        policy_findings = [row for row in (split_policy_error, label_policy_error) if row is not None]
+        if policy_findings:
+            return AuditReport(
+                "violation", 3, tuple(policy_findings), _empty_support(), False,
+                entity_version=str(bundle.get("entity_version")) if bundle.get("entity_version") is not None else None,
+                entity_bundle_hash=str(bundle.get("content_sha256")) if bundle.get("content_sha256") is not None else None,
+                error="frozen policy snapshot or explicit override does not match its manifest binding",
+            )
+        if (split_policy_path is None or split_policy_value is None
+                or label_policy_path_frozen is None or label_policy_value is None):
+            return _manifest_failure("policy snapshot loader did not produce both frozen policies", "policy_binding_invalid")
+        try:
+            policy, policy_sha256, limits = _load_policy(split_policy_path)
+        except AuditInputError as exc:
+            finding = AuditFinding(
+                code="split_policy_snapshot_unsupported",
+                message=f"frozen split policy does not satisfy the independently supported contract: {exc}",
+                entity_ids=(str(manifest.get("policies", {}).get("split", {}).get("path")),),
+            )
+            return AuditReport(
+                "violation", 3, (finding,), _empty_support(), False,
+                entity_version=str(bundle.get("entity_version")) if bundle.get("entity_version") is not None else None,
+                entity_bundle_hash=str(bundle.get("content_sha256")) if bundle.get("content_sha256") is not None else None,
+                error=str(exc),
+            )
+        if budget_overrides is not None:
+            if not isinstance(budget_overrides, Mapping):
+                return _manifest_failure("budget_overrides must be an object", "budget_override_invalid")
+            try:
+                for key, value in budget_overrides.items():
+                    if key not in limits:
+                        raise AuditInputError(f"unsupported audit budget: {key}")
+                    limits[key] = _strict_nonnegative_int(value, f"budget override {key}")
+            except AuditInputError as exc:
+                return _manifest_failure(str(exc), "budget_override_invalid")
+        label_policy_semantic_sha256 = _canonical_hash(label_policy_value)
+        split_reference = policy_bindings["split"]
+        label_reference = policy_bindings["label"]
+        policy_report_context = {
+            "entity_version": str(bundle.get("entity_version")) if bundle.get("entity_version") is not None else None,
+            "entity_bundle_hash": str(bundle.get("content_sha256")) if bundle.get("content_sha256") is not None else None,
+            "split_policy_sha256": policy_sha256,
+            "source_provenance": tuple(bundle.get("source_provenance", ())),
+            "split_policy_file_sha256": split_reference.get("file_sha256"),
+            "label_policy_sha256": label_reference.get("file_sha256"),
+            "label_policy_semantic_sha256": label_reference.get("semantic_sha256"),
+        }
         audit_marker = manifest.get("audit")
         audit_is_final = (
             isinstance(audit_marker, Mapping)
@@ -1008,19 +1194,47 @@ def audit_split(
         if not isinstance(activity_binding, Mapping) or not isinstance(pair_binding, Mapping):
             return _manifest_failure("manifest must bind activity and pair ledgers to the frozen entity version")
         required_split_fields = (
-            "entity_version", "entity_bundle_hash", "molecule_memberships", "protein_memberships", "pair_assignments",
+            "split_policy_sha256", "split_policy_file_sha256", "split_policy_semantic_sha256",
+            "split_policy_schema_version", "split_policy_version", "label_policy_sha256",
+            "label_policy_file_sha256", "label_policy_semantic_sha256", "label_policy_schema_version",
+            "label_policy_version", "entity_version", "entity_bundle_hash", "molecule_memberships",
+            "protein_memberships", "pair_assignments",
             "crosspair_quarantine", "unassigned_pairs", "test_only_pair_assignments",
             "ambiguous_label_quarantine", "class_support", "training_ready",
         )
         if any(field_name not in split for field_name in required_split_fields):
             return _manifest_failure("split manifest omits one or more assignment/quarantine/support ledgers")
         if split.get("strict_split_status") in {"size_limit", "dependency_missing"}:
-            return _not_auditable(str(split.get("strict_split_status")), str(split.get("error") or "split was not fully built"), findings=findings)
+            return _not_auditable(
+                str(split.get("strict_split_status")),
+                str(split.get("error") or "split was not fully built"),
+                findings=findings,
+                **policy_report_context,
+            )
         claimed_policy_hash = split.get("split_policy_sha256")
         if claimed_policy_hash != policy_sha256:
             findings.append(AuditFinding(
                 code="split_policy_hash_mismatch", message="split policy hash does not identify the policy used by this independent audit",
                 entity_ids=(str(claimed_policy_hash), policy_sha256),
+            ))
+        if (split.get("split_policy_file_sha256") != split_reference["file_sha256"]
+                or split.get("split_policy_semantic_sha256") != split_reference["semantic_sha256"]
+                or split.get("split_policy_schema_version") != split_reference["schema_version"]
+                or split.get("split_policy_version") != split_reference["policy_version"]):
+            findings.append(AuditFinding(
+                code="split_policy_claim_mismatch",
+                message="split claim policy byte/semantic hash and version do not match the frozen split-policy snapshot",
+                entity_ids=(str(split.get("split_policy_file_sha256")), str(split_reference["file_sha256"])),
+            ))
+        if (split.get("label_policy_sha256") != label_reference["file_sha256"]
+                or split.get("label_policy_file_sha256") != label_reference["file_sha256"]
+                or split.get("label_policy_semantic_sha256") != label_reference["semantic_sha256"]
+                or split.get("label_policy_schema_version") != label_reference["schema_version"]
+                or split.get("label_policy_version") != label_reference["policy_version"]):
+            findings.append(AuditFinding(
+                code="label_policy_claim_mismatch",
+                message="split claim label-policy byte/semantic hash and version do not match the frozen label-policy snapshot",
+                entity_ids=(str(split.get("label_policy_sha256")), str(label_reference["file_sha256"])),
             ))
         expected_entity_version = bundle.get("entity_version")
         expected_entity_hash = bundle.get("content_sha256")
@@ -1061,14 +1275,22 @@ def audit_split(
 
         neighbor_result = _recompute_neighbors(bundle, policy, limits)
         if neighbor_result.status in {"size_limit", "dependency_missing"}:
-            return _not_auditable(neighbor_result.status, neighbor_result.error or neighbor_result.status, findings=findings)
+            return _not_auditable(
+                neighbor_result.status,
+                neighbor_result.error or neighbor_result.status,
+                findings=findings,
+                **policy_report_context,
+            )
         if neighbor_result.status != "ok":
             findings.append(AuditFinding(
                 code="neighbor_recompute_invalid", message=neighbor_result.error or "neighbor recomputation failed",
             ))
             return AuditReport("violation", 3, tuple(findings), _empty_support(), False,
                                str(bundle.get("entity_version")), str(bundle.get("content_sha256")), policy_sha256,
-                               tuple(bundle.get("source_provenance", ())), neighbor_result.error)
+                               tuple(bundle.get("source_provenance", ())), neighbor_result.error,
+                               split_policy_file_sha256=split_reference.get("file_sha256"),
+                               label_policy_sha256=label_reference.get("file_sha256"),
+                               label_policy_semantic_sha256=label_reference.get("semantic_sha256"))
 
         molecules = _verified_molecules(bundle)
         proteins = _verified_proteins(bundle)
@@ -1143,18 +1365,31 @@ def audit_split(
         try:
             groups, filtering_ledger = group_evidence(bundle.get("activities", []))
             label_result = apply_label_policy(
-                groups, ledger=filtering_ledger, entity_bundle_path=entity_path, allow_test_only=True,
+                groups, ledger=filtering_ledger, policy_path=label_policy_path_frozen,
+                entity_bundle_path=entity_path, allow_test_only=True,
             )
             confirmed, test_only, diagnostics = _label_maps(label_result, groups)
         except Exception as exc:
             if _dependency_error(exc):
-                return _not_auditable("dependency_missing", str(exc), findings=findings)
+                return _not_auditable("dependency_missing", str(exc), findings=findings, **policy_report_context)
             findings.append(AuditFinding(
                 code="evidence_policy_rejected", message=f"frozen evidence could not be independently regrouped and labeled: {exc}",
             ))
             return AuditReport("violation", 3, tuple(findings), _empty_support(), False,
                                str(bundle.get("entity_version")), str(bundle.get("content_sha256")), policy_sha256,
-                               tuple(bundle.get("source_provenance", ())), str(exc))
+                               tuple(bundle.get("source_provenance", ())), str(exc),
+                               split_policy_file_sha256=split_reference.get("file_sha256"),
+                               label_policy_sha256=label_reference.get("file_sha256"),
+                               label_policy_semantic_sha256=label_reference.get("semantic_sha256"))
+
+        if (label_result.policy_sha256 != label_reference.get("file_sha256")
+                or _canonical_hash(label_policy_value) != label_reference.get("semantic_sha256")
+                or label_result.policy_version != label_reference.get("policy_version")):
+            findings.append(AuditFinding(
+                code="label_policy_recompute_mismatch",
+                message="label recomputation did not use the exact frozen label-policy bytes/version",
+                entity_ids=(str(label_result.policy_sha256), str(label_reference.get("file_sha256"))),
+            ))
 
         evidence_by_pair = _source_rows_by_pair(bundle, groups)
         for entry in filtering_ledger.entries:
@@ -1404,12 +1639,15 @@ def audit_split(
             entity_bundle_hash=str(bundle.get("content_sha256")) if bundle.get("content_sha256") is not None else None,
             split_policy_sha256=policy_sha256,
             source_provenance=tuple(bundle.get("source_provenance", ())),
+            split_policy_file_sha256=str(split_reference.get("file_sha256")),
+            label_policy_sha256=str(label_reference.get("file_sha256")),
+            label_policy_semantic_sha256=label_policy_semantic_sha256,
         )
     except _AuditStop as exc:
-        return _not_auditable(exc.status, str(exc), findings=findings)
+        return _not_auditable(exc.status, str(exc), findings=findings, **policy_report_context)
     except (AuditInputError, EvidenceInputError, TypeError, ValueError, OSError) as exc:
         if _dependency_error(exc):
-            return _not_auditable("dependency_missing", str(exc), findings=findings)
+            return _not_auditable("dependency_missing", str(exc), findings=findings, **policy_report_context)
         if isinstance(exc, AuditInputError):
             findings.append(AuditFinding(code="audit_input_invalid", message=str(exc)))
             return AuditReport("violation", 3, tuple(findings), _empty_support(), False, error=str(exc))
@@ -1423,7 +1661,11 @@ def audit_split(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Independently audit a frozen split manifest")
     parser.add_argument("--manifest", required=True, help="path to a frozen manifest.json")
-    parser.add_argument("--policy", help="optional split policy JSON path")
+    parser.add_argument("--policy", help="optional split policy file override; its bytes must match the frozen snapshot")
+    parser.add_argument("--label-policy", help="optional label policy file override; its bytes must match the frozen snapshot")
+    parser.add_argument("--max-molecule-pairs", type=int, help="runtime-only upper bound for this audit")
+    parser.add_argument("--max-protein-pairs", type=int, help="runtime-only upper bound for this audit")
+    parser.add_argument("--max-alignment-cells", type=int, help="runtime-only upper bound for this audit")
     return parser
 
 
@@ -1432,7 +1674,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args = build_argument_parser().parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
-    report = audit_split(args.manifest, policy_path=args.policy)
+    budget_overrides = {
+        key: value for key, value in (
+            ("molecule_pairs", args.max_molecule_pairs),
+            ("protein_pairs", args.max_protein_pairs),
+            ("alignment_cells", args.max_alignment_cells),
+        ) if value is not None
+    }
+    report = audit_split(
+        args.manifest,
+        policy_path=args.policy,
+        label_policy_path=args.label_policy,
+        budget_overrides=budget_overrides or None,
+    )
     print(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True, allow_nan=False))
     return report.exit_code
 

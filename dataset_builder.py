@@ -19,6 +19,7 @@ from label_policy import apply_label_policy, group_evidence
 
 
 _POLICY_PATH = Path(__file__).resolve().parent / "policies" / "split_policy.json"
+_LABEL_POLICY_PATH = Path(__file__).resolve().parent / "policies" / "label_policy.json"
 _CHEMBL_ID = re.compile(r"^CHEMBL[0-9]+$")
 _ACCESSION = re.compile(r"^[A-Z0-9]{6}(?:[A-Z0-9]{4})?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -111,6 +112,12 @@ class SplitResult:
     ambiguous_label_quarantine: tuple[PairSplitAssignment, ...] = ()
     error: Optional[str] = None
     test_only: bool = False
+    policy_file_sha256: Optional[str] = None
+    policy_schema_version: Optional[int] = None
+    policy_version: Optional[str] = None
+    label_policy_semantic_sha256: Optional[str] = None
+    label_policy_schema_version: Optional[int] = None
+    label_policy_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +148,15 @@ def _reject_json_constant(value: str) -> None:
     raise DatasetBuildError(f"non-finite JSON constant is not allowed: {value}", code="invalid_policy")
 
 
+def _unique_policy_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DatasetBuildError(f"duplicate split policy key: {key}", code="invalid_policy")
+        result[key] = value
+    return result
+
+
 def _finite_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise DatasetBuildError(f"{label} must be a finite number", code="invalid_policy")
@@ -156,13 +172,17 @@ def _nonnegative_int(value: Any, label: str) -> int:
     return value
 
 
-def _load_policy(policy_path: Any = None) -> tuple[dict[str, Any], str]:
+def _load_policy(policy_path: Any = None) -> tuple[dict[str, Any], str, str]:
     path = _POLICY_PATH if policy_path is None else Path(policy_path)
     if not isinstance(path, Path):
         raise DatasetBuildError("policy_path must identify a JSON file", code="invalid_policy")
     try:
-        with path.open("r", encoding="utf-8-sig") as stream:
-            policy = json.load(stream, parse_constant=_reject_json_constant)
+        policy_bytes = path.read_bytes()
+        policy = json.loads(
+            policy_bytes.decode("utf-8-sig"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_policy_object,
+        )
     except DatasetBuildError:
         raise
     except Exception as exc:
@@ -250,7 +270,7 @@ def _load_policy(policy_path: Any = None) -> tuple[dict[str, Any], str]:
         _nonnegative_int(budgets.get(name), f"budget {name}")
     if policy.get("connected_components") != "undirected transitive connected components":
         raise DatasetBuildError("connected-component policy is unsupported", code="invalid_policy")
-    return policy, canonical_json_sha256(policy)
+    return policy, canonical_json_sha256(policy), hashlib.sha256(policy_bytes).hexdigest()
 
 
 def _require_rdkit() -> tuple[Any, Any, Any, Any]:
@@ -491,7 +511,7 @@ def molecule_neighbor(
     if (not isinstance(entity_a, str) or _CHEMBL_ID.fullmatch(entity_a) is None
             or not isinstance(entity_b, str) or _CHEMBL_ID.fullmatch(entity_b) is None):
         raise DatasetBuildError("molecule neighbor records require canonical ChEMBL identities")
-    policy, _ = _load_policy(policy_path)
+    policy, _, _ = _load_policy(policy_path)
     if policy["budgets"]["molecule_pairs"] < 1:
         raise DatasetBuildError("molecule pair budget exceeded", code="size_limit")
     try:
@@ -626,7 +646,7 @@ def protein_neighbor(
 ) -> tuple[NeighborEvidence, ...]:
     record_a = _protein_record(protein_a)
     record_b = _protein_record(protein_b)
-    policy, _ = _load_policy(policy_path)
+    policy, _, _ = _load_policy(policy_path)
     if policy["budgets"]["protein_pairs"] < 1:
         raise DatasetBuildError("protein pair budget exceeded", code="size_limit")
     try:
@@ -834,6 +854,7 @@ def _split_failure(
     bundle: Optional[Mapping[str, Any]] = None,
     sources: tuple[Mapping[str, Any], ...] = (),
     test_only: bool = False,
+    policy_file_sha256: Optional[str] = None,
 ) -> SplitResult:
     return SplitResult(
         strict_split_status=status,
@@ -855,6 +876,7 @@ def _split_failure(
         split_sha256=None,
         error=error,
         test_only=test_only,
+        policy_file_sha256=policy_file_sha256,
     )
 
 
@@ -1033,7 +1055,7 @@ def _semantic_split_hash(
 
 def _build_public_cluster_result(entity_bundle_path: Any, *, policy_path: Any,
                                  molecule: bool) -> ClusterBuildResult:
-    policy, policy_hash = _load_policy(policy_path)
+    policy, policy_hash, _ = _load_policy(policy_path)
     try:
         _require_rdkit()
         if not molecule:
@@ -1073,7 +1095,23 @@ def strict_double_cold_split(
     """Split whole molecule/protein clusters and quarantine cross-partition pairs."""
     if type(allow_test_only) is not bool:
         raise DatasetBuildError("allow_test_only must be a boolean", code="invalid_input")
-    policy, policy_hash = _load_policy(policy_path)
+    split_policy_source = _POLICY_PATH if policy_path is None else Path(policy_path)
+    label_policy_source = _LABEL_POLICY_PATH if label_policy_path is None else Path(label_policy_path)
+    policy, policy_hash, policy_file_sha256 = _load_policy(split_policy_source)
+    try:
+        label_policy_bytes = label_policy_source.read_bytes()
+        label_policy_value = json.loads(
+            label_policy_bytes.decode("utf-8-sig"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_policy_object,
+        )
+        if not isinstance(label_policy_value, dict):
+            raise DatasetBuildError("label policy root must be an object", code="invalid_policy")
+        label_policy_semantic_sha256 = canonical_json_sha256(label_policy_value)
+        label_policy_schema_version = label_policy_value.get("schema_version")
+        label_policy_version = label_policy_value.get("policy_version")
+    except (OSError, UnicodeError, json.JSONDecodeError, DatasetBuildError) as exc:
+        raise DatasetBuildError(f"label policy could not be snapshotted: {exc}", code="invalid_policy") from exc
     try:
         _require_rdkit()
         _alignment_context(policy)
@@ -1119,7 +1157,7 @@ def strict_double_cold_split(
         label_result = apply_label_policy(
             groups,
             ledger=ledger,
-            policy_path=label_policy_path,
+            policy_path=label_policy_source,
             entity_bundle_path=resolved_path,
             allow_test_only=allow_test_only,
         )
@@ -1128,11 +1166,18 @@ def strict_double_cold_split(
             f"source-verified label policy rejected split input: {exc}",
             code="label_policy_rejected",
         ) from exc
+    label_policy_file_sha256 = hashlib.sha256(label_policy_bytes).hexdigest()
+    if label_result.policy_sha256 != label_policy_file_sha256:
+        raise DatasetBuildError("label policy bytes changed between snapshot and label evaluation", code="policy_changed")
 
     current_bundle, _ = _load_verified_bundle(resolved_path)
     if (current_bundle.get("entity_version") != bundle.get("entity_version")
             or current_bundle.get("content_sha256") != bundle.get("content_sha256")):
         raise DatasetBuildError("entity bundle changed while the split was being built", code="bundle_changed")
+    if hashlib.sha256(split_policy_source.read_bytes()).hexdigest() != policy_file_sha256:
+        raise DatasetBuildError("split policy changed while the split was being built", code="policy_changed")
+    if label_policy_source.read_bytes() != label_policy_bytes:
+        raise DatasetBuildError("label policy changed while the split was being built", code="policy_changed")
 
     confirmed_labels, test_only_labels, diagnostic_reasons = _decision_maps(label_result, groups)
     molecule_members = _cluster_membership(molecule_result.clusters)
@@ -1299,6 +1344,12 @@ def strict_double_cold_split(
         ambiguous_label_quarantine=ambiguous_tuple,
         test_only=(molecule_result.test_only or protein_result.test_only
                    or bool(test_only_tuple)),
+        policy_file_sha256=policy_file_sha256,
+        policy_schema_version=policy["schema_version"],
+        policy_version=policy["policy_version"],
+        label_policy_semantic_sha256=label_policy_semantic_sha256,
+        label_policy_schema_version=label_policy_schema_version,
+        label_policy_version=label_policy_version,
     )
 
 
@@ -1322,7 +1373,15 @@ def frozen_split_claim(result: SplitResult) -> dict[str, Any]:
     return {
         "strict_split_status": result.strict_split_status,
         "split_policy_sha256": result.policy_sha256,
+        "split_policy_file_sha256": result.policy_file_sha256,
+        "split_policy_semantic_sha256": result.policy_sha256,
+        "split_policy_schema_version": result.policy_schema_version,
+        "split_policy_version": result.policy_version,
         "label_policy_sha256": result.label_policy_sha256,
+        "label_policy_file_sha256": result.label_policy_sha256,
+        "label_policy_semantic_sha256": result.label_policy_semantic_sha256,
+        "label_policy_schema_version": result.label_policy_schema_version,
+        "label_policy_version": result.label_policy_version,
         "split_sha256": result.split_sha256,
         "entity_version": result.entity_version,
         "entity_bundle_hash": result.entity_bundle_hash,
@@ -1352,10 +1411,16 @@ def publish_frozen_dataset(
     from artifact_store import FrozenManifestWriter, FrozenWriteResult
 
     try:
+        split_policy_source = Path(_POLICY_PATH if policy_path is None else policy_path).expanduser()
+        label_policy_source = Path(_LABEL_POLICY_PATH if label_policy_path is None else label_policy_path).expanduser()
+        if not split_policy_source.is_absolute():
+            split_policy_source = Path.cwd() / split_policy_source
+        if not label_policy_source.is_absolute():
+            label_policy_source = Path.cwd() / label_policy_source
         result = strict_double_cold_split(
             entity_bundle_path,
-            policy_path=policy_path,
-            label_policy_path=label_policy_path,
+            policy_path=split_policy_source,
+            label_policy_path=label_policy_source,
             allow_test_only=allow_test_only,
         )
     except (DatasetBuildError, OSError, TypeError, ValueError) as exc:
@@ -1367,7 +1432,11 @@ def publish_frozen_dataset(
     try:
         claim = frozen_split_claim(result)
         writer = FrozenManifestWriter(output_root, version_id=version_id, code_root=Path(__file__).resolve().parent)
-        return writer.publish(entity_bundle_path, split=claim)
+        return writer.publish(
+            entity_bundle_path,
+            split=claim,
+            policy_paths={"split": split_policy_source, "label": label_policy_source},
+        )
     except (DatasetBuildError, TypeError, ValueError, OSError) as exc:
         return FrozenWriteResult("incomplete", 2, error=str(exc))
 

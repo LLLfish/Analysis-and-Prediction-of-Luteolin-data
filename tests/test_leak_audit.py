@@ -156,6 +156,8 @@ def _frozen_policy_refs(root: Path) -> tuple[dict, dict]:
         }
         claims[f"{name}_policy_file_sha256"] = hashlib.sha256(raw).hexdigest()
         claims[f"{name}_policy_semantic_sha256"] = semantic_hash
+        claims[f"{name}_policy_schema_version"] = parsed["schema_version"]
+        claims[f"{name}_policy_version"] = parsed["policy_version"]
         target = root / references[name]["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(raw)
@@ -532,6 +534,12 @@ def test_cli_alignment_budget_failure_returns_exit4_not_clean(tmp_path):
 
     assert completed.returncode == 4, (completed.stdout or "") + (completed.stderr or "")
     assert '"status": "size_limit"' in completed.stdout
+    audit_report = json.loads(completed.stdout)
+    frozen_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert audit_report["split_policy_sha256"] == frozen_manifest["policies"]["split"]["semantic_sha256"]
+    assert audit_report["split_policy_file_sha256"] == frozen_manifest["policies"]["split"]["file_sha256"]
+    assert "split_policy_hash_mismatch" not in {row["code"] for row in audit_report["findings"]}
+    assert "split_policy_hash_mismatch" not in {row["code"] for row in audit_report["findings"]}
 
 
 def test_cli_missing_bio_dependency_returns_exit4(tmp_path):

@@ -64,6 +64,8 @@ def _policy_bytes_and_hashes(root: Path | None = None) -> tuple[dict, dict]:
         }
         claims[f"{name}_policy_file_sha256"] = hashlib.sha256(raw).hexdigest()
         claims[f"{name}_policy_semantic_sha256"] = semantic_sha256
+        claims[f"{name}_policy_schema_version"] = value["schema_version"]
+        claims[f"{name}_policy_version"] = value["policy_version"]
         if root is not None:
             destination = root / references[name]["path"]
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -701,6 +703,11 @@ def test_custom_policies_are_frozen_and_default_audit_uses_only_snapshot_bytes(t
         encoding="utf-8", errors="replace", timeout=60, check=False,
     )
     assert audited.returncode == 0, (audited.stdout or "") + (audited.stderr or "")
+    audit_report = json.loads(audited.stdout)
+    assert audit_report["split_policy_sha256"] == refs["split"]["semantic_sha256"]
+    assert audit_report["split_policy_file_sha256"] == refs["split"]["file_sha256"]
+    assert audit_report["label_policy_sha256"] == refs["label"]["file_sha256"]
+    assert audit_report["label_policy_semantic_sha256"] == refs["label"]["semantic_sha256"]
 
     custom_split.write_bytes(b"changed after publication")
     custom_label.unlink()
@@ -709,6 +716,7 @@ def test_custom_policies_are_frozen_and_default_audit_uses_only_snapshot_bytes(t
         encoding="utf-8", errors="replace", timeout=60, check=False,
     )
     assert after_input_change.returncode == 0, (after_input_change.stdout or "") + (after_input_change.stderr or "")
+    assert json.loads(after_input_change.stdout)["split_policy_file_sha256"] == refs["split"]["file_sha256"]
 
     wrong_split = tmp_path / "wrong-split-policy.json"
     wrong_label = tmp_path / "wrong-label-policy.json"
@@ -727,10 +735,12 @@ def test_custom_policies_are_frozen_and_default_audit_uses_only_snapshot_bytes(t
 
     tamper_cases = (
         ("split", "path", "policies/other.json", "split_policy_path_mismatch"),
-        ("split", "file_sha256", "0" * 64, "split_policy_hash_mismatch"),
+        ("split", "file_sha256", "0" * 64, "split_policy_snapshot_hash_mismatch"),
+        ("split", "semantic_sha256", "1" * 64, "split_policy_semantic_mismatch"),
         ("split", "policy_version", "forged-split-v9", "split_policy_version_mismatch"),
         ("label", "path", "policies/other-label.json", "label_policy_path_mismatch"),
-        ("label", "file_sha256", "f" * 64, "label_policy_hash_mismatch"),
+        ("label", "file_sha256", "f" * 64, "label_policy_snapshot_hash_mismatch"),
+        ("label", "semantic_sha256", "2" * 64, "label_policy_semantic_mismatch"),
         ("label", "policy_version", "forged-label-v9", "label_policy_version_mismatch"),
     )
     for index, (kind, field, value, finding_code) in enumerate(tamper_cases):
@@ -742,6 +752,25 @@ def test_custom_policies_are_frozen_and_default_audit_uses_only_snapshot_bytes(t
         report = leak_audit.audit_split(tampered_path)
         assert report.exit_code == 3
         assert finding_code in {row.code for row in report.findings}
+
+    for index, (field, value, finding_code) in enumerate((
+        ("split_policy_file_sha256", "0" * 64, "split_policy_claim_mismatch"),
+        ("label_policy_sha256", "f" * 64, "label_policy_claim_mismatch"),
+    )):
+        tampered = json.loads(json.dumps(manifest))
+        tampered["split"][field] = value
+        tampered["semantic_sha256"] = _store().semantic_manifest_hash(tampered)
+        tampered_path = version_dir / f"tampered-policy-claim-{index}.json"
+        tampered_path.write_text(json.dumps(tampered, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        report = leak_audit.audit_split(tampered_path)
+        assert report.exit_code == 3
+        assert finding_code in {row.code for row in report.findings}
+
+    frozen_label = version_dir / refs["label"]["path"]
+    frozen_label.write_bytes(frozen_label.read_bytes() + b"\n")
+    label_tamper = leak_audit.audit_split(manifest_path)
+    assert label_tamper.exit_code == 3
+    assert "label_policy_snapshot_hash_mismatch" in {row.code for row in label_tamper.findings}
 
     frozen_split = version_dir / refs["split"]["path"]
     frozen_split.write_bytes(frozen_split.read_bytes() + b"\n")

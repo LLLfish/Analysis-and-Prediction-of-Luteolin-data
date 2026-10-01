@@ -26,6 +26,14 @@ _TIME_FIELDS = frozenset({
     "collected_at", "checked_at", "published_at", "last_modified",
 })
 _CODE_ROOT = Path(__file__).resolve().parent
+_DEFAULT_POLICY_PATHS = {
+    "split": _CODE_ROOT / "policies" / "split_policy.json",
+    "label": _CODE_ROOT / "policies" / "label_policy.json",
+}
+_POLICY_RELATIVE_PATHS = {
+    "split": "policies/split_policy.json",
+    "label": "policies/label_policy.json",
+}
 
 
 class FrozenArtifactError(ValueError):
@@ -61,6 +69,74 @@ def _canonical_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise FrozenArtifactError(f"manifest contains a non-canonical JSON value: {exc}") from exc
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise FrozenArtifactError(f"policy contains a duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _read_policy_sources(
+    policy_paths: Any,
+    split: Mapping[str, Any],
+) -> dict[str, tuple[Path, bytes, dict[str, Any]]]:
+    if policy_paths is None:
+        requested = _DEFAULT_POLICY_PATHS
+    elif isinstance(policy_paths, Mapping) and set(policy_paths) == {"split", "label"}:
+        requested = policy_paths
+    else:
+        raise FrozenArtifactError("policy_paths must identify exactly one split and one label policy")
+    result: dict[str, tuple[Path, bytes, dict[str, Any]]] = {}
+    bindings = {
+        "split": {
+            "file_sha256": split.get("split_policy_file_sha256"),
+            "semantic_sha256": split.get("split_policy_sha256"),
+            "schema_version": split.get("split_policy_schema_version"),
+            "policy_version": split.get("split_policy_version"),
+        },
+        "label": {
+            "file_sha256": split.get("label_policy_sha256"),
+            "semantic_sha256": split.get("label_policy_semantic_sha256"),
+            "schema_version": split.get("label_policy_schema_version"),
+            "policy_version": split.get("label_policy_version"),
+        },
+    }
+    for kind in ("split", "label"):
+        raw_path = requested[kind]
+        if raw_path is None or not os.fspath(raw_path).strip():
+            raise FrozenArtifactError(f"{kind} policy path must be non-empty")
+        unresolved = Path(raw_path).expanduser()
+        _assert_no_reparse_components(unresolved)
+        source_path = unresolved.resolve(strict=True)
+        if not source_path.is_file() or _is_reparse_path(source_path):
+            raise FrozenArtifactError(f"{kind} policy input must be a regular non-reparse file")
+        raw = source_path.read_bytes()
+        try:
+            policy = json.loads(
+                raw.decode("utf-8-sig"),
+                parse_constant=lambda token: (_ for _ in ()).throw(FrozenArtifactError(f"non-finite policy number: {token}")),
+                object_pairs_hook=_unique_json_object,
+            )
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise FrozenArtifactError(f"{kind} policy input is not strict UTF-8 JSON: {exc}") from exc
+        if not isinstance(policy, Mapping):
+            raise FrozenArtifactError(f"{kind} policy input root must be an object")
+        actual = {
+            "file_sha256": hashlib.sha256(raw).hexdigest(),
+            "semantic_sha256": canonical_json_sha256(policy),
+            "schema_version": policy.get("schema_version"),
+            "policy_version": policy.get("policy_version"),
+        }
+        expected = bindings[kind]
+        if actual != expected:
+            raise FrozenArtifactError(f"{kind} policy input does not match the policy hashes/version used by the split")
+        reference = {"path": _POLICY_RELATIVE_PATHS[kind], **actual}
+        result[kind] = (source_path, raw, reference)
+    return result
 
 
 def _without_time_fields(value: Any) -> Any:
@@ -272,7 +348,11 @@ def _validate_split_claim(split: Any, bundle: Mapping[str, Any]) -> dict[str, An
             raise FrozenArtifactError(f"split claim {key} does not match the source-verified entity bundle")
         result[key] = expected
     required = (
-        "strict_split_status", "split_policy_sha256", "molecule_memberships", "protein_memberships",
+        "strict_split_status", "split_policy_sha256", "split_policy_file_sha256",
+        "split_policy_semantic_sha256", "split_policy_schema_version", "split_policy_version",
+        "label_policy_sha256", "label_policy_file_sha256", "label_policy_semantic_sha256",
+        "label_policy_schema_version", "label_policy_version",
+        "molecule_memberships", "protein_memberships",
         "pair_assignments", "crosspair_quarantine", "unassigned_pairs", "test_only_pair_assignments",
         "ambiguous_label_quarantine", "class_support", "training_ready",
     )
@@ -280,6 +360,9 @@ def _validate_split_claim(split: Any, bundle: Mapping[str, Any]) -> dict[str, An
         raise FrozenArtifactError("split claim omits a required assignment/readiness ledger")
     if type(result.get("training_ready")) is not bool:
         raise FrozenArtifactError("split claim training_ready must be boolean")
+    if (result.get("split_policy_semantic_sha256") != result.get("split_policy_sha256")
+            or result.get("label_policy_file_sha256") != result.get("label_policy_sha256")):
+        raise FrozenArtifactError("split claim policy semantic/file hashes are inconsistent")
     return result
 
 
@@ -299,7 +382,13 @@ class FrozenManifestWriter:
         self.version_id = version_id
         self.code_root = Path(code_root).resolve(strict=False) if code_root is not None else _CODE_ROOT
 
-    def publish(self, entity_bundle_path: os.PathLike[str] | str, *, split: Mapping[str, Any]) -> FrozenWriteResult:
+    def publish(
+        self,
+        entity_bundle_path: os.PathLike[str] | str,
+        *,
+        split: Mapping[str, Any],
+        policy_paths: Optional[Mapping[str, Any]] = None,
+    ) -> FrozenWriteResult:
         try:
             if not isinstance(self.version_id, str) or not _VERSION_ID.fullmatch(self.version_id) or self.version_id in {".", ".."}:
                 raise FrozenArtifactError("version_id must be a simple filesystem-safe identifier")
@@ -314,9 +403,12 @@ class FrozenManifestWriter:
             bundle_bytes = entity_path.read_bytes()
             bundle = load_entity_bundle(entity_path, verify_sources=True)
             split_payload = _validate_split_claim(split, bundle)
+            policy_sources = _read_policy_sources(policy_paths, split_payload)
             version_dir = output_root / self.version_id
             if _intersects(version_dir, bundle_root):
                 raise FrozenArtifactError("frozen output version intersects its source bundle")
+            if any(_intersects(version_dir, source_path) for source_path, _raw, _ref in policy_sources.values()):
+                raise FrozenArtifactError("frozen output version intersects a source policy file")
             output_root.mkdir(parents=True, exist_ok=True)
             _assert_no_reparse_components(output_root)
             claim, existing_manifest = _exclusive_claim(version_dir)
@@ -365,10 +457,22 @@ class FrozenManifestWriter:
                 _assert_no_reparse_components(destination.parent)
                 _write_atomic(destination, snapshots[relative][1], token, temporary_paths)
 
+            for kind in ("split", "label"):
+                _source_path, policy_bytes, reference = policy_sources[kind]
+                destination = version_dir / Path(reference["path"])
+                try:
+                    destination.resolve(strict=False).relative_to(version_dir.resolve(strict=True))
+                except ValueError as exc:
+                    raise FrozenArtifactError(f"frozen {kind} policy destination escapes claimed version") from exc
+                _assert_no_reparse_components(destination.parent)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _assert_no_reparse_components(destination.parent)
+                _write_atomic(destination, policy_bytes, token, temporary_paths)
+
             activity_rows = bundle.get("activities", [])
             pair_payload = _pair_payload(split_payload)
             manifest: dict[str, Any] = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "version_id": self.version_id,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "entities": {
@@ -379,6 +483,7 @@ class FrozenManifestWriter:
                     "file_sha256": hashlib.sha256(bundle_bytes).hexdigest(),
                 },
                 "source_provenance": deepcopy(bundle.get("source_provenance", [])),
+                "policies": {kind: dict(policy_sources[kind][2]) for kind in ("split", "label")},
                 "activities": {
                     "entity_version": bundle["entity_version"],
                     "entity_bundle_hash": bundle["content_sha256"],
@@ -429,6 +534,13 @@ class FrozenManifestWriter:
                     frozen_path = version_dir / Path(relative)
                     if hashlib.sha256(frozen_path.read_bytes()).hexdigest() != expected_hash:
                         raise FrozenArtifactError(f"frozen raw or metadata bytes changed before manifest commit: {relative}")
+                for kind in ("split", "label"):
+                    source_path, original_bytes, reference = policy_sources[kind]
+                    if source_path.read_bytes() != original_bytes:
+                        raise FrozenArtifactError(f"{kind} policy input changed while audit ran")
+                    frozen_path = version_dir / Path(reference["path"])
+                    if frozen_path.read_bytes() != original_bytes:
+                        raise FrozenArtifactError(f"frozen {kind} policy bytes changed before manifest commit")
 
             verify_source_snapshots()
 

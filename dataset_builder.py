@@ -85,6 +85,7 @@ class PairSplitAssignment:
     reasons: tuple[str, ...] = ()
     evidence_ids: tuple[str, ...] = ()
     group_sha256: Optional[str] = None
+    evidence_records_json: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class SplitResult:
     test_only_pair_assignments: tuple[PairSplitAssignment, ...]
     class_support: Mapping[str, Mapping[str, int]]
     split_sha256: Optional[str]
+    ambiguous_label_quarantine: tuple[PairSplitAssignment, ...] = ()
     error: Optional[str] = None
     test_only: bool = False
 
@@ -951,6 +953,7 @@ def _assignment_for_group(
         reasons=tuple(sorted(set(reasons))),
         evidence_ids=tuple(sorted(group.evidence_ids)),
         group_sha256=group.group_sha256,
+        evidence_records_json=tuple(group.records_json),
     )
 
 
@@ -960,10 +963,14 @@ def _class_support(assignments: Iterable[PairSplitAssignment]) -> dict[str, dict
         for split in ("train", "val", "test")
     }
     for assignment in assignments:
-        if assignment.split in group_ids:
-            for label in assignment.labels:
-                if label in group_ids[assignment.split]:
-                    group_ids[assignment.split][label].add(assignment.split_group_id)
+        labels = set(assignment.labels)
+        if (assignment.split not in group_ids
+                or assignment.provenance_partition != "confirmed"
+                or len(labels) != 1):
+            continue
+        label = next(iter(labels))
+        if label in group_ids[assignment.split]:
+            group_ids[assignment.split][label].add(assignment.split_group_id)
     return {
         split: {label: len(values) for label, values in labels.items()}
         for split, labels in group_ids.items()
@@ -979,6 +986,7 @@ def _semantic_split_hash(
     crosspairs: tuple[PairSplitAssignment, ...],
     unassigned: tuple[PairSplitAssignment, ...],
     test_only_assignments: tuple[PairSplitAssignment, ...],
+    ambiguous_quarantine: tuple[PairSplitAssignment, ...],
     support: Mapping[str, Mapping[str, int]], ledger_hash: str,
 ) -> str:
     payload = {
@@ -1000,6 +1008,7 @@ def _semantic_split_hash(
         "crosspair_quarantine": [asdict(row) for row in crosspairs],
         "unassigned_pairs": [asdict(row) for row in unassigned],
         "test_only_pair_assignments": [asdict(row) for row in test_only_assignments],
+        "ambiguous_label_quarantine": [asdict(row) for row in ambiguous_quarantine],
         "class_support": {key: dict(value) for key, value in sorted(support.items())},
     }
     return canonical_json_sha256(payload)
@@ -1055,18 +1064,38 @@ def strict_double_cold_split(
         return _split_failure(exc.code, policy_hash, str(exc))
     bundle, resolved_path = _load_verified_bundle(entity_bundle_path)
     sources = _bundle_sources(bundle)
-    molecule_result = _molecule_cluster_from_bundle(bundle, policy, policy_hash, sources)
-    protein_result = _protein_cluster_from_bundle(bundle, policy, policy_hash, sources)
-    for cluster_result in (molecule_result, protein_result):
-        if cluster_result.status in {"size_limit", "dependency_missing"}:
-            return _split_failure(
-                cluster_result.status,
-                policy_hash,
-                cluster_result.error or cluster_result.status,
-                bundle=bundle,
-                sources=sources,
-                test_only=cluster_result.test_only,
-            )
+    try:
+        molecule_result = _molecule_cluster_from_bundle(bundle, policy, policy_hash, sources)
+    except _BuildAbort as exc:
+        return _split_failure(
+            exc.code, policy_hash, str(exc), bundle=bundle, sources=sources,
+            test_only=_bundle_is_test_only(bundle),
+        )
+    if molecule_result.status in {"size_limit", "dependency_missing"}:
+        return _split_failure(
+            molecule_result.status,
+            policy_hash,
+            molecule_result.error or molecule_result.status,
+            bundle=bundle,
+            sources=sources,
+            test_only=molecule_result.test_only,
+        )
+    try:
+        protein_result = _protein_cluster_from_bundle(bundle, policy, policy_hash, sources)
+    except _BuildAbort as exc:
+        return _split_failure(
+            exc.code, policy_hash, str(exc), bundle=bundle, sources=sources,
+            test_only=molecule_result.test_only or _bundle_is_test_only(bundle),
+        )
+    if protein_result.status in {"size_limit", "dependency_missing"}:
+        return _split_failure(
+            protein_result.status,
+            policy_hash,
+            protein_result.error or protein_result.status,
+            bundle=bundle,
+            sources=sources,
+            test_only=molecule_result.test_only or protein_result.test_only,
+        )
 
     try:
         groups, ledger = group_evidence(bundle["activities"])
@@ -1097,6 +1126,7 @@ def strict_double_cold_split(
     crosspairs: list[PairSplitAssignment] = []
     unassigned: list[PairSplitAssignment] = []
     test_only_assignments: list[PairSplitAssignment] = []
+    ambiguous_quarantine: list[PairSplitAssignment] = []
 
     for group in sorted(groups, key=lambda row: (row.pair_key, row.split_group_id)):
         molecule_cluster_id = molecule_members.get(group.molecule_chembl_id)
@@ -1107,6 +1137,40 @@ def strict_double_cold_split(
         labels = confirmed or test_labels
         partition = "confirmed" if confirmed else "test_only" if test_labels else "unlabeled"
         diagnostics = diagnostic_reasons.get(group.pair_key, set())
+        is_ambiguous = len(confirmed) > 1 or (not confirmed and len(test_labels) > 1)
+        if is_ambiguous:
+            reasons = diagnostics | {"ambiguous_multi_label"}
+            row = _assignment_for_group(
+                group,
+                molecule_cluster_id=molecule_cluster_id,
+                protein_cluster_id=protein_cluster_id,
+                split=None,
+                labels=labels,
+                provenance_partition=partition,
+                reasons=reasons,
+            )
+            ambiguous_quarantine.append(row)
+            if molecule_cluster_id is None or protein_cluster_id is None:
+                unassigned.append(_assignment_for_group(
+                    group,
+                    molecule_cluster_id=molecule_cluster_id,
+                    protein_cluster_id=protein_cluster_id,
+                    split=None,
+                    labels=labels,
+                    provenance_partition=partition,
+                    reasons=reasons | {"entity_not_clusterable"},
+                ))
+            elif molecule_assignments[molecule_cluster_id] != protein_assignments[protein_cluster_id]:
+                crosspairs.append(_assignment_for_group(
+                    group,
+                    molecule_cluster_id=molecule_cluster_id,
+                    protein_cluster_id=protein_cluster_id,
+                    split=None,
+                    labels=labels,
+                    provenance_partition=partition,
+                    reasons=reasons | {"crosspair_cluster_partition_mismatch"},
+                ))
+            continue
         if molecule_cluster_id is None or protein_cluster_id is None:
             row = _assignment_for_group(
                 group,
@@ -1166,10 +1230,12 @@ def strict_double_cold_split(
     crosspairs.sort(key=lambda row: (row.pair_key, row.split_group_id))
     unassigned.sort(key=lambda row: (row.pair_key, row.split_group_id))
     test_only_assignments.sort(key=lambda row: (row.split or "", row.pair_key, row.split_group_id))
+    ambiguous_quarantine.sort(key=lambda row: (row.pair_key, row.split_group_id))
     pair_assignments_tuple = tuple(pair_assignments)
     crosspairs_tuple = tuple(crosspairs)
     unassigned_tuple = tuple(unassigned)
     test_only_tuple = tuple(test_only_assignments)
+    ambiguous_tuple = tuple(ambiguous_quarantine)
     support = _class_support(pair_assignments_tuple)
     strict_status = (
         "ready"
@@ -1191,6 +1257,7 @@ def strict_double_cold_split(
         crosspairs=crosspairs_tuple,
         unassigned=unassigned_tuple,
         test_only_assignments=test_only_tuple,
+        ambiguous_quarantine=ambiguous_tuple,
         support=support,
         ledger_hash=label_result.ledger.sha256,
     )
@@ -1212,6 +1279,7 @@ def strict_double_cold_split(
         test_only_pair_assignments=test_only_tuple,
         class_support=support,
         split_sha256=split_hash,
+        ambiguous_label_quarantine=ambiguous_tuple,
         test_only=(molecule_result.test_only or protein_result.test_only
                    or bool(test_only_tuple)),
     )

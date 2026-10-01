@@ -294,6 +294,26 @@ def test_fixture_manifest_accounts_for_every_synthetic_and_legacy_record(ppi_fix
             assert len(matching[0].source_record_hash) == 64
 
 
+def test_conflicting_direct_native_identity_fields_are_quarantined_as_a_group():
+    conflicting = {
+        "stringId_A": "9606.ENSP00000354587",
+        "source_native_id_a": "9606.ENSP00000263967",
+        "stringId_B": "9606.ENSP00000263967",
+        "ncbiTaxonId": 9606,
+        "score": 0.5,
+    }
+    rejected = canonicalize_ppi([conflicting], source_kind="synthetic_test")
+    assert rejected.status == "invalid"
+    assert rejected.edge_count == 0
+    assert [issue.code for issue in rejected.issues] == ["conflicting_native_identity"]
+    assert rejected.issues[0].field == "stringId_A|source_native_id_a"
+
+    consistent = dict(conflicting, source_native_id_a="9606.ENSP00000354587")
+    accepted = canonicalize_ppi([consistent], source_kind="synthetic_test")
+    assert accepted.status == "ready"
+    assert accepted.edge_count == 1
+
+
 def test_score_boundaries_and_invalid_types_have_explicit_ledger_codes():
     base = {
         "source_native_id_a": "9606.ENSP00000354587",

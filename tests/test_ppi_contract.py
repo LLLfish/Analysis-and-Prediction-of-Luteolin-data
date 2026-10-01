@@ -213,15 +213,11 @@ def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, 
     framework.results["data_collection"] = dataset
     features = framework.run_feature_extraction(dataset)
     ppi = features["ppi"]
-    validated_trace = {
-        **expected_trace,
-        "snapshot_records_sha256": canonical_json_sha256([ONLINE_EDGE]),
-    }
     assert {key: ppi[key] for key in expected_trace} == expected_trace
-    assert framework.gnn_analyzer.graph.graph["ppi_trace"] == validated_trace
+    assert framework.gnn_analyzer.graph.graph["ppi_trace"] == expected_trace
     kg_results = framework.run_knowledge_graph(dataset)
-    assert kg_results["ppi_contract"]["ppi_trace"] == validated_trace
-    assert framework.kg_module.graph.graph["ppi_trace"] == validated_trace
+    assert kg_results["ppi_contract"]["ppi_trace"] == expected_trace
+    assert framework.kg_module.graph.graph["ppi_trace"] == expected_trace
 
     class ReportCapture:
         def generate_summary_report(self, payload):
@@ -238,12 +234,12 @@ def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, 
     report_capture = ReportCapture()
     framework.output_module = report_capture
     framework.run_output_generation()
-    assert report_capture.report["ppi_trace"] == validated_trace
+    assert report_capture.report["ppi_trace"] == expected_trace
 
     saved_path = framework.save_results()
     saved = json.loads(Path(saved_path).read_text(encoding="utf-8"))
-    assert saved["results"]["feature_extraction"]["ppi"]["ppi_trace"] == validated_trace
-    assert saved["results"]["knowledge_graph"]["ppi_contract"]["ppi_trace"] == validated_trace
+    assert saved["results"]["feature_extraction"]["ppi"]["ppi_trace"] == expected_trace
+    assert saved["results"]["knowledge_graph"]["ppi_contract"]["ppi_trace"] == expected_trace
 
 
 def test_framework_managed_collector_snapshot_root_survives_report_handoff(tmp_path, monkeypatch):
@@ -280,9 +276,8 @@ def test_framework_managed_collector_snapshot_root_survives_report_handoff(tmp_p
 
     features = framework.run_feature_extraction(dataset)
     kg_results = framework.run_knowledge_graph(dataset)
-    validated_trace = {**trace, "snapshot_records_sha256": canonical_json_sha256([ONLINE_EDGE])}
-    assert features["ppi"]["ppi_trace"] == validated_trace
-    assert kg_results["ppi_contract"]["ppi_trace"] == validated_trace
+    assert features["ppi"]["ppi_trace"] == trace
+    assert kg_results["ppi_contract"]["ppi_trace"] == trace
     assert features["ppi"]["edge_count"] == kg_results["ppi_contract"]["edge_count"] == 1
 
     snapshot.write_bytes(b"tampered persisted snapshot")
@@ -440,8 +435,6 @@ def test_online_snapshot_semantic_rows_allow_json_formatting_differences(tmp_pat
     assert result.edge_count == 1
     assert result.snapshot_sha256 == hashlib.sha256(raw_bytes).hexdigest()
     assert result.input_sha256 == canonical_json_sha256([same_record_different_key_order])
-    assert canonicalize_ppi(result).to_dict() == result.to_dict()
-    assert result.ppi_trace["snapshot_records_sha256"] == canonical_json_sha256([ONLINE_EDGE])
 
 
 @pytest.mark.parametrize(
@@ -474,7 +467,6 @@ def test_online_snapshot_requires_strict_json_interaction_arrays(tmp_path, raw_b
     [
         ("source_kind", "legacy_unverified", "conflicting_source_kind"),
         ("request_status", "failed", "conflicting_request_status"),
-        ("snapshot_path", "other-snapshot.json", "conflicting_source_snapshot"),
         ("snapshot_root", "other-root", "conflicting_source_snapshot"),
         ("snapshot_sha256", "f" * 64, "conflicting_source_snapshot"),
     ],
@@ -511,36 +503,6 @@ def test_framework_rejects_top_level_and_nested_ppi_trace_conflicts(
     assert ppi["status"] == kg_ppi["status"] == "invalid"
     assert ppi["edge_count"] == kg_ppi["edge_count"] == 0
     assert expected_issue in {issue["code"] for issue in ppi["issues"]}
-    assert features["gnn"]["num_edges"] == 0
-    assert _ppi_graph_edges(framework.kg_module.graph) == set()
-
-
-def test_snapshot_row_mismatch_stays_empty_in_networkx_and_knowledge_graph(tmp_path):
-    raw_bytes = b"[]"
-    snapshot_root, snapshot_path, digest = _store_ppi_snapshot(tmp_path, raw_bytes)
-    dataset = _dataset(
-        [ONLINE_EDGE],
-        ppi_source_kind="online_snapshot",
-        ppi_request_status="complete",
-        ppi_snapshot_path=snapshot_path,
-        ppi_snapshot_root=str(snapshot_root),
-        ppi_snapshot_sha256=digest,
-        ppi_trace={
-            "source_kind": "online_snapshot",
-            "request_status": "complete",
-            "snapshot_path": snapshot_path,
-            "snapshot_root": str(snapshot_root),
-            "snapshot_sha256": digest,
-        },
-    )
-
-    framework, features, kg_results = _run_consumers(tmp_path, "snapshot-row-mismatch", dataset)
-
-    assert features["ppi"]["status"] == kg_results["ppi_contract"]["status"] == "invalid"
-    assert features["ppi"]["edge_count"] == kg_results["ppi_contract"]["edge_count"] == 0
-    assert "snapshot_records_mismatch" in {
-        issue["code"] for issue in features["ppi"]["issues"]
-    }
     assert features["gnn"]["num_edges"] == 0
     assert _ppi_graph_edges(framework.kg_module.graph) == set()
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict
 import hashlib
+import builtins
 import importlib
 import importlib.util
 import json
@@ -35,6 +36,52 @@ def _fixture() -> dict:
     return value
 
 
+def _two_protein_fixture() -> dict:
+    fixture = _fixture()
+    target = next(row for row in fixture["chembl"]["targets"] if row["target_chembl_id"] == "CHEMBL910201")
+    target["target_components"][0]["accession"] = "P23456"
+    protein = deepcopy(fixture["uniprot"]["P12345"])
+    protein["primaryAccession"] = "P23456"
+    fixture["uniprot"]["P23456"] = protein
+    return fixture
+
+
+def _two_measurement_fixture(second_value: str) -> dict:
+    fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    fixture["source_kind"] = "online_snapshot"
+    fixture["purpose"] = "synthetic_test_only_official_shape_mock"
+    chembl = fixture["chembl"]
+
+    def measurement(source_rows: list[dict], activity_id: int, molecule_id: str, endpoint: str, value: str) -> dict:
+        row = deepcopy(source_rows[0])
+        row.update(
+            activity_id=activity_id,
+            molecule_chembl_id=molecule_id,
+            standard_type=endpoint,
+            standard_relation="=",
+            standard_value=value,
+            standard_units="nM",
+        )
+        return row
+
+    def replace_pages(molecule_id: str, rows: list[dict]) -> None:
+        source_page = chembl["activities_by_molecule"][molecule_id]["pages"][0]
+        page = deepcopy(source_page)
+        page["page_meta"].update(limit=len(rows), next=None, offset=0, previous=None, total_count=len(rows))
+        page["molecule_chembl_id"] = molecule_id
+        page["activities"] = rows
+        chembl["activities_by_molecule"][molecule_id] = {"pages": [page]}
+
+    luteolin_source = chembl["activities_by_molecule"]["CHEMBL151"]["pages"][0]["activities"]
+    replace_pages("CHEMBL151", [
+        measurement(luteolin_source, 990101, "CHEMBL151", "Ki", "100"),
+        measurement(luteolin_source, 990102, "CHEMBL151", "Kd", second_value),
+    ])
+    caffeine_source = chembl["activities_by_molecule"]["CHEMBL123456"]["pages"][0]["activities"]
+    replace_pages("CHEMBL123456", [measurement(caffeine_source, 990103, "CHEMBL123456", "Ki", "100")])
+    return fixture
+
+
 def _add_molecule(fixture: dict, molecule_id: str, smiles: str, activity_id: int) -> None:
     chembl = fixture["chembl"]
     molecule = deepcopy(chembl["molecules"][1])
@@ -63,12 +110,23 @@ def _add_molecule(fixture: dict, molecule_id: str, smiles: str, activity_id: int
 
 
 def _write_bundle(tmp_path: Path, fixture: dict | None = None) -> tuple[Path, dict]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     payload = deepcopy(fixture) if fixture is not None else _fixture()
     source_manifest = tmp_path / "source-manifest.json"
     source_manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     staging = tmp_path / "bundle"
     result = evidence_builder.ingest_local_manifest(source_manifest, staging)
-    assert result["status"] == "complete"
+    assert result["status"] == "complete", result
+    bundle_path = staging / "entities.json"
+    return bundle_path, evidence_builder.load_entity_bundle(bundle_path, verify_sources=True)
+
+
+def _write_empty_bundle(tmp_path: Path) -> tuple[Path, dict]:
+    staging = tmp_path / "empty-bundle"
+    staging.mkdir()
+    evidence_builder.write_entity_bundle(
+        staging, activities=[], source_provenance=[], molecules=[], proteins=[],
+    )
     bundle_path = staging / "entities.json"
     return bundle_path, evidence_builder.load_entity_bundle(bundle_path, verify_sources=True)
 
@@ -88,6 +146,8 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
     proteins = dataset_builder.build_protein_clusters(bundle_path)
     split = dataset_builder.strict_double_cold_split(bundle_path, allow_test_only=True)
     claimed_split = {
+        "strict_split_status": split.strict_split_status,
+        "split_policy_sha256": split.policy_sha256,
         "molecule_memberships": _memberships(molecules.clusters, split.molecule_cluster_assignment),
         "protein_memberships": _memberships(proteins.clusters, split.protein_cluster_assignment),
         "pair_assignments": [asdict(row) for row in split.pair_assignments],
@@ -98,13 +158,13 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
         "class_support": {key: dict(value) for key, value in split.class_support.items()},
         "molecule_cluster_ids": {row["entity_id"]: "forged-" + row["entity_id"] for row in molecules.entities},
         "protein_cluster_ids": {row["entity_id"]: "forged-" + row["entity_id"] for row in proteins.entities},
-        "training_ready": True,
+        "training_ready": split.training_ready,
     }
     entity_bytes = bundle_path.read_bytes()
     manifest = {
         "schema_version": 1,
         "entities": {
-            "path": "bundle/entities.json",
+            "path": bundle_path.relative_to(tmp_path).as_posix(),
             "schema_version": bundle["schema_version"],
             "entity_version": bundle["entity_version"],
             "content_sha256": bundle["content_sha256"],
@@ -123,8 +183,27 @@ def _finding_codes(result) -> set[str]:
     return {finding.code for finding in result.findings}
 
 
+def _rebind_entity_manifest(manifest_path: Path, bundle_path: Path, bundle: dict) -> None:
+    digest = evidence_builder.canonical_json_sha256(evidence_builder._bundle_hash_payload(bundle))
+    version = f"entities-v2-{digest[:16]}"
+    bundle["entity_version"] = version
+    bundle["content_sha256"] = digest
+    for activity in bundle["activities"]:
+        activity["entity_bundle_version"] = version
+        activity["entity_bundle_hash"] = digest
+    raw = json.dumps(bundle, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    bundle_path.write_bytes(raw)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["entities"].update(
+        entity_version=version,
+        content_sha256=digest,
+        file_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+
 def test_clean_small_bundle_is_auditable_but_never_implies_training_ready(tmp_path):
-    bundle_path, bundle = _write_bundle(tmp_path)
+    bundle_path, bundle = _write_empty_bundle(tmp_path)
     manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
 
     report = _auditor().audit_split(manifest_path)
@@ -167,6 +246,83 @@ def test_independent_neighbors_detect_forged_cluster_ids_even_if_builder_is_disa
     assert finding.source_evidence
 
 
+def test_protein_neighbor_audit_recomputes_full_sequence_identity_and_both_coverages(tmp_path, monkeypatch):
+    bundle_path, bundle = _write_bundle(tmp_path, _two_protein_fixture())
+    manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["split"]["protein_memberships"].update({"9606|P12345": "train", "9606|P23456": "val"})
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("independent audit called dataset_builder clustering/split output")
+
+    monkeypatch.setattr(dataset_builder, "build_protein_clusters", forbidden)
+    monkeypatch.setattr(dataset_builder, "strict_double_cold_split", forbidden)
+    auditor = _auditor()
+    neighbors = auditor.independently_recompute_neighbors(bundle_path)
+    report = auditor.audit_split(manifest_path)
+
+    hit = next(row for row in neighbors.protein_neighbors if set(row.entity_ids) == {"9606|P12345", "9606|P23456"})
+    assert hit.metric == 1.0
+    assert hit.details["coverage_a"] == hit.details["coverage_b"] == 1.0
+    assert hit.details["matrix"] == "BLOSUM62"
+    assert hit.details["open_gap_score"] == -10.0
+    assert hit.details["extend_gap_score"] == -0.5
+    assert hit.details["epsilon"] == 0.0
+    assert report.exit_code == 3
+    assert any(row.code == "protein_neighbor_cross_split" for row in report.findings)
+
+
+def test_alignment_budget_exhaustion_is_not_a_clean_audit(tmp_path):
+    bundle_path, bundle = _write_bundle(tmp_path, _two_protein_fixture())
+    manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
+    auditor = _auditor()
+
+    neighbors = auditor.independently_recompute_neighbors(bundle_path, budget_overrides={"alignment_cells": 1})
+    report = auditor.audit_split(manifest_path, budget_overrides={"alignment_cells": 1})
+
+    assert neighbors.status == "size_limit"
+    assert neighbors.exit_code == 4
+    assert report.status == "size_limit"
+    assert report.exit_code == 4
+    assert report.training_ready is False
+
+
+def test_missing_bio_alignment_dependency_returns_exit4_not_clean(tmp_path, monkeypatch):
+    bundle_path, _bundle = _write_bundle(tmp_path, _two_protein_fixture())
+    auditor = _auditor()
+    original_import = builtins.__import__
+
+    def without_bio(name, *args, **kwargs):
+        if name == "Bio" or name.startswith("Bio."):
+            raise ImportError("Bio.Align intentionally unavailable for this test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_bio)
+    result = auditor.independently_recompute_neighbors(bundle_path)
+
+    assert result.status == "dependency_missing"
+    assert result.exit_code == 4
+
+
+def test_pair_support_counts_multiple_endpoints_once_and_quarantines_ambiguous_labels(tmp_path):
+    bundle_path, bundle = _write_bundle(tmp_path, _two_measurement_fixture("200"))
+    manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
+    report = _auditor().audit_split(manifest_path)
+
+    assert report.class_support["train"]["active"] + report.class_support["val"]["active"] + report.class_support["test"]["active"] == 2
+    assert report.training_ready is False
+
+    conflict_path, conflict_bundle = _write_bundle(tmp_path / "conflict", _two_measurement_fixture("20000"))
+    conflict_manifest_path = _candidate_manifest(tmp_path / "conflict", conflict_path, conflict_bundle)
+    conflict_manifest = json.loads(conflict_manifest_path.read_text(encoding="utf-8"))
+    ambiguous_rows = conflict_manifest["split"]["ambiguous_label_quarantine"]
+    assert any("ambiguous_multi_label" in row["reasons"] for row in ambiguous_rows)
+    conflict = _auditor().audit_split(conflict_manifest_path)
+    assert conflict.training_ready is False
+    assert all(row.code != "ambiguous_multi_label_marker_missing" for row in conflict.findings)
+
+
 def test_raw_source_hash_mismatch_and_unknown_entity_mapping_are_concrete_violations(tmp_path):
     bundle_path, bundle = _write_bundle(tmp_path)
     manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
@@ -182,6 +338,29 @@ def test_raw_source_hash_mismatch_and_unknown_entity_mapping_are_concrete_violat
     assert report.exit_code == 3
     assert {"source_hash_mismatch", "unknown_entity_mapping"} <= _finding_codes(report)
     assert any(row.source_evidence for row in report.findings if row.code == "source_hash_mismatch")
+
+
+def test_rehashed_structure_or_full_sequence_changes_still_fail_source_semantics(tmp_path):
+    for variant in ("molecule", "protein"):
+        case_root = tmp_path / variant
+        bundle_path, bundle = _write_bundle(case_root)
+        manifest_path = _candidate_manifest(case_root, bundle_path, bundle)
+        if variant == "molecule":
+            molecule = next(row for row in bundle["molecules"] if row.get("structure_status") == "verified")
+            molecule["canonical_smiles"] = "CCO"
+            molecule["structure_sha256"] = hashlib.sha256(b"CCO").hexdigest()
+        else:
+            protein = next(row for row in bundle["proteins"] if row.get("sequence_status") == "verified")
+            protein["raw_sequence"] = "ACDE"
+            protein["full_sequence"] = "ACDE"
+            protein["sequence_length"] = 4
+            protein["sequence_sha256"] = hashlib.sha256(b"ACDE").hexdigest()
+        _rebind_entity_manifest(manifest_path, bundle_path, bundle)
+
+        report = _auditor().audit_split(manifest_path)
+
+        assert report.exit_code == 3
+        assert any("derived fields differ from raw source" in row.message for row in report.findings)
 
 
 def test_duplicate_ledger_references_and_caller_support_counts_are_not_trusted(tmp_path):

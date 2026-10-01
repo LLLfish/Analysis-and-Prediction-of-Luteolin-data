@@ -593,9 +593,13 @@ def _verified_bundle_membership(
     record: Mapping[str, Any],
     bundle: Optional[Mapping[str, Any]],
     policy: Mapping[str, Any],
+    *,
+    allow_test_only: bool,
 ) -> tuple[str, str]:
     source_kind = record.get("source_kind")
     if source_kind in policy["test_only_source_kinds"]:
+        if not allow_test_only:
+            return "unverified", "synthetic_test_only"
         if bundle is not None:
             bundle_activities = bundle.get("activities", [])
             if not any(_mapping_matches(record, item) for item in bundle_activities):
@@ -880,6 +884,7 @@ def apply_label_policy(
         for evidence_id, record, record_json in parsed:
             partition, trust_reason = _verified_bundle_membership(
                 record_json, record, bundle, policy,
+                allow_test_only=allow_test_only,
             )
             if partition == "unverified":
                 outcomes.append((group, evidence_id, record, partition, "unverified",

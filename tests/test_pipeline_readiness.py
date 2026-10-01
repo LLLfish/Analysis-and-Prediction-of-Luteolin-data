@@ -702,6 +702,17 @@ def test_dashboard_html_escapes_untrusted_html_and_script_data(tmp_path, monkeyp
     assert "framework_output/" not in dashboard
 
 
+def test_cnn_and_fusion_savers_do_not_default_to_protected_feature_roots():
+    cnn = cnn_module.MolecularCNN()
+    fusion = transformer_module.FeatureFusion()
+    assert cnn.output_dir is None
+    assert fusion.output_dir is None
+    with pytest.raises(ValueError, match="output_dir"):
+        cnn.save_features(np.zeros((1, 2), dtype=np.float32))
+    with pytest.raises(ValueError, match="output_dir"):
+        fusion.save_fused_features(np.zeros((1, 2), dtype=np.float32))
+
+
 def test_configured_save_methods_create_parents_and_reject_path_traversal(tmp_path, monkeypatch):
     _install_write_guard(monkeypatch)
     protein_root = tmp_path / "protein"

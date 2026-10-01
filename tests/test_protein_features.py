@@ -230,6 +230,30 @@ def test_partial_esm_checkpoint_loading_cannot_be_reported_as_pretrained():
         })
 
 
+def test_feature_save_requires_explicit_unprotected_output_and_refuses_conflicts(tmp_path):
+    default_extractor = protein_features.ProteinFeatureExtractor()
+    assert default_extractor.output_dir is None
+    with pytest.raises(ValueError, match="output_dir"):
+        default_extractor.save_features()
+
+    protected_root = APL_ROOT / "features" / "protein"
+    protected_extractor = protein_features.ProteinFeatureExtractor(output_dir=str(protected_root))
+    with pytest.raises(ValueError, match="protected"):
+        protected_extractor.save_features()
+
+    safe_root = tmp_path / "safe-output"
+    embeddings = safe_root / "embeddings"
+    embeddings.mkdir(parents=True)
+    destination = embeddings / "existing.json"
+    destination.write_bytes(b"keep-existing-feature")
+    safe_extractor = protein_features.ProteinFeatureExtractor(output_dir=str(safe_root))
+    safe_extractor.protein_name = "P12345"
+    safe_extractor.features = {"esm_embedding": [1.0]}
+    with pytest.raises(FileExistsError, match="existing|conflict"):
+        safe_extractor.save_features("existing.json")
+    assert destination.read_bytes() == b"keep-existing-feature"
+
+
 def test_unbound_sequence_api_cannot_emit_protein_features(tmp_path):
     extractor = _extractor(tmp_path)
 

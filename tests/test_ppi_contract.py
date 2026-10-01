@@ -421,6 +421,53 @@ def test_chinese_path_json_and_utf8_sig_csv_round_trip_identity(tmp_path):
     assert "测试蛋白甲" in json_result.edges[0].endpoint_a.source_native_id or "测试蛋白甲" in json_result.edges[0].endpoint_b.source_native_id
 
 
+def test_ppi_json_reader_rejects_duplicate_object_keys(tmp_path):
+    path = tmp_path / "duplicate-key.json"
+    path.write_text(
+        '[{"stringId_A":"9606.ENSP00000354587",'
+        '"stringId_A":"9606.ENSP00000263967"}]',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        read_ppi_records(path)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_ppi_json_reader_rejects_nonstandard_numeric_constants(tmp_path, constant):
+    path = tmp_path / "nonstandard-number.json"
+    path.write_text(
+        '[{"stringId_A":"9606.ENSP00000354587",'
+        '"stringId_B":"9606.ENSP00000263967",'
+        f'"ncbiTaxonId":9606,"score":{constant}'
+        "}]",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="non-standard JSON numeric constant"):
+        read_ppi_records(path)
+
+
+def test_ppi_file_provenance_uses_actual_bytes_separately_from_semantic_input(tmp_path):
+    first_path = tmp_path / "compact.json"
+    second_path = tmp_path / "pretty.json"
+    first_bytes = json.dumps([ONLINE_EDGE], separators=(",", ":")).encode("utf-8")
+    second_bytes = json.dumps([ONLINE_EDGE], indent=2).encode("utf-8")
+    first_path.write_bytes(first_bytes)
+    second_path.write_bytes(second_bytes)
+
+    first = canonicalize_ppi(read_ppi_records(first_path), source_kind="synthetic_test")
+    second = canonicalize_ppi(read_ppi_records(second_path), source_kind="synthetic_test")
+
+    assert first.input_sha256 == second.input_sha256 == canonical_json_sha256([ONLINE_EDGE])
+    assert first.source_file_sha256 == hashlib.sha256(first_bytes).hexdigest()
+    assert second.source_file_sha256 == hashlib.sha256(second_bytes).hexdigest()
+    assert first.source_file_sha256 != second.source_file_sha256
+    assert first.source_file_path == str(first_path.resolve())
+    assert first.to_dict()["ppi_trace"]["source_file_sha256"] == first.source_file_sha256
+    assert first.provenance_sha256 != second.provenance_sha256
+
+
 def test_concurrent_normalization_keeps_result_ledgers_isolated():
     valid = [{
         "stringId_A": "9606.ENSP00000354587",

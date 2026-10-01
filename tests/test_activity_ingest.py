@@ -93,6 +93,42 @@ def _chembl_get_from_fixture(fixture, calls):
     return fake_get
 
 
+def test_default_collector_is_side_effect_free_and_run_pipeline_requires_configuration(monkeypatch):
+    calls = []
+    monkeypatch.setattr("data_collection.requests.get", lambda *args, **kwargs: calls.append(args[0]))
+    monkeypatch.setattr("data_collection.requests.post", lambda *args, **kwargs: calls.append(args[0]))
+
+    collector = LuteolinDataCollector()
+
+    assert collector.output_dir is None
+    with pytest.raises(ValueError, match="output|online"):
+        collector.run_pipeline()
+    assert calls == []
+
+
+def test_public_online_collection_requires_explicit_opt_in(tmp_path, monkeypatch):
+    calls = []
+
+    def blocked_request(url, *args, **kwargs):
+        calls.append(url)
+        raise RuntimeError("mocked offline request")
+
+    monkeypatch.setattr("data_collection.requests.get", blocked_request)
+    monkeypatch.setattr("data_collection.requests.post", blocked_request)
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "no-online-opt-in"))
+    monkeypatch.setattr(collector, "_fetch_pubchem_via_pubchempy", lambda: (_ for _ in ()).throw(RuntimeError("use REST fallback")))
+
+    for fetch in (
+        collector.fetch_pubchem_data,
+        collector.fetch_chembl_data,
+        collector.fetch_tcmsp_data,
+        lambda: collector.fetch_string_data(["AKT1"]),
+    ):
+        with pytest.raises(PermissionError, match="allow_online"):
+            fetch()
+    assert calls == []
+
+
 def test_collector_fetches_and_hands_off_complete_activity_pages(tmp_path, monkeypatch):
     fixture = _fixture()
     calls = []

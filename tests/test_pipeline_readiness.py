@@ -377,6 +377,45 @@ def test_network_statistics_status_preserves_ppi_failure_state(tmp_path, ppi_sta
     assert features["feature_readiness"]["stages"]["network_statistics"]["status"] == expected_status
 
 
+def test_default_framework_is_read_only_and_returns_partial_without_online_opt_in(monkeypatch):
+    calls = []
+    from data_collection import LuteolinDataCollector
+    monkeypatch.setattr("data_collection.requests.get", lambda *args, **kwargs: calls.append(args[0]))
+    monkeypatch.setattr("data_collection.requests.post", lambda *args, **kwargs: calls.append(args[0]))
+
+    framework = main_module.NetworkPharmacologyFramework()
+
+    assert framework.output_dir is None
+    dataset = framework.run_data_collection()
+    assert dataset["status"] == "partial"
+    assert dataset["collection_status"] == "not_requested"
+    pipeline = framework.run_full_pipeline()
+    assert pipeline["data_collection"]["status"] == "partial"
+    assert pipeline["pipeline_status"] == "partial"
+    assert calls == []
+
+
+def test_framework_output_root_must_be_new_and_outside_protected_paths(tmp_path):
+    import inspect
+
+    constructor = main_module.NetworkPharmacologyFramework
+    assert "allow_online" in inspect.signature(constructor).parameters
+    with pytest.raises(ValueError, match="output|protected"):
+        constructor(allow_online=True)
+
+    apl_root = Path(main_module.__file__).resolve().parent
+    with pytest.raises(ValueError, match="protected"):
+        constructor(output_dir=str(apl_root / "data"))
+
+    existing = tmp_path / "existing-run"
+    existing.mkdir()
+    sentinel = existing / "keep.json"
+    sentinel.write_bytes(b"keep-existing-output")
+    with pytest.raises(FileExistsError, match="existing|new"):
+        constructor(output_dir=str(existing))
+    assert sentinel.read_bytes() == b"keep-existing-output"
+
+
 def test_run_output_directory_resolution_rejects_a_junction_into_protected_data(tmp_path, monkeypatch):
     resolver = getattr(main_module, "_resolve_new_output_dir", None)
     assert callable(resolver)

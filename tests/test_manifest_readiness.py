@@ -726,6 +726,49 @@ def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_referen
         assert report["code_version_control"]["commit"] is None
 
 
+def test_legacy_coverage_fields_are_null_with_source_specific_reasons(tmp_path):
+    apl_root = tmp_path / "fake-apl"
+    _fake_legacy_sources(apl_root)
+    collection = _source_audit().audit_legacy_sources(apl_root, output_dir=tmp_path / "coverage-reports")
+    by_id = {row["source_id"]: row for row in collection["sources"]}
+
+    assert set(by_id) == {"apl_data", "framework_output_data", "offline_data"}
+    for source_id, row in by_id.items():
+        assert row.get("scope_kind") == "legacy_source_root"
+        assert row["training_ready"] is False
+        entity_coverage = row.get("entity_coverage")
+        assert isinstance(entity_coverage, dict), f"{source_id} is missing entity_coverage"
+        for name, observed_key in (("molecule_records", "compound_records"), ("protein_records", "protein_records")):
+            metric = entity_coverage[name]
+            assert metric["observed_count"] == row["observed_counts"][observed_key]
+            assert metric["verified_count"] is None
+            assert metric["status"] == "not_evaluated"
+            assert source_id in metric["reason"]
+        clusters = row.get("cluster_coverage")
+        assert isinstance(clusters, dict), f"{source_id} is missing cluster_coverage"
+        for name in ("molecule_cluster_count", "protein_cluster_count"):
+            metric = clusters[name]
+            assert metric["count"] is None
+            assert metric["status"] == "not_evaluated"
+            assert source_id in metric["reason"]
+        support = row.get("double_cold_split_support")
+        assert isinstance(support, dict), f"{source_id} is missing double_cold_split_support"
+        assert support["status"] == "not_evaluated"
+        for split_name in ("train", "validation", "test"):
+            for label in ("active", "inactive"):
+                metric = support["splits"][split_name][label]
+                assert metric["count"] is None
+                assert metric["status"] == "not_evaluated"
+                assert source_id in metric["reason"]
+        excluded = row.get("excluded")
+        assert isinstance(excluded, dict), f"{source_id} is missing excluded dispositions"
+        for name in ("entities", "labels"):
+            metric = excluded[name]
+            assert metric["count"] is None
+            assert metric["status"] == "not_evaluated"
+            assert source_id in metric["reason"]
+
+
 def test_source_audit_cli_returns_zero_for_successful_not_ready_reports_and_two_for_bad_input(tmp_path):
     apl_root = tmp_path / "fake-apl"
     _fake_legacy_sources(apl_root)

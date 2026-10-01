@@ -171,10 +171,27 @@ class NetworkPharmacologyFramework:
         return value
 
     def _canonicalize_dataset_ppi(self, dataset: Dict[str, Any]) -> CanonicalPpiResult:
+        trace = dataset.get("ppi_trace")
+        trace = trace if isinstance(trace, dict) else {}
+        source_kind = dataset.get("ppi_source_kind")
+        if source_kind is None:
+            source_kind = trace.get("source_kind")
+        request_status = dataset.get("ppi_request_status")
+        if request_status is None:
+            request_status = trace.get("request_status")
+        snapshot_path = dataset.get("ppi_snapshot_path")
+        if snapshot_path is None:
+            snapshot_path = trace.get("snapshot_path")
+        snapshot_sha256 = dataset.get("ppi_snapshot_sha256")
+        if snapshot_sha256 is None:
+            snapshot_sha256 = trace.get("snapshot_sha256")
         result = canonicalize_ppi(
             dataset.get('interactions', []),
-            source_kind=dataset.get('ppi_source_kind'),
+            source_kind=source_kind,
             alias_mappings=dataset.get('ppi_alias_mappings'),
+            request_status=request_status,
+            snapshot_path=snapshot_path,
+            snapshot_sha256=snapshot_sha256,
         )
         cached = getattr(self, '_ppi_result', None)
         if (
@@ -182,12 +199,14 @@ class NetworkPharmacologyFramework:
             and cached.input_sha256 == result.input_sha256
             and cached.semantic_sha256 == result.semantic_sha256
             and cached.provenance_sha256 == result.provenance_sha256
+            and cached.request_status == result.request_status
+            and cached.snapshot_path == result.snapshot_path
+            and cached.snapshot_sha256 == result.snapshot_sha256
             and cached.issues == result.issues
         ):
             return cached
         self._ppi_result = result
         return result
-
     @staticmethod
     def _feature_readiness(stage_statuses: Dict[str, StageStatus]) -> Dict[str, Any]:
         stage_data = {name: status.to_dict() for name, status in stage_statuses.items()}
@@ -396,6 +415,25 @@ class NetworkPharmacologyFramework:
         logger.info("Analyzing canonical PPI network statistics...")
         ppi_result = self._canonicalize_dataset_ppi(dataset)
         ppi_features = ppi_result.to_dict()
+        ppi_trace = ppi_features.get("ppi_trace") if isinstance(ppi_features, dict) else None
+        if not isinstance(ppi_trace, dict):
+            ppi_trace = {
+                "source_kind": getattr(ppi_result, "source_kind", None),
+                "request_status": getattr(ppi_result, "request_status", None),
+                "snapshot_path": getattr(ppi_result, "snapshot_path", None),
+                "snapshot_sha256": getattr(ppi_result, "snapshot_sha256", None),
+            }
+            if isinstance(ppi_features, dict):
+                ppi_features["ppi_trace"] = ppi_trace
+        request_status = getattr(ppi_result, "request_status", None)
+        if request_status is None and isinstance(ppi_features, dict):
+            request_status = ppi_features.get("request_status")
+        snapshot_path = getattr(ppi_result, "snapshot_path", None)
+        if snapshot_path is None and isinstance(ppi_features, dict):
+            snapshot_path = ppi_features.get("snapshot_path")
+        snapshot_sha256 = getattr(ppi_result, "snapshot_sha256", None)
+        if snapshot_sha256 is None and isinstance(ppi_features, dict):
+            snapshot_sha256 = ppi_features.get("snapshot_sha256")
         gnn_features = {
             "model_type": "network_statistics_only",
             "status": ppi_result.status,
@@ -403,13 +441,18 @@ class NetworkPharmacologyFramework:
             "graph_stats": {"num_nodes": ppi_result.node_count, "num_edges": ppi_result.edge_count},
             "num_nodes": ppi_result.node_count,
             "num_edges": ppi_result.edge_count,
+            "ppi_trace": ppi_trace,
+            "ppi_contract": ppi_features,
         }
-        if ppi_result.status == "empty":
+        if request_status in {"failed", "not_requested"}:
+            gnn_features["status"] = "unavailable"
+        elif ppi_result.status == "empty":
             gnn_features["status"] = "empty"
         elif self.gnn_analyzer:
             try:
                 import networkx as nx
                 graph = nx.Graph()
+                graph.graph["ppi_trace"] = ppi_trace
                 for edge in ppi_result.edges:
                     endpoint_a = edge.endpoint_a.identity_key
                     endpoint_b = edge.endpoint_b.identity_key
@@ -421,6 +464,9 @@ class NetworkPharmacologyFramework:
                         weight=edge.score,
                         semantic_sha256=edge.semantic_sha256,
                         source_record_hashes=edge.source_record_hashes,
+                        source_snapshot_path=snapshot_path,
+                        source_snapshot_sha256=snapshot_sha256,
+                        ppi_trace=ppi_trace,
                     )
                 if graph.number_of_nodes() > 0:
                     centrality = self.gnn_analyzer.compute_centrality(graph)
@@ -433,12 +479,24 @@ class NetworkPharmacologyFramework:
             except ImportError:
                 gnn_features["status"] = "dependency_unavailable"
         ppi_status = getattr(ppi_result, "status", "invalid")
-        if ppi_status == "empty":
-            network_status = StageStatus("empty", "no_canonical_ppi_edges")
+        if request_status == "failed":
+            network_status = StageStatus(
+                "unavailable", "ppi_collection_failed", {"ppi_trace": ppi_trace},
+            )
+        elif request_status == "not_requested":
+            network_status = StageStatus(
+                "unavailable", "ppi_collection_not_requested", {"ppi_trace": ppi_trace},
+            )
+        elif ppi_status == "empty":
+            empty_reason = (
+                "successful_ppi_collection_without_edges"
+                if request_status == "complete" else "no_canonical_ppi_edges"
+            )
+            network_status = StageStatus("empty", empty_reason, {"ppi_trace": ppi_trace})
         elif ppi_status == "partial":
-            network_status = StageStatus("partial", "ppi_result_partial")
+            network_status = StageStatus("partial", "ppi_result_partial", {"ppi_trace": ppi_trace})
         elif ppi_status == "ready" and gnn_features.get("status") != "dependency_unavailable":
-            network_status = StageStatus("ready")
+            network_status = StageStatus("ready", details={"ppi_trace": ppi_trace})
         else:
             failed_status = (
                 "dependency_unavailable"
@@ -448,10 +506,10 @@ class NetworkPharmacologyFramework:
             reason = {
                 "invalid": "ppi_result_invalid",
                 "unresolved": "ppi_result_unresolved",
+                "unavailable": "ppi_collection_unavailable",
                 "dependency_unavailable": "network_statistics_dependency_unavailable",
             }.get(failed_status, "network_statistics_not_ready")
-            network_status = StageStatus("unavailable", reason)
-
+            network_status = StageStatus("unavailable", reason, {"ppi_trace": ppi_trace})
         if self.cnn_module is None:
             cnn_status = StageStatus("unavailable", "cnn_module_unavailable")
         else:
@@ -612,10 +670,23 @@ class NetworkPharmacologyFramework:
         target_data = dataset.get('targets', [])
         protein_data = dataset.get('proteins', [])
         ppi_result = self._canonicalize_dataset_ppi(dataset)
-        kg_results = {'ppi_contract': ppi_result.to_dict(include_edges=False)}
+        kg_contract = ppi_result.to_dict(include_edges=False)
+        kg_trace = kg_contract.get("ppi_trace") if isinstance(kg_contract, dict) else None
+        if not isinstance(kg_trace, dict):
+            kg_trace = {
+                "source_kind": getattr(ppi_result, "source_kind", None),
+                "request_status": getattr(ppi_result, "request_status", None),
+                "snapshot_path": getattr(ppi_result, "snapshot_path", None),
+                "snapshot_sha256": getattr(ppi_result, "snapshot_sha256", None),
+            }
+            if isinstance(kg_contract, dict):
+                kg_contract["ppi_trace"] = kg_trace
+        kg_results = {'ppi_contract': kg_contract}
         if self.kg_module:
             try:
                 self.kg_module.build_from_data(compound_data, target_data, ppi_result)
+                self.kg_module.graph.graph["ppi_trace"] = kg_trace
+                self.kg_module.graph.graph["ppi_contract"] = kg_results["ppi_contract"]
                 stats = self.kg_module.compute_graph_statistics()
                 graph_path = self.kg_module.save_graph()
                 triples_path = self.kg_module.save_triples()
@@ -668,6 +739,10 @@ class NetworkPharmacologyFramework:
                     'data_files': self._available_output_files(),
                 }
                 report = self.output_module.generate_summary_report(summary_input)
+                ppi_report = feature_extraction.get("ppi", {})
+                if isinstance(report, dict) and isinstance(ppi_report, dict):
+                    report["ppi_trace"] = ppi_report.get("ppi_trace")
+                    report["ppi_contract"] = ppi_report
                 self.output_module.generate_dashboard_html(report)
                 plot_input = {
                     'targets': target_data,

@@ -178,9 +178,8 @@ def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, 
         def json(self):
             return [ONLINE_EDGE]
 
-    collector = LuteolinDataCollector(
-        output_dir=str(tmp_path / "collector-run"), allow_online=True,
-    )
+    collector = LuteolinDataCollector(output_dir=str(tmp_path / "collector-run"))
+    collector.allow_online = True
     monkeypatch.setattr(
         "data_collection.requests.post", lambda *args, **kwargs: Response(),
     )
@@ -200,6 +199,7 @@ def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, 
     assert dataset["ppi_trace"] == expected_trace
 
     framework = _framework(tmp_path, "collector-framework")
+    Path(framework.output_dir).mkdir()
     framework.results["data_collection"] = dataset
     features = framework.run_feature_extraction(dataset)
     ppi = features["ppi"]

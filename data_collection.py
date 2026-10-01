@@ -478,8 +478,29 @@ class LuteolinDataCollector:
             json.dump(result, f, ensure_ascii=False, indent=2)
         return result
 
+    def _save_string_response(self, response) -> tuple[str, str]:
+        raw_body = getattr(response, "content", None)
+        if isinstance(raw_body, (bytes, bytearray)):
+            raw_bytes = bytes(raw_body)
+        else:
+            response_text = getattr(response, "text", None)
+            if not isinstance(response_text, str):
+                raise ValueError("STRING response did not expose raw response bytes")
+            raw_bytes = response_text.encode("utf-8")
+        snapshot_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        relative_path = Path("raw") / "string" / f"{snapshot_sha256}.json"
+        snapshot_path = Path(self.output_dir) / relative_path
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        if snapshot_path.exists():
+            if snapshot_path.read_bytes() != raw_bytes:
+                raise ValueError(f"immutable STRING snapshot collision: {relative_path.as_posix()}")
+        else:
+            with snapshot_path.open("xb") as stream:
+                stream.write(raw_bytes)
+        return relative_path.as_posix(), snapshot_sha256
+
     def fetch_string_data(self, gene_symbols: List[str]) -> Dict[str, Any]:
-        """Fetch STRING only for explicit seeds; never substitute static fallback rows."""
+        """Fetch STRING for explicit seeds and retain exact response-byte provenance."""
         symbols = sorted({
             value.strip() for value in (gene_symbols or [])
             if isinstance(value, str) and value.strip()
@@ -495,14 +516,16 @@ class LuteolinDataCollector:
                 "source_kind": "legacy_unverified",
                 "resolution_status": "empty",
                 "request_status": "not_requested",
+                "snapshot_path": None,
+                "snapshot_sha256": None,
             }
             self.raw_data["string"] = result
-            raw_dir = os.path.join(self.output_dir, "raw")
-            with open(os.path.join(raw_dir, "string_ppi_network.json"), "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
             return result
 
         logger.info("Step 4: Fetching STRING PPI for %d explicit seed symbols...", len(symbols))
+        response = None
+        snapshot_path = None
+        snapshot_sha256 = None
         try:
             url = "https://string-db.org/api/json/network"
             response = requests.post(
@@ -519,6 +542,7 @@ class LuteolinDataCollector:
             interactions = response.json()
             if not isinstance(interactions, list) or any(not isinstance(row, dict) for row in interactions):
                 raise ValueError("STRING response must be a list of interaction objects")
+            snapshot_path, snapshot_sha256 = self._save_string_response(response)
             result = {
                 "species": "Homo sapiens",
                 "species_id": 9606,
@@ -528,9 +552,18 @@ class LuteolinDataCollector:
                 "total_interactions": len(interactions),
                 "source_kind": "online_snapshot",
                 "request_status": "complete",
+                "resolution_status": "resolved" if interactions else "empty",
+                "snapshot_path": snapshot_path,
+                "snapshot_sha256": snapshot_sha256,
+                "raw_response_sha256": snapshot_sha256,
             }
-        except Exception as e:
-            logger.warning("STRING retrieval incomplete: %s", e)
+        except Exception as exc:
+            logger.warning("STRING retrieval incomplete: %s", exc)
+            if response is not None:
+                try:
+                    snapshot_path, snapshot_sha256 = self._save_string_response(response)
+                except Exception as snapshot_error:
+                    logger.warning("STRING failure snapshot could not be saved: %s", snapshot_error)
             result = {
                 "species": "Homo sapiens",
                 "species_id": 9606,
@@ -541,14 +574,12 @@ class LuteolinDataCollector:
                 "source_kind": "legacy_unverified",
                 "resolution_status": "incomplete",
                 "request_status": "failed",
-                "reason": str(e),
+                "snapshot_path": snapshot_path,
+                "snapshot_sha256": snapshot_sha256,
+                "reason": str(exc),
             }
         self.raw_data["string"] = result
-        raw_dir = os.path.join(self.output_dir, "raw")
-        with open(os.path.join(raw_dir, "string_ppi_network.json"), "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
         return result
-
     def _map_target_to_gene(self, target_name: str) -> str:
         for key, gene in self.gene_mapping.items():
             if key.lower() in target_name.lower():
@@ -562,6 +593,13 @@ class LuteolinDataCollector:
         from evidence_builder import activity_evidence_from_collector_payload, LegacyDisplayAdapter
 
         chembl_payload = self.raw_data.get("chembl", {})
+        ppi_payload = self.raw_data.get("string", {})
+        ppi_trace = {
+            "source_kind": ppi_payload.get("source_kind", "legacy_unverified"),
+            "request_status": ppi_payload.get("request_status", "not_requested"),
+            "snapshot_path": ppi_payload.get("snapshot_path"),
+            "snapshot_sha256": ppi_payload.get("snapshot_sha256"),
+        }
         activity_rows = activity_evidence_from_collector_payload(chembl_payload)
         serialized_evidence = [asdict(row) for row in activity_rows]
         cleaned_data = {
@@ -569,6 +607,11 @@ class LuteolinDataCollector:
             "targets": [],
             "activity_evidence": serialized_evidence,
             "interactions": [],
+            "ppi_trace": ppi_trace,
+            "ppi_source_kind": ppi_trace["source_kind"],
+            "ppi_request_status": ppi_trace["request_status"],
+            "ppi_snapshot_path": ppi_trace["snapshot_path"],
+            "ppi_snapshot_sha256": ppi_trace["snapshot_sha256"],
             "proteins": [],
             "metadata": {
                 "processing_time": datetime.now().isoformat(),
@@ -652,7 +695,7 @@ class LuteolinDataCollector:
                 copied["sequence_status"] = "missing"
                 copied["sequence_status_reason"] = "legacy_payload_has_metadata_without_sequence"
             cleaned_data["proteins"].append(copied)
-        cleaned_data["interactions"] = self.raw_data.get("string", {}).get("interactions", [])
+        cleaned_data["interactions"] = ppi_payload.get("interactions", [])
         self.processed_data = cleaned_data
         return cleaned_data
     def save_processed_data(self) -> str:

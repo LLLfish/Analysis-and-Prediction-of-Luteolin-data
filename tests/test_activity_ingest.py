@@ -484,13 +484,28 @@ def test_missing_verified_gene_symbols_do_not_trigger_string_request(tmp_path, m
 
 
 def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_request(tmp_path, monkeypatch):
-    no_request = LuteolinDataCollector(
-        output_dir=str(tmp_path / "ppi-not-requested"), allow_online=False,
-    )
+    from main import NetworkPharmacologyFramework
+
+    def network_result(dataset):
+        framework = object.__new__(NetworkPharmacologyFramework)
+        framework.results = {}
+        framework.ligand_extractor = None
+        framework.protein_extractor = None
+        framework.gnn_analyzer = None
+        framework.cnn_module = None
+        framework.transformer_module = None
+        features = framework.run_feature_extraction(dataset)
+        return features["ppi"], features["feature_readiness"]["stages"]["network_statistics"]
+
+    no_request = LuteolinDataCollector(output_dir=str(tmp_path / "ppi-not-requested"))
     unrequested = no_request.fetch_string_data([])
     unrequested_clean = no_request.clean_and_standardize()
     assert unrequested["request_status"] == "not_requested"
     assert unrequested_clean["ppi_trace"]["request_status"] == "not_requested"
+    unrequested_contract, unrequested_network = network_result(unrequested_clean)
+    assert unrequested_contract["status"] == "unavailable"
+    assert unrequested_network["status"] == "unavailable"
+    assert unrequested_network["reason"] == "ppi_collection_not_requested"
 
     class EmptyResponse:
         status_code = 200
@@ -502,9 +517,8 @@ def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_r
         def json(self):
             return []
 
-    successful_empty = LuteolinDataCollector(
-        output_dir=str(tmp_path / "ppi-empty-success"), allow_online=True,
-    )
+    successful_empty = LuteolinDataCollector(output_dir=str(tmp_path / "ppi-empty-success"))
+    successful_empty.allow_online = True
     monkeypatch.setattr(
         "data_collection.requests.post", lambda *args, **kwargs: EmptyResponse(),
     )
@@ -515,10 +529,12 @@ def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_r
     assert empty_result["interactions"] == []
     assert empty_clean["ppi_trace"]["request_status"] == "complete"
     assert empty_clean["ppi_trace"]["snapshot_sha256"] == "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    empty_contract, empty_network = network_result(empty_clean)
+    assert empty_contract["status"] == "empty"
+    assert empty_network["status"] == "empty"
 
-    failed = LuteolinDataCollector(
-        output_dir=str(tmp_path / "ppi-failed"), allow_online=True,
-    )
+    failed = LuteolinDataCollector(output_dir=str(tmp_path / "ppi-failed"))
+    failed.allow_online = True
     monkeypatch.setattr(
         "data_collection.requests.post",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline fixture")),
@@ -529,6 +545,10 @@ def test_ppi_request_status_survives_cleaning_for_empty_success_failure_and_no_r
     assert failed_result["source_kind"] == "legacy_unverified"
     assert failed_clean["ppi_trace"]["request_status"] == "failed"
     assert failed_clean["interactions"] == []
+    failed_contract, failed_network = network_result(failed_clean)
+    assert failed_contract["status"] == "unavailable"
+    assert failed_network["status"] == "unavailable"
+    assert failed_network["reason"] == "ppi_collection_failed"
 
 
 def test_run_pipeline_hands_complete_raw_evidence_to_cleaning(tmp_path):

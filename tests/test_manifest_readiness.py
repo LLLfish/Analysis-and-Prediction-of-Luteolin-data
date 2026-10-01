@@ -229,6 +229,10 @@ def _source_verified_ready_mock_bundle(tmp_path: Path) -> Path:
     assert result["status"] == "complete", result
     bundle_path = staging / "entities.json"
     assert evidence_builder.load_entity_bundle(bundle_path, verify_sources=True)["source_kind"] == "online_snapshot"
+    molecule_clusters = dataset_builder.build_molecule_clusters(bundle_path)
+    protein_clusters = dataset_builder.build_protein_clusters(bundle_path)
+    assert len(molecule_clusters.clusters) == len(READY_MOCK_SMILES)
+    assert len(protein_clusters.clusters) == len(READY_MOCK_SMILES)
     return bundle_path
 
 

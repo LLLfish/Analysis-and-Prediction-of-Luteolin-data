@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -410,6 +411,15 @@ def test_pair_class_support_does_not_count_opposing_labels_twice():
     support = dataset_builder._class_support((ambiguous,))
 
     assert support == {
+        "train": {"active": 0, "inactive": 0},
+        "val": {"active": 0, "inactive": 0},
+        "test": {"active": 0, "inactive": 0},
+    }
+    separate_endpoint_rows = (
+        replace(ambiguous, labels=("active",)),
+        replace(ambiguous, labels=("inactive",)),
+    )
+    assert dataset_builder._class_support(separate_endpoint_rows) == {
         "train": {"active": 0, "inactive": 0},
         "val": {"active": 0, "inactive": 0},
         "test": {"active": 0, "inactive": 0},

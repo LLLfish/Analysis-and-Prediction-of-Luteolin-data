@@ -78,6 +78,41 @@ def _extractor(tmp_path: Path, *, max_tokens: int = 8):
     )
 
 
+def _synthetic_feature_result(bundle: dict) -> data_contracts.FeatureResult:
+    protein = data_contracts.ProteinRecord(**bundle["proteins"][0])
+    model_id = "mock/esm"
+    model_revision = "mock-r1"
+    artifact_hash = hashlib.sha256(b"synthetic test-only model artifact").hexdigest()
+    pooling = "residue-mask-mean-v1:max_tokens=8"
+    cache_key = protein_features.build_feature_cache_key(
+        protein,
+        model_id=model_id,
+        model_revision=model_revision,
+        model_artifact_sha256=artifact_hash,
+        pooling_policy=pooling,
+        entity_version=bundle["entity_version"],
+        entity_bundle_hash=bundle["content_sha256"],
+    )
+    return data_contracts.FeatureResult(
+        status="test_only",
+        reason="synthetic fixture only",
+        features={"esm_embedding": [1.0, 2.0]},
+        accession=protein.accession,
+        taxonomy_id=protein.taxonomy_id,
+        sequence_length=protein.sequence_length,
+        sequence_sha256=protein.sequence_sha256,
+        entity_version=bundle["entity_version"],
+        entity_bundle_hash=bundle["content_sha256"],
+        source_kind="synthetic_test",
+        model_id=model_id,
+        model_revision=model_revision,
+        model_artifact_sha256=artifact_hash,
+        pooling_policy=pooling,
+        cache_key=cache_key,
+        test_provenance="synthetic entity bundle and deterministic mock embedding",
+    )
+
+
 def test_identity_bound_feature_contract_is_exposed():
     assert "test_only" in inspect.signature(protein_features.ProteinFeatureExtractor).parameters
     assert callable(getattr(protein_features, "validate_sequence_identity", None))
@@ -246,12 +281,68 @@ def test_feature_save_requires_explicit_unprotected_output_and_refuses_conflicts
     embeddings.mkdir(parents=True)
     destination = embeddings / "existing.json"
     destination.write_bytes(b"keep-existing-feature")
+    _, bundle = _bundle(tmp_path)
+    result = _synthetic_feature_result(bundle)
     safe_extractor = protein_features.ProteinFeatureExtractor(output_dir=str(safe_root))
-    safe_extractor.protein_name = "P12345"
-    safe_extractor.features = {"esm_embedding": [1.0]}
     with pytest.raises(FileExistsError, match="existing|conflict"):
-        safe_extractor.save_features("existing.json")
+        safe_extractor.save_features("existing.json", result=result)
     assert destination.read_bytes() == b"keep-existing-feature"
+
+
+def test_feature_save_requires_explicit_result_and_writes_full_provenance(tmp_path):
+    _, bundle = _bundle(tmp_path)
+    result = _synthetic_feature_result(bundle)
+    extractor = protein_features.ProteinFeatureExtractor(output_dir=str(tmp_path / "safe-output"))
+    extractor.features = {"esm_embedding": [999.0]}
+
+    with pytest.raises(ValueError, match="explicit FeatureResult"):
+        extractor.save_features("unbound.json")
+    assert not (tmp_path / "safe-output" / "embeddings" / "unbound.json").exists()
+
+    path = Path(extractor.save_features("provenance.json", result=result))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved == result.to_dict()
+    assert saved["status"] == "test_only"
+    assert saved["test_provenance"] == result.test_provenance
+    assert saved["sequence_sha256"] == result.sequence_sha256
+    assert saved["entity_bundle_hash"] == result.entity_bundle_hash
+    assert saved["model_artifact_sha256"] == result.model_artifact_sha256
+    assert saved["pooling_policy"] == result.pooling_policy
+    assert saved["cache_key"] == result.cache_key
+
+
+def test_extractor_tracks_latest_result_across_extraction_cache_and_failure(tmp_path, monkeypatch):
+    bundle_path, _ = _bundle(tmp_path)
+    extractor = protein_features.ProteinFeatureExtractor(
+        output_dir=str(tmp_path / "feature-output"),
+        esm_model_name="mock/esm",
+        model_revision="mock-r1",
+        model=object(),
+        tokenizer=object(),
+        test_only=True,
+    )
+    monkeypatch.setattr(
+        extractor,
+        "_extract_residue_embedding",
+        lambda sequence: (protein_features.np.array([1.0, 2.0]), "ready", None),
+    )
+
+    first = extractor.extract_from_bundle(str(bundle_path), test_only=True)[0]
+    assert extractor.last_result == first
+    assert first.status == "test_only"
+
+    monkeypatch.setattr(
+        extractor,
+        "_extract_residue_embedding",
+        lambda sequence: pytest.fail("cache hit must not rerun the model"),
+    )
+    cached = extractor.extract_from_bundle(str(bundle_path), test_only=True)[0]
+    assert cached == first
+    assert extractor.last_result == cached
+
+    failed = extractor.extract_from_bundle(str(bundle_path), test_only=False)[0]
+    assert failed.status == "unverified_source"
+    assert extractor.last_result == failed
 
 
 def test_unbound_sequence_api_cannot_emit_protein_features(tmp_path):

@@ -802,6 +802,57 @@ def _make_decision(
     )
 
 
+def _validate_filtering_ledger(ledger: FilteringLedger) -> dict[str, LedgerEntry]:
+    if not isinstance(ledger.entries, tuple):
+        raise LabelPolicyInputError("filtering ledger entries must be an immutable tuple")
+    primary: dict[str, LedgerEntry] = {}
+    occurrences: dict[str, set[int]] = {}
+    entry_keys: set[tuple[str, int]] = set()
+    for entry in ledger.entries:
+        if not isinstance(entry, LedgerEntry):
+            raise LabelPolicyInputError("filtering ledger contains an invalid entry type")
+        if (not isinstance(entry.evidence_id, str) or not entry.evidence_id
+                or type(entry.occurrence) is not int or entry.occurrence < 1
+                or entry.disposition not in _LEDGER_CATEGORIES
+                or not isinstance(entry.reason, str)
+                or not isinstance(entry.record_json, str)
+                or not isinstance(entry.record_sha256, str)
+                or _SHA256.fullmatch(entry.record_sha256) is None):
+            raise LabelPolicyInputError("filtering ledger entry has invalid fields")
+        key = (entry.evidence_id, entry.occurrence)
+        if key in entry_keys:
+            raise LabelPolicyInputError("filtering ledger assigns an input occurrence more than once")
+        entry_keys.add(key)
+        occurrences.setdefault(entry.evidence_id, set()).add(entry.occurrence)
+        if hashlib.sha256(entry.record_json.encode("utf-8")).hexdigest() != entry.record_sha256:
+            raise LabelPolicyInputError("filtering ledger record hash does not match its raw record")
+        if (entry.occurrence == 1 and entry.disposition == "duplicate") or (
+            entry.occurrence > 1 and entry.disposition != "duplicate"
+        ):
+            raise LabelPolicyInputError("filtering ledger duplicate occurrences are inconsistent")
+        try:
+            record = json.loads(entry.record_json, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, LabelPolicyInputError) as exc:
+            raise LabelPolicyInputError(f"filtering ledger contains invalid raw JSON: {exc}") from exc
+        if not isinstance(record, dict):
+            raise LabelPolicyInputError("filtering ledger raw evidence must be a JSON object")
+        if "__invalid_evidence_type__" in record:
+            if entry.pair_key is not None:
+                raise LabelPolicyInputError("invalid raw evidence cannot claim a pair identity")
+        else:
+            prepared = _prepare_evidence(record)
+            if prepared.record_json != entry.record_json or prepared.evidence_id != entry.evidence_id:
+                raise LabelPolicyInputError("filtering ledger evidence ID does not match its raw record")
+            if prepared.pair_key != entry.pair_key:
+                raise LabelPolicyInputError("filtering ledger pair key does not match its raw record")
+        if entry.occurrence == 1:
+            primary[entry.evidence_id] = entry
+    for evidence_id, values in occurrences.items():
+        if values != set(range(1, len(values) + 1)):
+            raise LabelPolicyInputError(f"filtering ledger occurrence sequence is incomplete for {evidence_id}")
+    return primary
+
+
 def apply_label_policy(
     groups: Iterable[PairLabelGroup],
     *,
@@ -828,24 +879,40 @@ def apply_label_policy(
         raise LabelPolicyInputError("groups must be iterable") from exc
     if any(not isinstance(group, PairLabelGroup) for group in group_values):
         raise LabelPolicyInputError("groups must contain PairLabelGroup values")
-
-    ledger_primary: dict[str, LedgerEntry] = {}
-    for entry in ledger.entries:
-        if entry.occurrence == 1:
-            ledger_primary[entry.evidence_id] = entry
+    ledger_primary = _validate_filtering_ledger(ledger)
 
     grouped_evidence_ids: set[str] = set()
+    seen_pair_identities: set[tuple[str, int, str]] = set()
+    seen_split_group_ids: set[str] = set()
     outcomes: list[tuple[PairLabelGroup, str, dict[str, Any], str, str, str, str]] = []
     for group in group_values:
+        if (not isinstance(group.molecule_chembl_id, str)
+                or not _CHEMBL_ID.fullmatch(group.molecule_chembl_id)
+                or type(group.taxonomy_id) is not int
+                or not isinstance(group.protein_accession, str)
+                or not _ACCESSION.fullmatch(group.protein_accession)
+                or not isinstance(group.split_group_id, str)
+                or not isinstance(group.group_sha256, str)):
+            raise LabelPolicyInputError("pair group has an invalid canonical pair identity")
+        canonical_identity = (group.molecule_chembl_id, group.taxonomy_id, group.protein_accession)
+        expected_pair_key = f"{group.molecule_chembl_id}|{group.taxonomy_id}|{group.protein_accession}"
+        if group.pair_key != expected_pair_key:
+            raise LabelPolicyInputError("pair_key does not match canonical molecule/protein identity")
+        if canonical_identity in seen_pair_identities or group.split_group_id in seen_split_group_ids:
+            raise LabelPolicyInputError("duplicate or forked canonical pair groups are not allowed")
+        seen_pair_identities.add(canonical_identity)
+        seen_split_group_ids.add(group.split_group_id)
         if (not isinstance(group.evidence_ids, tuple)
                 or not isinstance(group.records_json, tuple)
                 or len(group.evidence_ids) != len(group.records_json)
+                or any(not isinstance(value, str) for value in group.evidence_ids)
+                or any(not isinstance(value, str) for value in group.records_json)
                 or len(set(group.evidence_ids)) != len(group.evidence_ids)):
             raise LabelPolicyInputError("pair group evidence arrays are malformed")
         parsed: list[tuple[str, dict[str, Any], str]] = []
         for evidence_id, record_json in zip(group.evidence_ids, group.records_json):
-            if not isinstance(evidence_id, str) or not isinstance(record_json, str):
-                raise LabelPolicyInputError("pair group evidence IDs and records must be strings")
+            if evidence_id in grouped_evidence_ids:
+                raise LabelPolicyInputError("one evidence ID is assigned to multiple pair groups")
             try:
                 record = json.loads(record_json, parse_constant=_reject_json_constant)
             except (json.JSONDecodeError, LabelPolicyInputError) as exc:
@@ -861,7 +928,8 @@ def apply_label_policy(
                 raise LabelPolicyInputError("pair group identity does not match its activity evidence")
             ledger_entry = ledger_primary.get(evidence_id)
             if (ledger_entry is None or ledger_entry.record_sha256 != prepared.record_sha256
-                    or ledger_entry.record_json != record_json):
+                    or ledger_entry.record_json != record_json
+                    or ledger_entry.pair_key != prepared.pair_key):
                 raise LabelPolicyInputError("pair group evidence does not match its filtering ledger")
             parsed.append((evidence_id, record, record_json))
             grouped_evidence_ids.add(evidence_id)
@@ -896,6 +964,13 @@ def apply_label_policy(
             outcomes.append((group, evidence_id, record, partition, status,
                              reason, condition_hash or ""))
 
+    expected_grouped_ids = {
+        evidence_id for evidence_id, entry in ledger_primary.items()
+        if entry.pair_key is not None
+    }
+    if grouped_evidence_ids != expected_grouped_ids:
+        raise LabelPolicyInputError("pair groups and ledger do not assign every canonical evidence row exactly once")
+
     decisions_by_class: dict[str, list[LabelDecision]] = {
         "confirmed_labeled_pairs": [], "test_only_labeled_pairs": [],
         "gray": [], "unknown": [], "conflicts": [], "excluded": [], "unverified": [],
@@ -907,24 +982,38 @@ def apply_label_policy(
         bucket_key = (group.pair_key, endpoint, condition_hash, partition)
         buckets.setdefault(bucket_key, []).append((group, evidence_id, record, status, reason, condition_hash))
 
+    directly_conflicted_pairs: set[tuple[str, str]] = set()
+    for bucket_key, rows in buckets.items():
+        labels = {row[3] for row in rows if row[3] in {"active", "inactive"}}
+        if labels == {"active", "inactive"}:
+            directly_conflicted_pairs.add((bucket_key[0], bucket_key[3]))
+
     for bucket_key in sorted(buckets):
         rows = buckets[bucket_key]
         group = rows[0][0]
         pair_key, endpoint, condition_hash, partition = bucket_key
         candidate_rows = [row for row in rows if row[3] in {"active", "inactive"}]
         candidate_labels = {row[3] for row in candidate_rows}
-        if candidate_labels == {"active", "inactive"}:
+        pair_conflicted = (pair_key, partition) in directly_conflicted_pairs
+        if pair_conflicted and candidate_rows:
             evidence_ids = [row[1] for row in candidate_rows]
+            is_direct_conflict = candidate_labels == {"active", "inactive"}
             decision = _make_decision(
                 group, pair_key=pair_key, split_group_id=group.split_group_id,
                 endpoint=endpoint, condition_hash=condition_hash, label="conflict",
                 evidence_ids=evidence_ids,
-                reasons=("active_inactive_same_endpoint_assay_condition",), partition=partition,
+                reasons=("active_inactive_same_endpoint_assay_condition" if is_direct_conflict
+                         else "pair_quarantined_by_conflicting_endpoint",),
+                partition=partition,
             )
             decisions_by_class["conflicts"].append(decision)
             if partition == "confirmed":
                 for evidence_id in evidence_ids:
-                    ledger_updates[evidence_id] = ("conflict_candidate", "active_inactive_conflict")
+                    ledger_updates[evidence_id] = (
+                        "conflict_candidate",
+                        "active_inactive_conflict" if is_direct_conflict
+                        else "pair_quarantined_by_conflicting_endpoint",
+                    )
         elif candidate_labels:
             label = next(iter(candidate_labels))
             evidence_ids = [row[1] for row in candidate_rows]

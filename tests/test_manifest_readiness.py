@@ -47,6 +47,31 @@ def _source_audit():
     return importlib.import_module("source_audit")
 
 
+def _policy_bytes_and_hashes(root: Path | None = None) -> tuple[dict, dict]:
+    policy_root = APL_ROOT / "policies"
+    references = {}
+    claims = {}
+    for name, filename in (("split", "split_policy.json"), ("label", "label_policy.json")):
+        raw = (policy_root / filename).read_bytes()
+        value = json.loads(raw.decode("utf-8-sig"))
+        semantic_sha256 = data_contracts.canonical_json_sha256(value)
+        references[name] = {
+            "path": f"policies/{filename}",
+            "file_sha256": hashlib.sha256(raw).hexdigest(),
+            "semantic_sha256": semantic_sha256,
+            "schema_version": value["schema_version"],
+            "policy_version": value["policy_version"],
+        }
+        claims[f"{name}_policy_file_sha256"] = hashlib.sha256(raw).hexdigest()
+        claims[f"{name}_policy_semantic_sha256"] = semantic_sha256
+        if root is not None:
+            destination = root / references[name]["path"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(raw)
+    claims["label_policy_sha256"] = references["label"]["file_sha256"]
+    return references, claims
+
+
 def _empty_verified_bundle(tmp_path: Path) -> tuple[Path, dict]:
     bundle_root = tmp_path / "source-bundle"
     raw_root = bundle_root / "raw"
@@ -73,9 +98,11 @@ def _empty_verified_bundle(tmp_path: Path) -> tuple[Path, dict]:
 
 def _split_payload(bundle_path: Path, bundle: dict) -> dict:
     result = dataset_builder.strict_double_cold_split(bundle_path, allow_test_only=True)
+    _references, policy_claims = _policy_bytes_and_hashes()
     return {
         "strict_split_status": result.strict_split_status,
         "split_policy_sha256": result.policy_sha256,
+        **policy_claims,
         "entity_version": bundle["entity_version"],
         "entity_bundle_hash": bundle["content_sha256"],
         "molecule_memberships": {},
@@ -575,8 +602,9 @@ def test_dataset_builder_publishes_only_through_the_frozen_writer(tmp_path, monk
         def __init__(self, root, version_id, **kwargs):
             called.append((Path(root), version_id))
 
-        def publish(self, entity_path, *, split):
+        def publish(self, entity_path, *, split, policy_paths=None):
             called.append((Path(entity_path), split["entity_bundle_hash"]))
+            called.append(policy_paths)
             return type("Result", (), {"status": "complete", "exit_code": 0})()
 
     monkeypatch.setattr(store, "FrozenManifestWriter", FakeWriter)
@@ -613,6 +641,141 @@ def test_dataset_builder_cli_returns_zero_for_tool_success_with_training_not_rea
     )
     assert repeated.returncode == 2, (repeated.stdout or "") + (repeated.stderr or "")
     assert json.loads(repeated.stdout)["status"] == "conflict"
+
+
+def _custom_policy_sources(tmp_path: Path) -> tuple[Path, Path, dict, dict]:
+    default_split_path = APL_ROOT / "policies" / "split_policy.json"
+    default_label_path = APL_ROOT / "policies" / "label_policy.json"
+    split_policy = json.loads(default_split_path.read_text(encoding="utf-8"))
+    split_policy["budgets"]["alignment_cells"] = 1_000_001
+    label_policy = json.loads(default_label_path.read_text(encoding="utf-8"))
+    split_path = tmp_path / "custom-split-policy.json"
+    label_path = tmp_path / "custom-label-policy.json"
+    split_path.write_text(json.dumps(split_policy, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    label_path.write_text(json.dumps(label_policy, ensure_ascii=False, sort_keys=True, indent=1) + "\n", encoding="utf-8")
+    assert label_path.read_bytes() != default_label_path.read_bytes()
+    assert data_contracts.canonical_json_sha256(json.loads(label_path.read_text(encoding="utf-8"))) == data_contracts.canonical_json_sha256(label_policy)
+    return split_path, label_path, split_policy, label_policy
+
+
+def test_custom_policies_are_frozen_and_default_audit_uses_only_snapshot_bytes(tmp_path):
+    bundle_path, _bundle = _empty_verified_bundle(tmp_path)
+    custom_split, custom_label, split_value, label_value = _custom_policy_sources(tmp_path)
+    output_root = tmp_path / "custom-policy-frozen"
+    env = dict(os.environ)
+    env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")})
+
+    built = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "dataset_builder.py"),
+         "--entities", str(bundle_path), "--out", str(output_root), "--version", "custom-v1",
+         "--policy", str(custom_split), "--label-policy", str(custom_label)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60, check=False,
+    )
+
+    assert built.returncode == 0, (built.stdout or "") + (built.stderr or "")
+    build_result = json.loads(built.stdout)
+    assert build_result["status"] == "complete"
+    version_dir = output_root / "custom-v1"
+    manifest_path = version_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    refs = manifest["policies"]
+    assert refs["split"]["path"] == "policies/split_policy.json"
+    assert refs["label"]["path"] == "policies/label_policy.json"
+    assert (version_dir / refs["split"]["path"]).read_bytes() == custom_split.read_bytes()
+    assert (version_dir / refs["label"]["path"]).read_bytes() == custom_label.read_bytes()
+    assert refs["split"]["file_sha256"] == hashlib.sha256(custom_split.read_bytes()).hexdigest()
+    assert refs["split"]["semantic_sha256"] == data_contracts.canonical_json_sha256(split_value)
+    assert refs["split"]["policy_version"] == split_value["policy_version"]
+    assert refs["label"]["file_sha256"] == hashlib.sha256(custom_label.read_bytes()).hexdigest()
+    assert refs["label"]["semantic_sha256"] == data_contracts.canonical_json_sha256(label_value)
+    assert manifest["split"]["split_policy_file_sha256"] == refs["split"]["file_sha256"]
+    assert manifest["split"]["split_policy_sha256"] == refs["split"]["semantic_sha256"]
+    assert manifest["split"]["label_policy_sha256"] == refs["label"]["file_sha256"]
+    assert manifest["split"]["label_policy_semantic_sha256"] == refs["label"]["semantic_sha256"]
+
+    audit_command = [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "leak_audit.py"), "--manifest", str(manifest_path)]
+    audited = subprocess.run(
+        audit_command, cwd=tmp_path, env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=60, check=False,
+    )
+    assert audited.returncode == 0, (audited.stdout or "") + (audited.stderr or "")
+
+    custom_split.write_bytes(b"changed after publication")
+    custom_label.unlink()
+    after_input_change = subprocess.run(
+        audit_command, cwd=tmp_path, env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=60, check=False,
+    )
+    assert after_input_change.returncode == 0, (after_input_change.stdout or "") + (after_input_change.stderr or "")
+
+    wrong_split = tmp_path / "wrong-split-policy.json"
+    wrong_label = tmp_path / "wrong-label-policy.json"
+    wrong_split.write_bytes((APL_ROOT / "policies" / "split_policy.json").read_bytes())
+    wrong_label.write_bytes((APL_ROOT / "policies" / "label_policy.json").read_bytes())
+    for option, wrong_path, finding_code in (
+        ("--policy", wrong_split, "split_policy_override_mismatch"),
+        ("--label-policy", wrong_label, "label_policy_override_mismatch"),
+    ):
+        override = subprocess.run(
+            [*audit_command, option, str(wrong_path)], cwd=tmp_path, env=env,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False,
+        )
+        assert override.returncode == 3, (override.stdout or "") + (override.stderr or "")
+        assert finding_code in {row["code"] for row in json.loads(override.stdout)["findings"]}
+
+    tamper_cases = (
+        ("split", "path", "policies/other.json", "split_policy_path_mismatch"),
+        ("split", "file_sha256", "0" * 64, "split_policy_hash_mismatch"),
+        ("split", "policy_version", "forged-split-v9", "split_policy_version_mismatch"),
+        ("label", "path", "policies/other-label.json", "label_policy_path_mismatch"),
+        ("label", "file_sha256", "f" * 64, "label_policy_hash_mismatch"),
+        ("label", "policy_version", "forged-label-v9", "label_policy_version_mismatch"),
+    )
+    for index, (kind, field, value, finding_code) in enumerate(tamper_cases):
+        tampered = json.loads(json.dumps(manifest))
+        tampered["policies"][kind][field] = value
+        tampered["semantic_sha256"] = _store().semantic_manifest_hash(tampered)
+        tampered_path = version_dir / f"tampered-policy-ref-{index}.json"
+        tampered_path.write_text(json.dumps(tampered, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        report = leak_audit.audit_split(tampered_path)
+        assert report.exit_code == 3
+        assert finding_code in {row.code for row in report.findings}
+
+    frozen_split = version_dir / refs["split"]["path"]
+    frozen_split.write_bytes(frozen_split.read_bytes() + b"\n")
+    frozen_tamper = leak_audit.audit_split(manifest_path)
+    assert frozen_tamper.exit_code == 3
+    assert "split_policy_snapshot_hash_mismatch" in {row.code for row in frozen_tamper.findings}
+
+
+def test_custom_policy_input_change_during_publication_leaves_no_manifest(tmp_path, monkeypatch):
+    bundle_path, _bundle = _empty_verified_bundle(tmp_path)
+    custom_split, custom_label, _split_value, _label_value = _custom_policy_sources(tmp_path)
+    output_root = tmp_path / "changing-policy-output"
+    store = _store()
+    original_audit = store.audit_split
+    changed = False
+
+    def change_policy_after_provisional_audit(manifest_path, **kwargs):
+        nonlocal changed
+        report = original_audit(manifest_path, **kwargs)
+        if not changed:
+            custom_split.write_bytes(custom_split.read_bytes() + b"\n")
+            changed = True
+        return report
+
+    monkeypatch.setattr(store, "audit_split", change_policy_after_provisional_audit)
+    result = dataset_builder.publish_frozen_dataset(
+        bundle_path, output_root, version_id="policy-change-v1",
+        policy_path=custom_split, label_policy_path=custom_label,
+    )
+
+    assert changed is True
+    assert result.exit_code == 2
+    assert result.status == "incomplete"
+    assert not (output_root / "policy-change-v1" / "manifest.json").exists()
 
 
 def test_public_cli_promotes_builder_provisional_claim_only_after_independent_ready_audit(tmp_path):

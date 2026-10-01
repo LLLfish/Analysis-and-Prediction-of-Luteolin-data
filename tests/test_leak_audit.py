@@ -140,14 +140,39 @@ def _memberships(clusters, assignment: dict) -> dict[str, str]:
     return rows
 
 
+def _frozen_policy_refs(root: Path) -> tuple[dict, dict]:
+    references = {}
+    claims = {}
+    for name, filename in (("split", "split_policy.json"), ("label", "label_policy.json")):
+        raw = (APL_ROOT / "policies" / filename).read_bytes()
+        parsed = json.loads(raw.decode("utf-8-sig"))
+        semantic_hash = evidence_builder.canonical_json_sha256(parsed)
+        references[name] = {
+            "path": f"policies/{filename}",
+            "file_sha256": hashlib.sha256(raw).hexdigest(),
+            "semantic_sha256": semantic_hash,
+            "schema_version": parsed["schema_version"],
+            "policy_version": parsed["policy_version"],
+        }
+        claims[f"{name}_policy_file_sha256"] = hashlib.sha256(raw).hexdigest()
+        claims[f"{name}_policy_semantic_sha256"] = semantic_hash
+        target = root / references[name]["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+    claims["label_policy_sha256"] = references["label"]["file_sha256"]
+    return references, claims
+
+
 def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path:
     """Build an untrusted candidate claim; audit tests never use it as evidence."""
     molecules = dataset_builder.build_molecule_clusters(bundle_path)
     proteins = dataset_builder.build_protein_clusters(bundle_path)
     split = dataset_builder.strict_double_cold_split(bundle_path, allow_test_only=True)
+    policy_refs, policy_claims = _frozen_policy_refs(tmp_path)
     claimed_split = {
         "strict_split_status": split.strict_split_status,
         "split_policy_sha256": split.policy_sha256,
+        **policy_claims,
         "entity_version": bundle["entity_version"],
         "entity_bundle_hash": bundle["content_sha256"],
         "molecule_memberships": _memberships(molecules.clusters, split.molecule_cluster_assignment),
@@ -168,7 +193,7 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
         "test_only_pair_assignments", "ambiguous_label_quarantine",
     )}
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "entities": {
             "path": bundle_path.relative_to(tmp_path).as_posix(),
             "schema_version": bundle["schema_version"],
@@ -177,6 +202,7 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
             "file_sha256": hashlib.sha256(entity_bytes).hexdigest(),
         },
         "source_provenance": bundle["source_provenance"],
+        "policies": policy_refs,
         "activities": {
             "entity_version": bundle["entity_version"],
             "entity_bundle_hash": bundle["content_sha256"],
@@ -494,16 +520,12 @@ def test_cli_malicious_fixture_returns_audit_violation_exit_code(tmp_path):
 def test_cli_alignment_budget_failure_returns_exit4_not_clean(tmp_path):
     bundle_path, bundle = _write_bundle(tmp_path, _two_protein_fixture())
     manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
-    policy = json.loads((APL_ROOT / "policies" / "split_policy.json").read_text(encoding="utf-8"))
-    policy["budgets"]["alignment_cells"] = 1
-    policy_path = tmp_path / "bounded-policy.json"
-    policy_path.write_text(json.dumps(policy, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     env = dict(os.environ)
     env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")})
 
     completed = subprocess.run(
         [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "leak_audit.py"),
-         "--manifest", str(manifest_path), "--policy", str(policy_path)],
+         "--manifest", str(manifest_path), "--max-alignment-cells", "1"],
         cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=30, check=False,
     )

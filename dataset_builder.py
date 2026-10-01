@@ -962,15 +962,31 @@ def _class_support(assignments: Iterable[PairSplitAssignment]) -> dict[str, dict
         split: {label: set() for label in ("active", "inactive")}
         for split in ("train", "val", "test")
     }
+    labels_by_group: dict[tuple[str, str], set[str]] = {}
+    splits_by_group: dict[str, set[str]] = {}
+    pairs_by_group: dict[str, set[str]] = {}
+    invalid_groups: set[tuple[str, str]] = set()
     for assignment in assignments:
+        if assignment.split not in group_ids or assignment.provenance_partition != "confirmed":
+            continue
+        key = (assignment.split, assignment.split_group_id)
         labels = set(assignment.labels)
-        if (assignment.split not in group_ids
-                or assignment.provenance_partition != "confirmed"
-                or len(labels) != 1):
+        bucket = labels_by_group.setdefault(key, set())
+        splits_by_group.setdefault(assignment.split_group_id, set()).add(assignment.split)
+        pairs_by_group.setdefault(assignment.split_group_id, set()).add(assignment.pair_key)
+        if len(labels) != 1 or not labels.issubset({"active", "inactive"}):
+            invalid_groups.add(key)
+        bucket.update(labels)
+    for group_id, splits in splits_by_group.items():
+        pair_keys = pairs_by_group[group_id]
+        if len(splits) != 1 or len(pair_keys) != 1:
+            invalid_groups.update((split, group_id) for split in splits)
+    for (split, group_id), labels in labels_by_group.items():
+        if (split, group_id) in invalid_groups or len(labels) != 1:
             continue
         label = next(iter(labels))
-        if label in group_ids[assignment.split]:
-            group_ids[assignment.split][label].add(assignment.split_group_id)
+        if label in group_ids[split]:
+            group_ids[split][label].add(group_id)
     return {
         split: {label: len(values) for label, values in labels.items()}
         for split, labels in group_ids.items()

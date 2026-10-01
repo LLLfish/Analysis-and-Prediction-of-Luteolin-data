@@ -190,7 +190,7 @@ def _git_state(code_root: Path) -> dict[str, Any]:
     if not branch or not commit or status is None:
         return {"status": "git_unavailable", "git_root": git_root, "branch": branch, "commit": commit,
                 "dirty": None, "dirty_paths": []}
-    dirty_paths = [line[3:] for line in status.splitlines() if len(line) >= 4]
+    dirty_paths = [line[2:].lstrip() for line in status.splitlines() if len(line) >= 3]
     return {
         "status": "git",
         "git_root": git_root,

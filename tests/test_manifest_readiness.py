@@ -148,6 +148,7 @@ def test_frozen_writer_copies_exact_entities_and_all_raw_bytes_and_audits_the_pu
     assert code_state["branch"] == "codex/p0-data-foundation"
     assert code_state["commit"] == head
     assert code_state["dirty"] is True
+    assert "output_dashboard.html" in code_state["dirty_paths"]
     for source in bundle["source_provenance"]:
         relative = Path(source["source_path"])
         assert (frozen_root / relative).read_bytes() == (bundle_path.parent / relative).read_bytes()

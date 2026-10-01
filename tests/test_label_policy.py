@@ -270,6 +270,19 @@ def test_measured_value_boundaries_are_inclusive_units_convert_and_pchembl_is_ig
     assert active.test_only_labeled_pairs[0].evidence_ids
 
 
+def test_synthetic_labels_require_explicit_test_only_opt_in(tmp_path):
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    record = _with_measurement(base, 715001, "Ki", "1", "uM")
+
+    result = _apply_test_records([record], tmp_path, allow_test_only=False)
+
+    assert result.confirmed_labeled_pairs == ()
+    assert result.test_only_labeled_pairs == ()
+    assert len(result.unverified) == 1
+    assert "synthetic_test_only" in result.unverified[0].reasons
+    assert result.counts["confirmed_active"] == 0
+
+
 def test_compatible_assay_conflict_is_quarantined_and_ki_kd_remain_separate(tmp_path):
     base = next(row for row in _producer_evidence() if row.activity_id == 700001)
     records = [

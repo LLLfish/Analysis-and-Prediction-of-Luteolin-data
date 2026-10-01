@@ -376,25 +376,31 @@ def _resolve_endpoint(
     record: Mapping[str, Any],
     side: str,
     alias_mappings: Mapping[str, Any],
-) -> tuple[Optional[str], str, tuple[str, ...], tuple[str, ...], Optional[str]]:
+) -> tuple[Optional[str], str, tuple[str, ...], tuple[str, ...], Optional[str], Optional[str]]:
     suffix = "A" if side == "a" else "B"
     direct_fields = (f"stringId_{suffix}", f"source_native_id_{side}")
-    for field in direct_fields:
-        if field in record:
-            value = record[field]
-            if not isinstance(value, str) or not value or value.strip() != value:
-                return None, "", (), (), field
-            return value, "", (), (), None
+    supplied_direct_fields = tuple(field for field in direct_fields if field in record)
+    if supplied_direct_fields:
+        direct_values = tuple(record[field] for field in supplied_direct_fields)
+        invalid_fields = tuple(
+            field for field, value in zip(supplied_direct_fields, direct_values)
+            if not isinstance(value, str) or not value or value.strip() != value
+        )
+        if invalid_fields:
+            return None, "", (), (), "|".join(invalid_fields), "invalid_native_identity"
+        if len(set(direct_values)) != 1:
+            return None, "", (), (), "|".join(supplied_direct_fields), "conflicting_native_identity"
+        return direct_values[0], "", (), (), None, None
 
     alias_field = f"protein_{side}"
     alias = record.get(alias_field)
     if not isinstance(alias, str) or not alias or alias.strip() != alias:
-        return None, "", (), (), alias_field
+        return None, "", (), (), alias_field, None
     mapping = alias_mappings.get(alias)
     if mapping is None:
-        return None, alias, (), (), alias_field
+        return None, alias, (), (), alias_field, None
     if not isinstance(mapping, Mapping):
-        return None, alias, (), (), alias_field
+        return None, alias, (), (), alias_field, None
     native_id = mapping.get("source_native_id")
     source = mapping.get("mapping_source")
     if (
@@ -405,15 +411,16 @@ def _resolve_endpoint(
         or not isinstance(source, str)
         or not source.strip()
     ):
-        return None, alias, (), (), alias_field
+        return None, alias, (), (), alias_field, None
     mapping_taxonomy = _strict_taxonomy(mapping.get("taxonomy_id"))
     if mapping_taxonomy is None:
-        return None, alias, (), (), "taxonomy_id"
+        return None, alias, (), (), "taxonomy_id", None
     return (
         native_id,
         alias,
         (source.strip(),),
         (canonical_json_sha256(mapping),),
+        None,
         None,
     )
 
@@ -925,11 +932,22 @@ def canonicalize_ppi(
         mapping_hashes = []
         original_endpoints = []
         for side in ("a", "b"):
-            native_id, original_id, sources, mapping_hashes_for_endpoint, field = _resolve_endpoint(
+            native_id, original_id, sources, mapping_hashes_for_endpoint, field, endpoint_error = _resolve_endpoint(
                 row, side, mappings
             )
             original_endpoints.append(original_id or native_id or "")
             if native_id is None:
+                if endpoint_error is not None:
+                    message = (
+                        "Endpoint native identity fields conflict."
+                        if endpoint_error == "conflicting_native_identity"
+                        else "Endpoint native identity fields must be non-empty, trimmed strings."
+                    )
+                    issues.append(ValidationIssue(
+                        endpoint_error, message, index, current_source, row_hash, field,
+                    ))
+                    row_error = True
+                    break
                 alias_field = f"protein_{side}"
                 alias = row.get(alias_field)
                 has_alias = isinstance(alias, str) and bool(alias)

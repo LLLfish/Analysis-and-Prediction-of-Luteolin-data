@@ -848,6 +848,15 @@ class NetworkPharmacologyFramework:
                 if isinstance(report, dict) and isinstance(ppi_report, dict):
                     report["ppi_trace"] = ppi_report.get("ppi_trace")
                     report["ppi_contract"] = ppi_report
+                if isinstance(report, dict):
+                    report["pipeline_status"] = self.results.get("pipeline_status", "partial")
+                    report["pipeline_status_reason"] = self.results.get("pipeline_status_reason")
+                report_path = None
+                save_report = getattr(self.output_module, "save_report", None)
+                if callable(save_report):
+                    report_path = save_report(report, "summary.json")
+                    if not isinstance(report_path, str) or not report_path:
+                        raise RuntimeError("Summary report persistence returned no path")
                 self.output_module.generate_dashboard_html(report)
                 plot_input = {
                     'targets': target_data,
@@ -857,6 +866,9 @@ class NetworkPharmacologyFramework:
                 }
                 self.output_module.generate_plots(plot_input)
                 output_results = report
+                if report_path is not None:
+                    output_results = dict(report)
+                    output_results["summary_report_path"] = report_path
             except Exception as e:
                 logger.error("Output generation failed: %s", e)
 
@@ -973,11 +985,39 @@ class NetworkPharmacologyFramework:
             raise FileExistsError(
                 "Full pipeline requires a new output directory; existing framework outputs are read-only."
             )
-        if self.output_dir is None or not getattr(self, "allow_online", False):
+        if self.output_dir is None:
             dataset = self.run_data_collection()
             self.results["pipeline_status"] = "partial"
             self.results["pipeline_status_reason"] = dataset.get("reason", "explicit_output_and_online_opt_in_required")
             logger.info("Pipeline remains partial because collection is not configured")
+            return self.results
+
+        if not getattr(self, "allow_online", False):
+            dataset = self.run_data_collection()
+            features = self.run_feature_extraction(dataset)
+            self.run_feature_fusion(features)
+            self.results["docking"] = {
+                "status": "unavailable",
+                "reason": "explicit_online_collection_opt_in_required_for_receptor_retrieval",
+                "targets": {},
+            }
+            self.run_knowledge_graph(dataset)
+            self.results["pipeline_status"] = "partial"
+            self.results["pipeline_status_reason"] = dataset.get(
+                "reason", "explicit_online_collection_opt_in_required",
+            )
+            self.run_output_generation()
+            report_path = self.results.get("output", {}).get("summary_report_path")
+            if not report_path:
+                self.results["pipeline_status"] = "failed"
+                self.results["pipeline_status_reason"] = "summary_report_persistence_failed"
+                self.save_results()
+                raise RuntimeError("Offline partial pipeline summary report could not be persisted")
+            if not self.save_results():
+                self.results["pipeline_status"] = "failed"
+                self.results["pipeline_status_reason"] = "framework_results_persistence_failed"
+                raise RuntimeError("Framework results could not be persisted; full pipeline did not complete")
+            logger.info("Pipeline remains partial because online collection was not opted in")
             return self.results
 
         logger.info("Starting full pipeline execution...")
@@ -988,9 +1028,6 @@ class NetworkPharmacologyFramework:
         self.run_feature_fusion(features)
         self.run_docking(dataset)
         self.run_knowledge_graph(dataset)
-        self.run_output_generation()
-
-        runtime = (datetime.now() - start_time).total_seconds()
         status = self.results.get("feature_extraction", {}).get(
             "feature_readiness", {},
         ).get("overall_status", "unavailable")
@@ -1001,6 +1038,10 @@ class NetworkPharmacologyFramework:
             if collection_status == "complete" and status == "ready" and fusion_status == "ready"
             else "partial"
         )
+        self.results.pop("pipeline_status_reason", None)
+        self.run_output_generation()
+
+        runtime = (datetime.now() - start_time).total_seconds()
         saved_path = self.save_results()
         if not saved_path:
             self.results["pipeline_status"] = "failed"

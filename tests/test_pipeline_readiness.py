@@ -979,7 +979,10 @@ def test_configured_offline_full_pipeline_persists_partial_status_and_report(tmp
     saved_results = saved["results"]
     assert result["pipeline_status"] == saved_results["pipeline_status"] == "partial"
     assert saved_results["pipeline_status_reason"] == "explicit_online_collection_opt_in_required"
+    assert report["pipeline_status"] == saved_results["pipeline_status"]
+    assert report["pipeline_status_reason"] == saved_results["pipeline_status_reason"]
     assert saved_results["data_collection"]["collection_status"] == "not_requested"
+    assert saved_results["docking"]["reason"] == "explicit_online_collection_opt_in_required_for_receptor_retrieval"
     stages = saved_results["feature_extraction"]["feature_readiness"]["stages"]
     assert stages["protein"]["status"] == "unavailable"
     assert stages["cnn"]["status"] == "skipped_untrained"

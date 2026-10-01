@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import hashlib
 import importlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -23,6 +26,13 @@ import leak_audit
 
 APL_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "activity_pages.json"
+READY_MOCK_SMILES = (
+    "C1CCCCC1", "C1CCCC1", "C1CCCCCC1", "C1CCCCCCC1", "C1CCCCCCCC1",
+    "C1CCOC1", "C1CCNC1", "C1CCSC1", "C1COCCO1", "C1CCNCC1",
+    "C1COCCN1", "C1CCOCC1", "c1ccccc1", "c1ccncc1", "c1ccoc1",
+    "c1ccsc1", "c1ncc[nH]1", "c1ccc2ccccc2c1", "c1ccc2ncccc2c1",
+    "C1C2CC3CC1CC(C2)C3",
+)
 
 
 def _store():
@@ -78,6 +88,110 @@ def _split_payload(bundle_path: Path, bundle: dict) -> dict:
         "class_support": {name: {"active": 0, "inactive": 0} for name in ("train", "val", "test")},
         "training_ready": False,
     }
+
+
+def _source_verified_ready_mock_bundle(tmp_path: Path) -> Path:
+    """Build an online-shaped local producer fixture for tool-only readiness tests."""
+    payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    payload["source_kind"] = "online_snapshot"
+    payload["purpose"] = "synthetic_test_only_tool_capability_fixture"
+    chembl = payload["chembl"]
+    base_molecule = deepcopy(chembl["molecules"][1])
+    base_activity = deepcopy(chembl["activities_by_molecule"]["CHEMBL123456"]["pages"][0]["activities"][0])
+    base_page = deepcopy(chembl["activities_by_molecule"]["CHEMBL123456"]["pages"][0])
+    base_target = deepcopy(chembl["targets"][0])
+    base_component = deepcopy(payload["uniprot"]["P12345"])
+    base_assay = deepcopy(next(row for row in chembl["assays"] if row["assay_chembl_id"] == "CHEMBL910001"))
+    base_document = deepcopy(next(row for row in chembl["documents"] if row["document_chembl_id"] == "CHEMBL910101"))
+    amino_acids = "ACDEFGHIKLMNPQRSTVWY"
+
+    molecules = []
+    targets = []
+    assays = []
+    documents = []
+    uniprot = {}
+    activity_pages = {}
+    for molecule_index, smiles in enumerate(READY_MOCK_SMILES):
+        molecule_id = f"CHEMBL920{molecule_index + 1:03d}"
+        molecule = deepcopy(base_molecule)
+        molecule.update(molecule_chembl_id=molecule_id, pref_name=f"tool fixture molecule {molecule_index + 1}")
+        molecule["molecule_structures"]["canonical_smiles"] = smiles
+        molecules.append(molecule)
+
+        activity_rows = []
+        for protein_index in range(len(READY_MOCK_SMILES)):
+            accession = f"P{protein_index + 1:05d}"
+            target_id = f"CHEMBL930{protein_index + 1:03d}"
+            assay_id = f"CHEMBL940{protein_index + 1:03d}"
+            document_id = f"CHEMBL950{protein_index + 1:03d}"
+            if molecule_index == 0:
+                target = deepcopy(base_target)
+                target.update(target_chembl_id=target_id, pref_name=f"tool fixture target {protein_index + 1}")
+                target["target_components"] = [{
+                    "component_id": protein_index + 1,
+                    "accession": accession,
+                    "component_type": "PROTEIN",
+                    "organism": "Homo sapiens",
+                }]
+                targets.append(target)
+
+                protein = deepcopy(base_component)
+                protein["primaryAccession"] = accession
+                sequence = "".join(random.Random(7000 + protein_index).choices(amino_acids, k=40))
+                protein["sequence"]["value"] = sequence
+                protein["sequence"]["length"] = len(sequence)
+                uniprot[accession] = protein
+
+                assay = deepcopy(base_assay)
+                assay.update(assay_chembl_id=assay_id, target_chembl_id=target_id, confidence_score=9)
+                assays.append(assay)
+                document = deepcopy(base_document)
+                document.update(document_chembl_id=document_id, doi=f"10.0000/tool-fixture.{protein_index + 1:03d}")
+                documents.append(document)
+
+            row = deepcopy(base_activity)
+            row.update(
+                activity_id=97000000 + molecule_index * len(READY_MOCK_SMILES) + protein_index,
+                molecule_chembl_id=molecule_id,
+                target_chembl_id=target_id,
+                assay_chembl_id=assay_id,
+                document_chembl_id=document_id,
+                standard_type="Ki",
+                standard_relation="=",
+                standard_value="100" if (molecule_index + protein_index) % 2 == 0 else "100000",
+                standard_units="nM",
+            )
+            activity_rows.append(row)
+
+        if molecule_index == 0:
+            # One measured but independent-only endpoint remains quarantined;
+            # train/val/test qualified support remains supplied by other pairs.
+            activity_rows[0]["standard_type"] = "IC50"
+
+        page = deepcopy(base_page)
+        page["molecule_chembl_id"] = molecule_id
+        page["activities"] = activity_rows
+        page["page_meta"].update(
+            limit=len(activity_rows), offset=0, next=None, previous=None,
+            total_count=len(activity_rows),
+        )
+        activity_pages[molecule_id] = {"pages": [page]}
+
+    chembl["molecules"] = molecules
+    chembl["targets"] = targets
+    chembl["assays"] = assays
+    chembl["documents"] = documents
+    chembl["activities_by_molecule"] = activity_pages
+    payload["uniprot"] = uniprot
+
+    source_manifest = tmp_path / "ready-tool-fixture.json"
+    source_manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    staging = tmp_path / "ready-tool-producer"
+    result = evidence_builder.ingest_local_manifest(source_manifest, staging)
+    assert result["status"] == "complete", result
+    bundle_path = staging / "entities.json"
+    assert evidence_builder.load_entity_bundle(bundle_path, verify_sources=True)["source_kind"] == "online_snapshot"
+    return bundle_path
 
 
 def _fake_legacy_sources(root: Path) -> None:
@@ -161,20 +275,39 @@ def test_frozen_writer_copies_exact_entities_and_all_raw_bytes_and_audits_the_pu
     assert report.training_ready is False
 
 
-def test_competing_writers_have_one_success_and_never_publish_a_partial_manifest(tmp_path):
+def test_competing_writers_have_one_success_and_never_publish_a_partial_manifest(tmp_path, monkeypatch):
     bundle_path, bundle = _empty_verified_bundle(tmp_path)
     split = _split_payload(bundle_path, bundle)
     output_root = tmp_path / "race"
     output_root.mkdir()
-    writer_type = _store().FrozenManifestWriter
+    store = _store()
+    writer_type = store.FrozenManifestWriter
     writers = [writer_type(output_root, version_id="same-version") for _ in range(2)]
+    audit_started = threading.Event()
+    release_audit = threading.Event()
+    original_audit = store.audit_split
+
+    def hold_first_writer(manifest_path):
+        audit_started.set()
+        if not release_audit.wait(timeout=10):
+            raise TimeoutError("test did not release first writer")
+        return original_audit(manifest_path)
+
+    monkeypatch.setattr(store, "audit_split", hold_first_writer)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda writer: writer.publish(bundle_path, split=split), writers))
+        first_future = executor.submit(writers[0].publish, bundle_path, split=split)
+        assert audit_started.wait(timeout=10)
+        second = writers[1].publish(bundle_path, split=split)
+        release_audit.set()
+        first = first_future.result(timeout=30)
+        results = [first, second]
 
     statuses = [result.status for result in results]
     assert statuses.count("complete") == 1
-    assert all(status in {"complete", "busy", "exists"} for status in statuses)
+    assert sum(result.exit_code == 0 for result in results) == 1
+    assert all(result.exit_code in {0, 2} for result in results)
+    assert all(status in {"complete", "busy", "conflict"} for status in statuses)
     final_dir = output_root / "same-version"
     if "complete" in statuses:
         manifest_path = final_dir / "manifest.json"
@@ -279,8 +412,27 @@ def test_existing_version_is_immutable_when_input_claim_changes(tmp_path):
 
     second = writer.publish(bundle_path, split=changed)
 
-    assert second.status in {"exists", "conflict"}
+    assert second.status == "conflict"
+    assert second.exit_code == 2
     assert manifest_path.read_bytes() == before
+
+
+def test_corrupt_existing_manifest_is_conflict_not_success_or_repair(tmp_path):
+    bundle_path, bundle = _empty_verified_bundle(tmp_path)
+    split = _split_payload(bundle_path, bundle)
+    output_root = tmp_path / "corrupt-existing"
+    writer = _store().FrozenManifestWriter(output_root, version_id="v1")
+    first = writer.publish(bundle_path, split=split)
+    manifest_path = Path(first.manifest_path)
+    manifest_path.write_bytes(b"{}")
+    corrupt_bytes = manifest_path.read_bytes()
+
+    assert leak_audit.audit_split(manifest_path).exit_code != 0
+    second = writer.publish(bundle_path, split=split)
+
+    assert second.status == "conflict"
+    assert second.exit_code == 2
+    assert manifest_path.read_bytes() == corrupt_bytes
 
 
 def test_no_git_input_records_not_initialized_and_null_commit(tmp_path):
@@ -308,13 +460,25 @@ def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_referen
     assert set(by_id) == {"apl_data", "framework_output_data", "offline_data"}
     assert all(row["training_ready"] is False for row in by_id.values())
     assert by_id["offline_data"]["observed_counts"]["activity_records"] == 0
+    assert by_id["offline_data"]["observed_counts"]["unverified_activity_records"] == 0
+    assert by_id["offline_data"]["label_statistics_status"] == "not_evaluated_no_activity_records"
+    assert by_id["offline_data"]["observed_counts"]["confirmed_active"] is None
     assert by_id["offline_data"]["observed_counts"]["compound_records"] == 1
     assert by_id["offline_data"]["observed_counts"]["protein_records"] == 1
     assert by_id["offline_data"]["observed_counts"]["ppi_edges"] == 1
     assert by_id["offline_data"]["observed_counts"]["distinct_target_ids"] == 1
+    for source_id in ("apl_data", "framework_output_data"):
+        source = by_id[source_id]
+        assert source["observed_counts"]["unverified_activity_records"] == 1
+        assert source["label_statistics_status"] == "not_evaluated"
+        assert source["observed_counts"]["confirmed_active"] is None
+        assert source["observed_counts"]["confirmed_inactive"] is None
+        assert source["observed_counts"]["unknown"] is None
+        assert source["observed_counts"]["quarantine"] is None
     offline_file = by_id["offline_data"]["files"][0]
     assert offline_file["embedded_static_reference"]["source_kind"] == "static_reference"
     assert offline_file["embedded_static_reference"]["collection_counts"]["$.targets"] == 2
+    assert offline_file["embedded_static_reference"]["label_statistics_status"] == "not_evaluated_static_reference"
     tcmsp = next(file for file in by_id["apl_data"]["files"] if file["relative_path"].endswith("tcmsp_luteolin.json"))
     assert tcmsp["source_kind"] == "static_reference"
     assert by_id["apl_data"]["source_sha256"] != by_id["framework_output_data"]["source_sha256"]
@@ -393,6 +557,43 @@ def test_dataset_builder_cli_returns_zero_for_tool_success_with_training_not_rea
     result = json.loads(completed.stdout)
     assert result["status"] == "complete"
     assert result["audit_report"]["training_ready"] is False
+
+    repeated = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "dataset_builder.py"),
+         "--entities", str(bundle_path), "--out", str(output_root), "--version", "cli-v1"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=45, check=False,
+    )
+    assert repeated.returncode == 2, (repeated.stdout or "") + (repeated.stderr or "")
+    assert json.loads(repeated.stdout)["status"] == "conflict"
+
+
+def test_public_cli_promotes_builder_provisional_claim_only_after_independent_ready_audit(tmp_path):
+    bundle_path = _source_verified_ready_mock_bundle(tmp_path)
+    output_root = tmp_path / "ready-frozen"
+    env = dict(os.environ)
+    env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")})
+
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "dataset_builder.py"),
+         "--entities", str(bundle_path), "--out", str(output_root), "--version", "ready-v1"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=90, check=False,
+    )
+
+    assert completed.returncode == 0, (completed.stdout or "") + (completed.stderr or "")
+    result = json.loads(completed.stdout)
+    assert result["status"] == "complete"
+    assert result["audit_report"]["training_ready"] is True
+    manifest_path = output_root / "ready-v1" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["split"]["training_ready"] is True
+    assert manifest["audit"]["status"] == "clean"
+    assert manifest["split"]["crosspair_quarantine"]
+    assert manifest["split"]["unassigned_pairs"]
+    independent = leak_audit.audit_split(manifest_path)
+    assert independent.exit_code == 0
+    assert independent.training_ready is True
 
 
 def test_dataset_builder_cli_incomplete_version_argument_returns_two_without_output(tmp_path):

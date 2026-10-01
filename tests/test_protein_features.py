@@ -78,6 +78,22 @@ def _extractor(tmp_path: Path, *, max_tokens: int = 8):
     )
 
 
+def _extract_test_result(output_dir: Path, bundle_path: Path):
+    extractor = protein_features.ProteinFeatureExtractor(
+        output_dir=str(output_dir),
+        esm_model_name="mock/esm",
+        model_revision="mock-r1",
+        model=object(),
+        tokenizer=object(),
+        test_only=True,
+    )
+    extractor._extract_residue_embedding = lambda sequence: (
+        protein_features.np.array([1.0, 2.0]), "ready", None,
+    )
+    results = extractor.extract_from_bundle(str(bundle_path), test_only=True)
+    assert len(results) == 1
+    return extractor, results[0]
+
 def _synthetic_feature_result(bundle: dict) -> data_contracts.FeatureResult:
     protein = data_contracts.ProteinRecord(**bundle["proteins"][0])
     model_id = "mock/esm"
@@ -281,18 +297,16 @@ def test_feature_save_requires_explicit_unprotected_output_and_refuses_conflicts
     embeddings.mkdir(parents=True)
     destination = embeddings / "existing.json"
     destination.write_bytes(b"keep-existing-feature")
-    _, bundle = _bundle(tmp_path)
-    result = _synthetic_feature_result(bundle)
-    safe_extractor = protein_features.ProteinFeatureExtractor(output_dir=str(safe_root))
+    bundle_path, _ = _bundle(tmp_path)
+    safe_extractor, result = _extract_test_result(safe_root, bundle_path)
     with pytest.raises(FileExistsError, match="existing|conflict"):
         safe_extractor.save_features("existing.json", result=result)
     assert destination.read_bytes() == b"keep-existing-feature"
 
 
 def test_feature_save_requires_explicit_result_and_writes_full_provenance(tmp_path):
-    _, bundle = _bundle(tmp_path)
-    result = _synthetic_feature_result(bundle)
-    extractor = protein_features.ProteinFeatureExtractor(output_dir=str(tmp_path / "safe-output"))
+    bundle_path, _ = _bundle(tmp_path)
+    extractor, result = _extract_test_result(tmp_path / "safe-output", bundle_path)
     extractor.features = {"esm_embedding": [999.0]}
 
     with pytest.raises(ValueError, match="explicit FeatureResult"):
@@ -310,6 +324,39 @@ def test_feature_save_requires_explicit_result_and_writes_full_provenance(tmp_pa
     assert saved["pooling_policy"] == result.pooling_policy
     assert saved["cache_key"] == result.cache_key
 
+
+def test_save_features_rejects_forged_ready_results_and_modified_clones(tmp_path):
+    bundle_path, bundle = _bundle(tmp_path)
+    extractor, issued = _extract_test_result(tmp_path / "feature-output", bundle_path)
+    unissued_test_result = _synthetic_feature_result(bundle)
+    forged_ready = replace(
+        unissued_test_result,
+        status="ready",
+        reason=None,
+        source_kind="offline_snapshot",
+        test_provenance=None,
+    )
+
+    with pytest.raises(ValueError, match="issued|source-verified"):
+        extractor.save_features("forged-ready.json", result=forged_ready)
+    assert not (tmp_path / "feature-output" / "embeddings" / "forged-ready.json").exists()
+
+    entity_hash = "c" * 64
+    modified_results = (
+        replace(issued, features={"esm_embedding": [9.0, 2.0]}),
+        replace(issued, cache_key="a" * 64),
+        replace(issued, model_artifact_sha256="b" * 64),
+        replace(
+            issued,
+            entity_bundle_hash=entity_hash,
+            entity_version=f"entities-v2-{entity_hash[:16]}",
+        ),
+    )
+    for index, modified in enumerate(modified_results):
+        filename = f"modified-{index}.json"
+        with pytest.raises(ValueError, match="issued|source-verified"):
+            extractor.save_features(filename, result=modified)
+        assert not (tmp_path / "feature-output" / "embeddings" / filename).exists()
 
 def test_extractor_tracks_latest_result_across_extraction_cache_and_failure(tmp_path, monkeypatch):
     bundle_path, _ = _bundle(tmp_path)
@@ -330,6 +377,8 @@ def test_extractor_tracks_latest_result_across_extraction_cache_and_failure(tmp_
     first = extractor.extract_from_bundle(str(bundle_path), test_only=True)[0]
     assert extractor.last_result == first
     assert first.status == "test_only"
+    first_path = Path(extractor.save_features("first.json", result=first))
+    assert json.loads(first_path.read_text(encoding="utf-8")) == first.to_dict()
 
     monkeypatch.setattr(
         extractor,
@@ -339,15 +388,24 @@ def test_extractor_tracks_latest_result_across_extraction_cache_and_failure(tmp_
     cached = extractor.extract_from_bundle(str(bundle_path), test_only=True)[0]
     assert cached == first
     assert extractor.last_result == cached
+    cached_path = Path(extractor.save_features("cached.json", result=cached))
+    assert json.loads(cached_path.read_text(encoding="utf-8")) == cached.to_dict()
 
     failed = extractor.extract_from_bundle(str(bundle_path), test_only=False)[0]
     assert failed.status == "unverified_source"
     assert extractor.last_result == failed
+    failed_path = Path(extractor.save_features("failed.json", result=failed))
+    assert json.loads(failed_path.read_text(encoding="utf-8")) == failed.to_dict()
 
     with pytest.raises(FileNotFoundError):
         extractor.extract_from_bundle(str(tmp_path / "missing" / "entities.json"), test_only=True)
     assert extractor.last_result.status == "unavailable"
     assert extractor.last_result.reason == "entity_bundle_verification_failed"
+    unavailable_path = Path(extractor.save_features("unavailable.json", result=extractor.last_result))
+    unavailable = json.loads(unavailable_path.read_text(encoding="utf-8"))
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["reason"] == "entity_bundle_verification_failed"
+    assert unavailable["features"] == {}
 
 
 def test_unbound_sequence_api_cannot_emit_protein_features(tmp_path):

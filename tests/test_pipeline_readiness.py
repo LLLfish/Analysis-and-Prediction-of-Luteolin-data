@@ -946,3 +946,53 @@ def test_feature_only_public_pipeline_raises_when_result_persistence_fails(tmp_p
     monkeypatch.setattr(main_module, "NetworkPharmacologyFramework", FailedSaveFramework)
     with pytest.raises(RuntimeError, match="could not be saved"):
         main_module.run_feature_pipeline(str(bundle_path), str(output_root))
+
+
+def test_configured_offline_full_pipeline_persists_partial_status_and_report(tmp_path, monkeypatch):
+    import requests
+
+    _install_write_guard(monkeypatch)
+    http_calls = []
+
+    def reject_http(*args, **kwargs):
+        http_calls.append((args, kwargs))
+        raise AssertionError("offline full pipeline must not make HTTP requests")
+
+    monkeypatch.setattr(requests.sessions.Session, "request", reject_http)
+    output_root = tmp_path / "offline-run"
+    framework = main_module.NetworkPharmacologyFramework(
+        output_dir=str(output_root), allow_online=False,
+    )
+    monkeypatch.setattr(
+        framework, "_download_pdb",
+        lambda pdb_id: pytest.fail(f"offline run attempted PDB retrieval: {pdb_id}"),
+    )
+
+    result = framework.run_full_pipeline()
+
+    results_path = output_root / "framework_results.json"
+    report_path = output_root / "output" / "reports" / "summary.json"
+    assert results_path.is_file()
+    assert report_path.is_file()
+    saved = json.loads(results_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    saved_results = saved["results"]
+    assert result["pipeline_status"] == saved_results["pipeline_status"] == "partial"
+    assert saved_results["pipeline_status_reason"] == "explicit_online_collection_opt_in_required"
+    assert saved_results["data_collection"]["collection_status"] == "not_requested"
+    stages = saved_results["feature_extraction"]["feature_readiness"]["stages"]
+    assert stages["protein"]["status"] == "unavailable"
+    assert stages["cnn"]["status"] == "skipped_untrained"
+    assert stages["transformer"]["status"] == "skipped_untrained"
+    assert report["feature_readiness"]["stages"] == stages
+    assert http_calls == []
+
+
+def test_no_output_root_full_pipeline_remains_memory_only(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    framework = main_module.NetworkPharmacologyFramework()
+
+    result = framework.run_full_pipeline()
+
+    assert result["pipeline_status"] == "partial"
+    assert list(tmp_path.iterdir()) == []

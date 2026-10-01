@@ -206,6 +206,31 @@ def test_interruption_before_manifest_commit_leaves_no_completed_version_and_cle
     assert not list(version_dir.glob("*.tmp.*"))
 
 
+def test_interruption_during_nested_snapshot_copy_cleans_its_temp_without_publishing(tmp_path, monkeypatch):
+    bundle_path, bundle = _empty_verified_bundle(tmp_path)
+    split = _split_payload(bundle_path, bundle)
+    output_root = tmp_path / "nested-interruption"
+    output_root.mkdir()
+    store = _store()
+    writer = store.FrozenManifestWriter(output_root, version_id="nested-interruption-v1")
+    original_replace = store.os.replace
+
+    def interrupt_raw_copy(source, destination):
+        if Path(destination).name == "metadata.json":
+            raise OSError("injected interruption during nested raw snapshot replace")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(store.os, "replace", interrupt_raw_copy)
+    result = writer.publish(bundle_path, split=split)
+
+    version_dir = output_root / "nested-interruption-v1"
+    assert result.status == "incomplete"
+    assert not (version_dir / "manifest.json").exists()
+    assert (version_dir / "entities.json").is_file()
+    assert not list(version_dir.rglob("*.tmp.*"))
+    assert not (version_dir / "raw" / "metadata.json").exists()
+
+
 def test_input_change_after_independent_audit_blocks_manifest_commit(tmp_path, monkeypatch):
     bundle_path, bundle = _empty_verified_bundle(tmp_path)
     split = _split_payload(bundle_path, bundle)

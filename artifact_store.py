@@ -249,7 +249,8 @@ def _cleanup_own_temps(version_dir: Path, token: str, temporary_paths: set[Path]
     for path in tuple(temporary_paths):
         try:
             resolved = path.resolve(strict=False)
-            if resolved.parent != root or token not in resolved.name or not resolved.name.endswith(token):
+            relative = resolved.relative_to(root)
+            if (not relative.parts or token not in resolved.name or not resolved.name.endswith(token)):
                 continue
             if path.is_file() and not path.is_symlink():
                 path.unlink()

@@ -274,6 +274,17 @@ def _audit_file(source_id: str, source_root: Path, path: Path) -> dict[str, Any]
             page_proof_present=page_proof,
             source_kind=_source_kind(source_id, relative, payload),
         )
+        if source_id == "offline_data" and isinstance(payload, Mapping):
+            core_payload = {key: value for key, value in payload.items() if str(key).casefold() != "tcmsp"}
+            base["id_values"] = _flatten_ids(core_payload)
+            static_reference = payload.get("tcmsp")
+            if isinstance(static_reference, Mapping):
+                base["embedded_static_reference"] = {
+                    "source_kind": "static_reference",
+                    "declared_source": static_reference.get("source"),
+                    "collection_counts": _collections(static_reference),
+                    "id_values": _flatten_ids(static_reference),
+                }
         if isinstance(payload, Mapping) and isinstance(payload.get("source"), str):
             base["declared_source"] = payload.get("source")
     elif suffix in {".csv", ".tsv"}:
@@ -305,6 +316,8 @@ def _audit_file(source_id: str, source_root: Path, path: Path) -> dict[str, Any]
 def _root_metrics(source_id: str, files: Sequence[Mapping[str, Any]], source_kind: str) -> dict[str, Any]:
     ids: dict[str, set[str]] = {}
     for file in files:
+        if source_id != "offline_data" and file.get("source_kind") == "static_reference":
+            continue
         for key, values in file.get("id_values", {}).items():
             ids.setdefault(key, set()).update(str(value) for value in values)
     def id_values(*keys: str) -> set[str]:
@@ -326,11 +339,10 @@ def _root_metrics(source_id: str, files: Sequence[Mapping[str, Any]], source_kin
         offline = next((row for row in files if Path(str(row.get("relative_path", ""))).name == "offline_data.json"), {})
         collections = offline.get("collection_counts", {})
         activity_count = 0
-        molecule_count = max((count for key, count in collections.items() if key.casefold().endswith(".compound")), default=0)
-        target_count = max((count for key, count in collections.items() if key.casefold().endswith(".targets")), default=target_count)
-        protein_count = max((count for key, count in collections.items() if key.casefold().endswith(".proteins")), default=protein_count)
-        ppi_count = max((count for key, count in collections.items()
-                         if key.casefold().endswith((".ppi", ".edges", ".interactions"))), default=0)
+        molecule_count = collections.get("$.compound", 0)
+        target_count = collections.get("$.targets", target_count)
+        protein_count = collections.get("$.proteins", protein_count)
+        ppi_count = collections.get("$.interactions", collections.get("$.ppi", collections.get("$.edges", 0)))
     sequence_count = sum(int(row.get("sequence_record_count") or 0) for row in files)
     missing_activity_fields = list(_ACTIVITY_REQUIRED_FIELDS)
     if chembl_files:

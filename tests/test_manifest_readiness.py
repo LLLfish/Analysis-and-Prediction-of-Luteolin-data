@@ -100,9 +100,12 @@ def _fake_legacy_sources(root: Path) -> None:
     }), encoding="utf-8")
     (root / "offline_data.json").write_text(json.dumps({
         "compound": {"name": "Luteolin"},
-        "targets": [{"gene_symbol": "EGFR"}],
+        "targets": [{"gene_symbol": "EGFR", "target_chembl_id": "CHEMBL1"}],
         "proteins": {"EGFR": {"uniprot_id": "P00533", "length": 1210}},
         "interactions": [{"protein_a": "EGFR", "protein_b": "GRB2"}],
+        "tcmsp": {"source": "online", "targets": [
+            {"target_chembl_id": "CHEMBL2"}, {"target_chembl_id": "CHEMBL3"},
+        ]},
     }), encoding="utf-8")
 
 
@@ -282,6 +285,10 @@ def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_referen
     assert by_id["offline_data"]["observed_counts"]["compound_records"] == 1
     assert by_id["offline_data"]["observed_counts"]["protein_records"] == 1
     assert by_id["offline_data"]["observed_counts"]["ppi_edges"] == 1
+    assert by_id["offline_data"]["observed_counts"]["distinct_target_ids"] == 1
+    offline_file = by_id["offline_data"]["files"][0]
+    assert offline_file["embedded_static_reference"]["source_kind"] == "static_reference"
+    assert offline_file["embedded_static_reference"]["collection_counts"]["$.targets"] == 2
     tcmsp = next(file for file in by_id["apl_data"]["files"] if file["relative_path"].endswith("tcmsp_luteolin.json"))
     assert tcmsp["source_kind"] == "static_reference"
     assert by_id["apl_data"]["source_sha256"] != by_id["framework_output_data"]["source_sha256"]

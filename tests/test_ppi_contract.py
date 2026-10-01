@@ -314,6 +314,73 @@ def test_conflicting_direct_native_identity_fields_are_quarantined_as_a_group():
     assert accepted.edge_count == 1
 
 
+def test_online_complete_envelope_cannot_bypass_snapshot_binding():
+    envelope = {
+        "schema_version": 2,
+        "source_kind": "online_snapshot",
+        "interactions": [ONLINE_EDGE],
+    }
+
+    result = canonicalize_ppi(envelope, request_status="complete")
+
+    assert result.status == "invalid"
+    assert result.edge_count == 0
+    assert "missing_source_snapshot" in {issue.code for issue in result.issues}
+
+
+def test_envelope_and_explicit_request_status_conflict_is_rejected():
+    envelope = {
+        "schema_version": 2,
+        "source_kind": "online_snapshot",
+        "request_status": "failed",
+        "interactions": [ONLINE_EDGE],
+    }
+
+    result = canonicalize_ppi(
+        envelope,
+        source_kind="online_snapshot",
+        request_status="complete",
+    )
+
+    assert result.status == "invalid"
+    assert result.edge_count == 0
+    assert "conflicting_request_status" in {issue.code for issue in result.issues}
+
+
+@pytest.mark.parametrize("request_status", ["failed", "not_requested"])
+def test_unsuccessful_request_with_records_is_quarantined_and_idempotent(request_status):
+    result = canonicalize_ppi(
+        [ONLINE_EDGE],
+        source_kind="legacy_unverified",
+        request_status=request_status,
+    )
+
+    assert result.status == "invalid"
+    assert result.edge_count == 0
+    assert result.accepted_record_count == 0
+    revalidated = canonicalize_ppi(result)
+    assert revalidated.to_dict() == result.to_dict()
+
+
+def test_failed_ppi_metadata_cannot_diverge_between_networkx_and_knowledge_graph(tmp_path):
+    dataset = _dataset(
+        [ONLINE_EDGE],
+        ppi_source_kind="legacy_unverified",
+        ppi_request_status="failed",
+    )
+
+    framework, features, kg_results = _run_consumers(tmp_path, "failed-ppi-with-rows", dataset)
+
+    ppi = features["ppi"]
+    kg_ppi = kg_results["ppi_contract"]
+    assert ppi["status"] == kg_ppi["status"] == "invalid"
+    assert ppi["edge_count"] == kg_ppi["edge_count"] == 0
+    assert features["gnn"]["num_edges"] == 0
+    assert framework.gnn_analyzer.graph is None or framework.gnn_analyzer.graph.number_of_edges() == 0
+    assert _ppi_graph_edges(framework.kg_module.graph) == set()
+    assert ppi["ppi_trace"] == kg_ppi["ppi_trace"]
+
+
 def test_score_boundaries_and_invalid_types_have_explicit_ledger_codes():
     base = {
         "source_native_id_a": "9606.ENSP00000354587",

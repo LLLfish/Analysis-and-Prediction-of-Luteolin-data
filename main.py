@@ -118,6 +118,7 @@ class NetworkPharmacologyFramework:
                 raise ValueError("output directory changed resolution after creation")
             _assert_output_path_is_unprotected(created_output, created_output)
         self._output_dir_preexisted = False
+        self._full_pipeline_started = False
         self.allow_online = allow_online
 
         if self.output_dir is None:
@@ -967,6 +968,9 @@ class NetworkPharmacologyFramework:
             "Destructive output cleanup is disabled; use a new run output directory."
         )
     def run_full_pipeline(self) -> Dict[str, Any]:
+        if getattr(self, "_full_pipeline_started", False):
+            raise FileExistsError("Full pipeline instances are single-use; create a new framework with a fresh output directory.")
+        self._full_pipeline_started = True
         if getattr(self, "_output_dir_preexisted", True):
             raise FileExistsError(
                 "Full pipeline requires a new output directory; existing framework outputs are read-only."
@@ -987,7 +991,6 @@ class NetworkPharmacologyFramework:
         self.run_docking(dataset)
         self.run_knowledge_graph(dataset)
         self.run_output_generation()
-        self.save_results()
 
         runtime = (datetime.now() - start_time).total_seconds()
         status = self.results.get("feature_extraction", {}).get(
@@ -1000,6 +1003,11 @@ class NetworkPharmacologyFramework:
             if collection_status == "complete" and status == "ready" and fusion_status == "ready"
             else "partial"
         )
+        saved_path = self.save_results()
+        if not saved_path:
+            self.results["pipeline_status"] = "failed"
+            self.results["pipeline_status_reason"] = "framework_results_persistence_failed"
+            raise RuntimeError("Framework results could not be persisted; full pipeline did not complete")
         logger.info(
             "Pipeline execution completed in %.2f seconds with status=%s",
             runtime, self.results["pipeline_status"],

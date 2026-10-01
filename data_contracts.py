@@ -49,6 +49,7 @@ _OFFLINE_FIELDS = {
 }
 _ENVELOPE_FIELDS = {
     "schema_version", "interactions", "source_kind", "alias_mappings",
+    "request_status", "snapshot_path", "snapshot_sha256",
     "retrieved_at", "source_uri", "source_sha256",
 }
 _TIME_FIELDS = frozenset({"retrieved_at", "created_at", "generated_at", "timestamp"})
@@ -577,8 +578,28 @@ def _validate_canonical_result(value: CanonicalPpiResult) -> CanonicalPpiResult:
         value.source_kind == "online_snapshot"
         and value.request_status == "complete"
         and value.snapshot_sha256 is None
+        and not (
+            value.status == "invalid"
+            and isinstance(value.edges, tuple)
+            and not value.edges
+            and isinstance(value.issues, tuple)
+            and any(
+                isinstance(issue, ValidationIssue)
+                and issue.code in {
+                    "missing_source_snapshot",
+                    "incomplete_source_snapshot",
+                    "invalid_source_snapshot",
+                }
+                for issue in value.issues
+            )
+        )
     ):
         return _invalid_canonical_result(value, "Complete online PPI collection requires a byte-bound snapshot.")
+    if value.request_status in {"failed", "not_requested"} and isinstance(value.edges, tuple) and value.edges:
+        return _invalid_canonical_result(
+            value,
+            "A failed or unrequested PPI collection cannot contain accepted edges.",
+        )
     if type(value.input_count) is not int or value.input_count < 0:
         return _invalid_canonical_result(value, "Canonical PPI result input_count is invalid.")
     if (
@@ -744,6 +765,108 @@ def _metadata_failure(
     )
 
 
+def _resolve_effective_ppi_metadata(
+    records: Any,
+    *,
+    source_kind: Optional[str],
+    request_status: Optional[str],
+    snapshot_path: Optional[str],
+    snapshot_sha256: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], list[tuple[str, str, Optional[str]]]]:
+    envelope = records if isinstance(records, Mapping) and "interactions" in records else {}
+    envelope_values = {
+        "source_kind": envelope.get("source_kind"),
+        "request_status": envelope.get("request_status"),
+        "snapshot_path": envelope.get("snapshot_path"),
+        "snapshot_sha256": envelope.get("snapshot_sha256"),
+    }
+    explicit_values = {
+        "source_kind": source_kind,
+        "request_status": request_status,
+        "snapshot_path": snapshot_path,
+        "snapshot_sha256": snapshot_sha256,
+    }
+    conflict_codes = {
+        "source_kind": "conflicting_source_kind",
+        "request_status": "conflicting_request_status",
+        "snapshot_path": "conflicting_source_snapshot",
+        "snapshot_sha256": "conflicting_source_snapshot",
+    }
+    errors: list[tuple[str, str, Optional[str]]] = []
+    effective = {}
+    for name, explicit_value in explicit_values.items():
+        envelope_value = envelope_values[name]
+        if explicit_value is not None and envelope_value is not None and explicit_value != envelope_value:
+            errors.append((
+                conflict_codes[name],
+                f"Explicit {name} conflicts with the PPI envelope.",
+                name,
+            ))
+        effective[name] = explicit_value if explicit_value is not None else envelope_value
+
+    effective_source_kind = effective["source_kind"]
+    if effective_source_kind is not None:
+        if not isinstance(effective_source_kind, str):
+            errors.append(("invalid_source_kind", "source_kind must be a string.", "source_kind"))
+        elif effective_source_kind not in _ALLOWED_SOURCE_KINDS:
+            errors.append((
+                "unknown_source_kind",
+                f"Unsupported source_kind {effective_source_kind!r}.",
+                "source_kind",
+            ))
+
+    effective_request_status = effective["request_status"]
+    if effective_request_status is not None and (
+        not isinstance(effective_request_status, str)
+        or effective_request_status not in {"complete", "failed", "not_requested"}
+    ):
+        errors.append(("invalid_request_status", "request_status is unsupported.", "request_status"))
+
+    effective_snapshot_path = effective["snapshot_path"]
+    effective_snapshot_sha256 = effective["snapshot_sha256"]
+    if (effective_snapshot_path is None) != (effective_snapshot_sha256 is None):
+        errors.append((
+            "incomplete_source_snapshot",
+            "snapshot_path and snapshot_sha256 must be supplied together.",
+            "snapshot_path",
+        ))
+    if effective_snapshot_path is not None:
+        path_parts = (
+            effective_snapshot_path.replace("\\", "/").split("/")
+            if isinstance(effective_snapshot_path, str) else []
+        )
+        if (
+            not isinstance(effective_snapshot_path, str)
+            or not effective_snapshot_path
+            or effective_snapshot_path.startswith(("/", "\\"))
+            or any(part in {"", ".", ".."} for part in path_parts)
+            or not _is_sha256(effective_snapshot_sha256)
+        ):
+            errors.append((
+                "invalid_source_snapshot",
+                "PPI snapshot path/hash is invalid.",
+                "snapshot_path",
+            ))
+    if (
+        effective_source_kind == "online_snapshot"
+        and effective_request_status == "complete"
+        and effective_snapshot_sha256 is None
+    ):
+        errors.append((
+            "missing_source_snapshot",
+            "Complete online PPI collection requires a byte-bound snapshot.",
+            "snapshot_sha256",
+        ))
+
+    return (
+        effective_source_kind,
+        effective_request_status,
+        effective_snapshot_path,
+        effective_snapshot_sha256,
+        errors,
+    )
+
+
 def canonicalize_ppi(
     records: Any,
     *,
@@ -759,6 +882,20 @@ def canonicalize_ppi(
     least one ValidationIssue. Reversed duplicates merge provenance; conflicting
     weights for the same unordered pair are rejected as a group.
     """
+    if isinstance(records, CanonicalPpiResult):
+        explicit_metadata = (
+            ("source_kind", source_kind, records.source_kind),
+            ("request_status", request_status, records.request_status),
+            ("snapshot_path", snapshot_path, records.snapshot_path),
+            ("snapshot_sha256", snapshot_sha256, records.snapshot_sha256),
+        )
+        if any(value is not None and value != recorded for _, value, recorded in explicit_metadata):
+            return _invalid_canonical_result(
+                records,
+                "Explicit PPI metadata conflicts with the canonical PPI result.",
+            )
+        return _validate_canonical_result(records)
+
     metadata_errors = []
     source_file_path = getattr(records, "source_file_path", None)
     source_file_sha256 = getattr(records, "source_file_sha256", None)
@@ -775,54 +912,50 @@ def canonicalize_ppi(
             "Source file path and actual-byte SHA-256 must be supplied together.",
             "source_file_sha256",
         ))
-    if source_kind is not None:
-        if not isinstance(source_kind, str):
-            metadata_errors.append(("invalid_source_kind", "source_kind must be a string.", "source_kind"))
-        elif source_kind not in _ALLOWED_SOURCE_KINDS:
-            metadata_errors.append(("unknown_source_kind", f"Unsupported source_kind {source_kind!r}.", "source_kind"))
-    if request_status is not None and (
-        not isinstance(request_status, str)
-        or request_status not in {"complete", "failed", "not_requested"}
-    ):
-        metadata_errors.append(("invalid_request_status", "request_status is unsupported.", "request_status"))
-    if (snapshot_path is None) != (snapshot_sha256 is None):
-        metadata_errors.append(("incomplete_source_snapshot", "snapshot_path and snapshot_sha256 must be supplied together.", "snapshot_path"))
-    if snapshot_path is not None:
-        path_parts = snapshot_path.replace("\\", "/").split("/") if isinstance(snapshot_path, str) else []
-        if (
-            not isinstance(snapshot_path, str)
-            or not snapshot_path
-            or snapshot_path.startswith(("/", "\\"))
-            or any(part in {"", ".", ".."} for part in path_parts)
-            or not _is_sha256(snapshot_sha256)
-        ):
-            metadata_errors.append(("invalid_source_snapshot", "PPI snapshot path/hash is invalid.", "snapshot_path"))
-    if (
-        source_kind == "online_snapshot"
-        and request_status == "complete"
-        and snapshot_sha256 is None
-    ):
-        metadata_errors.append(("missing_source_snapshot", "Complete online PPI collection requires a byte-bound snapshot.", "snapshot_sha256"))
+    (
+        effective_source_kind,
+        effective_request_status,
+        effective_snapshot_path,
+        effective_snapshot_sha256,
+        effective_metadata_errors,
+    ) = _resolve_effective_ppi_metadata(
+        records,
+        source_kind=source_kind,
+        request_status=request_status,
+        snapshot_path=snapshot_path,
+        snapshot_sha256=snapshot_sha256,
+    )
+    metadata_errors.extend(effective_metadata_errors)
     if alias_mappings is not None and not isinstance(alias_mappings, Mapping):
         metadata_errors.append(("invalid_alias_mappings", "alias_mappings must be an object keyed by alias.", "alias_mappings"))
     if metadata_errors:
         return _metadata_failure(
             records, metadata_errors,
-            source_kind=source_kind,
-            request_status=request_status,
-            snapshot_path=snapshot_path,
-            snapshot_sha256=snapshot_sha256,
+            source_kind=effective_source_kind,
+            request_status=effective_request_status,
+            snapshot_path=effective_snapshot_path,
+            snapshot_sha256=effective_snapshot_sha256,
             source_file_path=source_file_path,
             source_file_sha256=source_file_sha256,
         )
 
-    if isinstance(records, CanonicalPpiResult):
-        return _validate_canonical_result(records)
     if isinstance(records, list) and records and all(isinstance(item, CanonicalPpiEdge) for item in records):
+        if effective_request_status in {"failed", "not_requested"}:
+            code = f"ppi_request_{effective_request_status}_with_records"
+            return _metadata_failure(
+                records,
+                [(code, "A failed or unrequested PPI collection cannot contain accepted records.", "interactions")],
+                source_kind=effective_source_kind,
+                request_status=effective_request_status,
+                snapshot_path=effective_snapshot_path,
+                snapshot_sha256=effective_snapshot_sha256,
+                source_file_path=source_file_path,
+                source_file_sha256=source_file_sha256,
+            )
         return _canonicalize_edge_sequence(records)
 
     source_hash = canonical_json_sha256(records)
-    envelope_source_kind = None
+    envelope_source_kind = effective_source_kind if isinstance(records, Mapping) and "interactions" in records else None
     root_issues: list[ValidationIssue] = []
     if isinstance(records, Mapping) and "interactions" in records:
         envelope = records
@@ -841,17 +974,16 @@ def canonicalize_ppi(
                 envelope_errors.append(("invalid_source_kind", "Envelope source_kind must be a string.", "source_kind"))
             elif envelope_kind not in _ALLOWED_SOURCE_KINDS:
                 envelope_errors.append(("unknown_source_kind", f"Unsupported envelope source_kind {envelope_kind!r}.", "source_kind"))
-            elif source_kind is not None and envelope_kind != source_kind:
-                envelope_errors.append(("conflicting_source_kind", "Explicit source_kind conflicts with the PPI envelope.", "source_kind"))
             else:
                 envelope_source_kind = envelope_kind
         if "alias_mappings" in envelope and not isinstance(envelope["alias_mappings"], Mapping):
             envelope_errors.append(("invalid_alias_mappings", "Envelope alias_mappings must be an object keyed by alias.", "alias_mappings"))
         if envelope_errors:
             return _metadata_failure(
-                records, envelope_errors, source_kind=source_kind,
-                request_status=request_status, snapshot_path=snapshot_path,
-                snapshot_sha256=snapshot_sha256,
+                records, envelope_errors, source_kind=effective_source_kind,
+                request_status=effective_request_status,
+                snapshot_path=effective_snapshot_path,
+                snapshot_sha256=effective_snapshot_sha256,
                 source_file_path=source_file_path,
                 source_file_sha256=source_file_sha256,
             )
@@ -871,9 +1003,10 @@ def canonicalize_ppi(
         if not isinstance(rows, list):
             return _metadata_failure(
                 records, [("invalid_collection", "PPI interactions must be a list.", "interactions")],
-                source_kind=source_kind or envelope_source_kind,
-                request_status=request_status, snapshot_path=snapshot_path,
-                snapshot_sha256=snapshot_sha256,
+                source_kind=effective_source_kind,
+                request_status=effective_request_status,
+                snapshot_path=effective_snapshot_path,
+                snapshot_sha256=effective_snapshot_sha256,
                 source_file_path=source_file_path,
                 source_file_sha256=source_file_sha256,
             )
@@ -883,8 +1016,10 @@ def canonicalize_ppi(
     else:
         return _metadata_failure(
             records, [("invalid_collection", "PPI input must be a list or a versioned object containing interactions.", None)],
-            source_kind=source_kind, request_status=request_status,
-            snapshot_path=snapshot_path, snapshot_sha256=snapshot_sha256,
+            source_kind=effective_source_kind,
+            request_status=effective_request_status,
+            snapshot_path=effective_snapshot_path,
+            snapshot_sha256=effective_snapshot_sha256,
             source_file_path=source_file_path,
             source_file_sha256=source_file_sha256,
         )
@@ -893,18 +1028,31 @@ def canonicalize_ppi(
         if not isinstance(alias, str) or not alias or alias.strip() != alias or not isinstance(mapping, Mapping):
             return _metadata_failure(
                 records, [("invalid_alias_mappings", "Alias mappings must use non-empty string keys and object values.", "alias_mappings")],
-                source_kind=source_kind or envelope_source_kind,
-                request_status=request_status, snapshot_path=snapshot_path,
-                snapshot_sha256=snapshot_sha256,
+                source_kind=effective_source_kind,
+                request_status=effective_request_status,
+                snapshot_path=effective_snapshot_path,
+                snapshot_sha256=effective_snapshot_sha256,
                 source_file_path=source_file_path,
                 source_file_sha256=source_file_sha256,
             )
 
-    requested_source = source_kind if source_kind is not None else envelope_source_kind
+    requested_source = effective_source_kind
     input_rows = []
     issues = list(root_issues)
     candidate_records = []
     input_count = len(rows)
+    if effective_request_status in {"failed", "not_requested"} and rows:
+        code = f"ppi_request_{effective_request_status}_with_records"
+        return _metadata_failure(
+            records,
+            [(code, "A failed or unrequested PPI collection cannot contain accepted records.", "interactions")],
+            source_kind=effective_source_kind,
+            request_status=effective_request_status,
+            snapshot_path=effective_snapshot_path,
+            snapshot_sha256=effective_snapshot_sha256,
+            source_file_path=source_file_path,
+            source_file_sha256=source_file_sha256,
+        )
 
     for index, row in enumerate(rows):
         row_hash = canonical_json_sha256(row)
@@ -1144,9 +1292,9 @@ def canonicalize_ppi(
     return _build_result(
         merged_edges, issues, input_count, accepted_record_count, source_hash,
         source_kind=requested_source,
-        request_status=request_status,
-        snapshot_path=snapshot_path,
-        snapshot_sha256=snapshot_sha256,
+        request_status=effective_request_status,
+        snapshot_path=effective_snapshot_path,
+        snapshot_sha256=effective_snapshot_sha256,
         source_file_path=source_file_path,
         source_file_sha256=source_file_sha256,
     )

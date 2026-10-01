@@ -462,7 +462,39 @@ def _root_metrics(source_id: str, files: Sequence[Mapping[str, Any]], source_kin
         missing_protein_fields = [field for field in _PROTEIN_REQUIRED_FIELDS if field not in present]
     label_statistics_status = "not_evaluated" if activity_count else "not_evaluated_no_activity_records"
     no_source_activity_rows = activity_count == 0
+    entity_reason = (
+        f"{source_id}: legacy source rows do not carry a source-verified canonical entity bundle; "
+        "canonical molecule/protein identity and sequence verification were not run."
+    )
+    cluster_reason = (
+        f"{source_id}: source-verified entities are unavailable, so molecule/protein clustering was not evaluated."
+    )
+    split_reason = (
+        f"{source_id}: canonical grouping, approved label policy, cluster construction, and double-cold splitting were not run."
+    )
+    excluded_entity_reason = (
+        f"{source_id}: canonical entity eligibility and exclusion rules were not evaluated for this legacy source."
+    )
+    excluded_label_reason = (
+        f"{source_id}: canonical evidence grouping and label-policy exclusion dispositions were not evaluated."
+    )
+
+    def unevaluated_count(reason: str) -> dict[str, Any]:
+        return {"count": None, "status": "not_evaluated", "reason": reason}
+
+    split_support: dict[str, Any] = {
+        "status": "not_evaluated",
+        "reason": split_reason,
+        "splits": {
+            split_name: {
+                label: unevaluated_count(split_reason)
+                for label in ("active", "inactive")
+            }
+            for split_name in ("train", "validation", "test")
+        },
+    }
     return {
+        "scope_kind": "legacy_source_root",
         "label_statistics_status": label_statistics_status,
         "activity_row_audit": {
             "status": label_statistics_status,
@@ -487,6 +519,29 @@ def _root_metrics(source_id: str, files: Sequence[Mapping[str, Any]], source_kin
             "gray": None,
             "unknown": None,
             "quarantine": None,
+        },
+        "entity_coverage": {
+            "molecule_records": {
+                "observed_count": molecule_count,
+                "verified_count": None,
+                "status": "not_evaluated",
+                "reason": entity_reason,
+            },
+            "protein_records": {
+                "observed_count": protein_count,
+                "verified_count": None,
+                "status": "not_evaluated",
+                "reason": entity_reason,
+            },
+        },
+        "cluster_coverage": {
+            "molecule_cluster_count": unevaluated_count(cluster_reason),
+            "protein_cluster_count": unevaluated_count(cluster_reason),
+        },
+        "double_cold_split_support": split_support,
+        "excluded": {
+            "entities": unevaluated_count(excluded_entity_reason),
+            "labels": unevaluated_count(excluded_label_reason),
         },
         "ids": {key: sorted(values) for key, values in sorted(ids.items())},
         "missing_activity_fields": missing_activity_fields,

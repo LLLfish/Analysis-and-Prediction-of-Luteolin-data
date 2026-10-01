@@ -309,6 +309,8 @@ def test_semantic_manifest_hash_ignores_timestamps_but_keeps_source_bytes_and_po
     digest = _store().semantic_manifest_hash
 
     assert digest(first) == digest(second)
+    assert data_contracts.semantic_manifest_hash(first) == data_contracts.semantic_manifest_hash(second)
+    assert data_contracts.semantic_manifest_hash(first) == digest(first)
     second["entities"]["file_sha256"] = "e" * 64
     assert digest(first) != digest(second)
 
@@ -470,7 +472,15 @@ def test_source_readiness_receipt_sidecar_detects_rehashed_signal_removal(tmp_pa
     report = leak_audit.audit_split(manifest_path)
 
     assert report.exit_code == 3
-    assert "source_readiness_receipt_reference_missing" in {row.code for row in report.findings}
+    assert "source_readiness_contract_marker_missing" in {row.code for row in report.findings}
+
+    _bundle_path, _writer_instance, missing_ref_manifest = _published_empty_manifest(tmp_path, "receipt-reference-signal")
+    missing_ref = json.loads(missing_ref_manifest.read_text(encoding="utf-8"))
+    missing_ref.pop("source_readiness_receipt_ref")
+    _write_rehashed_manifest(missing_ref_manifest, missing_ref)
+    missing_ref_report = leak_audit.audit_split(missing_ref_manifest)
+    assert missing_ref_report.exit_code == 3
+    assert "source_readiness_receipt_reference_missing" in {row.code for row in missing_ref_report.findings}
 
 
 def test_legacy_unreceipted_manifest_is_read_only_exit4_and_cannot_promote_readiness(tmp_path):

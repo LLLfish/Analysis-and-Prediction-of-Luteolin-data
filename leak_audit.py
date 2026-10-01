@@ -132,6 +132,10 @@ class AuditReport:
     split_policy_file_sha256: Optional[str] = None
     label_policy_sha256: Optional[str] = None
     label_policy_semantic_sha256: Optional[str] = None
+    verified_entity_counts: Optional[Mapping[str, int]] = None
+    component_counts: Optional[Mapping[str, int]] = None
+    label_disposition_counts: Optional[Mapping[str, int]] = None
+    ledger_disposition_counts: Optional[Mapping[str, int]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +151,10 @@ class AuditReport:
             "split_policy_file_sha256": self.split_policy_file_sha256,
             "label_policy_sha256": self.label_policy_sha256,
             "label_policy_semantic_sha256": self.label_policy_semantic_sha256,
+            "verified_entity_counts": dict(self.verified_entity_counts) if self.verified_entity_counts is not None else None,
+            "component_counts": dict(self.component_counts) if self.component_counts is not None else None,
+            "label_disposition_counts": dict(self.label_disposition_counts) if self.label_disposition_counts is not None else None,
+            "ledger_disposition_counts": dict(self.ledger_disposition_counts) if self.ledger_disposition_counts is not None else None,
             "source_provenance": [_json_safe(item) for item in self.source_provenance],
             "error": self.error,
         }
@@ -1000,6 +1008,45 @@ def _manifest_failure(message: str, code: str = "manifest_invalid") -> AuditRepo
     return AuditReport("invalid_input", 2, (finding,), _empty_support(), False, error=message)
 
 
+def _receipt_bindings_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    entities = manifest.get("entities")
+    provenance = manifest.get("source_provenance")
+    policies = manifest.get("policies")
+    activities = manifest.get("activities")
+    pairs = manifest.get("pairs")
+    split = manifest.get("split")
+    if not isinstance(entities, Mapping) or not isinstance(provenance, (list, tuple)):
+        raise AuditInputError("source readiness receipt requires entity and raw provenance bindings")
+    if not isinstance(policies, Mapping) or not isinstance(activities, Mapping):
+        raise AuditInputError("source readiness receipt requires frozen policies and activity evidence")
+    if not isinstance(pairs, Mapping) or not isinstance(split, Mapping):
+        raise AuditInputError("source readiness receipt requires pair and split claims")
+    entity_fields = ("path", "schema_version", "entity_version", "content_sha256", "file_sha256")
+    policy_fields = ("path", "file_sha256", "semantic_sha256", "schema_version", "policy_version")
+    if any(field not in entities for field in entity_fields):
+        raise AuditInputError("source readiness receipt entity reference is incomplete")
+    if any(not isinstance(policies.get(kind), Mapping) or any(field not in policies[kind] for field in policy_fields)
+           for kind in ("split", "label")):
+        raise AuditInputError("source readiness receipt policy references are incomplete")
+    if not isinstance(activities.get("semantic_sha256"), str):
+        raise AuditInputError("source readiness receipt activity semantic hash is missing")
+    return {
+        "entities": {field: entities[field] for field in entity_fields},
+        "raw_provenance_sha256": canonical_json_sha256(provenance),
+        "policies": {
+            kind: {field: policies[kind][field] for field in policy_fields}
+            for kind in ("split", "label")
+        },
+        "activity_evidence_semantic_sha256": activities["semantic_sha256"],
+        "split_claim_sha256": canonical_json_sha256({"split": split, "pairs": pairs}),
+    }
+
+
+def _receipt_violation(code: str, message: str) -> AuditReport:
+    finding = AuditFinding(code=code, message=message)
+    return AuditReport("violation", 3, (finding,), _empty_support(), False, error=message)
+
+
 def _not_auditable(
     status: str,
     message: str,
@@ -1041,14 +1088,15 @@ def _integrity_code_for_bundle_error(message: str) -> str:
     return "entity_bundle_invalid"
 
 
-def audit_split(
+def _audit_split_core(
     manifest_path: os.PathLike[str] | str,
     *,
     policy_path: Any = None,
     label_policy_path: Any = None,
     budget_overrides: Optional[Mapping[str, Any]] = None,
+    _allow_unreceipted_candidate: bool = False,
 ) -> AuditReport:
-    """Audit a frozen split manifest without trusting its cluster IDs or counts."""
+    """Core implementation; the candidate flag is reachable only through the writer-private wrapper."""
     findings: list[AuditFinding] = []
     policy_report_context: dict[str, Any] = {}
     try:
@@ -1059,6 +1107,96 @@ def audit_split(
         manifest = _read_json_bytes(manifest_file.read_bytes(), "split manifest")
         if not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 2:
             return _manifest_failure("split manifest requires supported integer schema_version 2 with frozen policy bindings")
+
+        receipt_sidecar = manifest_root / "source_readiness_receipt.json"
+        sidecar_signal = receipt_sidecar.exists() or receipt_sidecar.is_symlink()
+        contract_signal = "source_readiness_contract_version" in manifest
+        reference_signal = "source_readiness_receipt_ref" in manifest
+        receipt_signal = contract_signal or reference_signal or sidecar_signal
+        source_receipt: Optional[Mapping[str, Any]] = None
+        if not receipt_signal and not _allow_unreceipted_candidate:
+            message = "schema-2 manifest has no source-readiness receipt and is legacy_unreceipted, read-only, and not ready"
+            finding = AuditFinding(code="legacy_unreceipted", message=message)
+            return AuditReport("legacy_unreceipted", 4, (finding,), _empty_support(), False, error=message)
+        if receipt_signal:
+            contract_version = manifest.get("source_readiness_contract_version")
+            if type(contract_version) is int and contract_version != 1:
+                return _receipt_violation(
+                    "source_readiness_contract_unsupported",
+                    f"unsupported source_readiness_contract_version: {contract_version}",
+                )
+            if not contract_signal:
+                return _receipt_violation(
+                    "source_readiness_contract_marker_missing",
+                    "source readiness receipt signals require source_readiness_contract_version=1",
+                )
+            if contract_version != 1:
+                return _receipt_violation(
+                    "source_readiness_contract_unsupported",
+                    "source_readiness_contract_version must be integer 1",
+                )
+            receipt_ref = manifest.get("source_readiness_receipt_ref")
+            if not isinstance(receipt_ref, Mapping):
+                return _receipt_violation(
+                    "source_readiness_receipt_reference_missing",
+                    "source readiness contract requires a receipt reference",
+                )
+            if not sidecar_signal:
+                return _receipt_violation(
+                    "source_readiness_receipt_missing",
+                    "source readiness contract receipt sidecar is missing",
+                )
+            if receipt_ref.get("path") != "source_readiness_receipt.json":
+                return _receipt_violation(
+                    "source_readiness_receipt_path_invalid",
+                    "source readiness receipt reference must point to source_readiness_receipt.json beside the manifest",
+                )
+            try:
+                receipt_path = _safe_relative_file(manifest_root, receipt_ref.get("path"), "source readiness receipt")
+                receipt_bytes = receipt_path.read_bytes()
+                source_receipt_value = _read_json_bytes(receipt_bytes, "source readiness receipt")
+            except (AuditInputError, OSError, TypeError, ValueError) as exc:
+                return _receipt_violation("source_readiness_receipt_invalid", str(exc))
+            if not isinstance(source_receipt_value, Mapping):
+                return _receipt_violation("source_readiness_receipt_invalid", "source readiness receipt must be an object")
+            if source_receipt_value.get("receipt_schema_version") != 1 or type(source_receipt_value.get("receipt_schema_version")) is not int:
+                return _receipt_violation(
+                    "source_readiness_receipt_unsupported",
+                    f"unsupported source readiness receipt schema version: {source_receipt_value.get('receipt_schema_version')}",
+                )
+            required_receipt_fields = {
+                "receipt_schema_version", "scope_kind", "receipt_sha256", "scope_sha256", "bindings", "metrics",
+            }
+            if set(source_receipt_value) != required_receipt_fields:
+                return _receipt_violation(
+                    "source_readiness_receipt_invalid",
+                    "source readiness receipt fields do not match receipt_schema_version=1",
+                )
+            if source_receipt_value.get("scope_kind") != "canonical_frozen_corpus":
+                return _receipt_violation(
+                    "source_readiness_receipt_scope_invalid",
+                    "source readiness receipt scope_kind must be canonical_frozen_corpus",
+                )
+            actual_receipt_file_hash = _sha256(receipt_bytes)
+            if receipt_ref.get("file_sha256") != actual_receipt_file_hash:
+                return _receipt_violation(
+                    "source_readiness_receipt_file_hash_mismatch",
+                    "receipt sidecar bytes differ from the file hash in the manifest reference",
+                )
+            actual_receipt_semantic_hash = canonical_json_sha256(source_receipt_value)
+            if receipt_ref.get("semantic_sha256") != actual_receipt_semantic_hash:
+                return _receipt_violation(
+                    "source_readiness_receipt_semantic_hash_mismatch",
+                    "receipt payload differs from the semantic hash in the manifest reference",
+                )
+            receipt_body = {key: value for key, value in source_receipt_value.items() if key != "receipt_sha256"}
+            if source_receipt_value.get("receipt_sha256") != canonical_json_sha256(receipt_body):
+                return _receipt_violation(
+                    "source_readiness_receipt_hash_mismatch",
+                    "receipt_sha256 does not match the canonical receipt payload",
+                )
+            source_receipt = source_receipt_value
+
         entity_ref = manifest.get("entities")
         if not isinstance(entity_ref, Mapping):
             return _manifest_failure("split manifest entities reference is missing")
@@ -1625,6 +1763,53 @@ def audit_split(
                 message="final/affirmative training_ready claim does not match independent retained support and audit results",
                 source_evidence=tuple(_json_safe(item) for item in bundle.get("source_provenance", []) if isinstance(item, Mapping)),
             ))
+        verified_entity_counts = {"molecules": len(molecules), "proteins": len(proteins)}
+        component_counts = {
+            "molecule_clusters": len(set(molecule_components.values())),
+            "protein_clusters": len(set(protein_components.values())),
+        }
+        label_disposition_counts = {str(key): int(value) for key, value in label_result.counts.items()}
+        ledger_disposition_counts = {str(key): int(value) for key, value in label_result.ledger.counts.items()}
+        if source_receipt is not None:
+            try:
+                expected_receipt_bindings = _receipt_bindings_from_manifest(manifest)
+            except AuditInputError as exc:
+                findings.append(AuditFinding(
+                    code="source_readiness_receipt_binding_invalid",
+                    message=f"manifest cannot satisfy the source readiness receipt bindings: {exc}",
+                ))
+            else:
+                if _canonical_hash(source_receipt.get("bindings")) != _canonical_hash(expected_receipt_bindings):
+                    findings.append(AuditFinding(
+                        code="source_readiness_receipt_binding_mismatch",
+                        message="receipt bindings do not describe this exact entity, source, policy, evidence, and split corpus",
+                    ))
+                expected_scope_hash = canonical_json_sha256(expected_receipt_bindings)
+                if source_receipt.get("scope_sha256") != expected_scope_hash:
+                    findings.append(AuditFinding(
+                        code="source_readiness_receipt_scope_mismatch",
+                        message="receipt scope_sha256 does not match independently reconstructed corpus bindings",
+                    ))
+            expected_receipt_metrics = {
+                "verified_entity_counts": verified_entity_counts,
+                "component_counts": component_counts,
+                "label_disposition_counts": label_disposition_counts,
+                "ledger_disposition_counts": ledger_disposition_counts,
+                "excluded_label_dispositions": {
+                    "confirmed": label_disposition_counts.get("confirmed_excluded", 0),
+                    "test_only": label_disposition_counts.get("test_only_excluded", 0),
+                    "ledger": ledger_disposition_counts.get("excluded", 0),
+                },
+                "double_cold_split_support": independently_derived_support,
+                "audit_status": "clean",
+                "audit_exit_code": 0,
+                "training_ready": computed_ready,
+            }
+            if _canonical_hash(source_receipt.get("metrics")) != _canonical_hash(expected_receipt_metrics):
+                findings.append(AuditFinding(
+                    code="source_readiness_receipt_metrics_mismatch",
+                    message="receipt metrics differ from independently recomputed entity, cluster, label, split, or readiness values",
+                ))
         computed_ready = computed_ready and not findings
 
         exit_code = 3 if findings else 0
@@ -1642,6 +1827,10 @@ def audit_split(
             split_policy_file_sha256=str(split_reference.get("file_sha256")),
             label_policy_sha256=str(label_reference.get("file_sha256")),
             label_policy_semantic_sha256=label_policy_semantic_sha256,
+            verified_entity_counts=verified_entity_counts,
+            component_counts=component_counts,
+            label_disposition_counts=label_disposition_counts,
+            ledger_disposition_counts=ledger_disposition_counts,
         )
     except _AuditStop as exc:
         return _not_auditable(exc.status, str(exc), findings=findings, **policy_report_context)
@@ -1656,6 +1845,30 @@ def audit_split(
             message=f"audit could not validate a frozen contract: {exc}",
         ))
         return AuditReport("violation", 3, tuple(findings), _empty_support(), False, error=str(exc))
+
+
+def _audit_candidate_split(manifest_path: os.PathLike[str] | str) -> AuditReport:
+    """Audit only an unpublished writer candidate before its receipt is written."""
+    candidate = Path(manifest_path)
+    if not candidate.name.startswith(".manifest.audit.tmp."):
+        return _manifest_failure("private candidate audit accepts only the frozen writer's provisional manifest")
+    return _audit_split_core(candidate, _allow_unreceipted_candidate=True)
+
+
+def audit_split(
+    manifest_path: os.PathLike[str] | str,
+    *,
+    policy_path: Any = None,
+    label_policy_path: Any = None,
+    budget_overrides: Optional[Mapping[str, Any]] = None,
+) -> AuditReport:
+    """Audit a frozen split manifest without trusting its cluster IDs or counts."""
+    return _audit_split_core(
+        manifest_path,
+        policy_path=policy_path,
+        label_policy_path=label_policy_path,
+        budget_overrides=budget_overrides,
+    )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:

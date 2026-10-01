@@ -16,8 +16,10 @@ import sys
 
 import pytest
 
+import data_contracts
 import dataset_builder
 import evidence_builder
+import source_audit
 
 
 APL_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,28 @@ def _auditor():
 def _fixture() -> dict:
     value = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     value["source_kind"] = "synthetic_test"
+    # The baseline audit manifest must contain only pair-resolvable evidence;
+    # non-human and PROTEIN COMPLEX rejection remains covered by entity tests.
+    eligible_targets = {
+        row["target_chembl_id"]
+        for row in value["chembl"]["targets"]
+        if row.get("target_type") == "SINGLE PROTEIN" and row.get("organism") == "Homo sapiens"
+    }
+    for molecule_pages in value["chembl"]["activities_by_molecule"].values():
+        pages = molecule_pages["pages"]
+        retained_rows = [
+            row
+            for page in pages
+            for row in page.get("activities", [])
+            if row.get("target_chembl_id") in eligible_targets
+        ]
+        page = deepcopy(pages[0])
+        page["activities"] = retained_rows
+        page["page_meta"].update(
+            offset=0, limit=len(retained_rows), total_count=len(retained_rows),
+            next=None, previous=None,
+        )
+        molecule_pages["pages"] = [page]
     return value
 
 
@@ -220,6 +244,34 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
         "split": claimed_split,
         "version_control": {"status": "not_initialized", "commit": None},
     }
+    candidate_path = tmp_path / ".manifest.audit.tmp.testfixture"
+
+    def write_candidate() -> None:
+        candidate_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+    manifest["semantic_sha256"] = data_contracts.semantic_manifest_hash(manifest)
+    write_candidate()
+    first_audit = _auditor()._audit_candidate_split(candidate_path)
+    assert first_audit.exit_code == 0, first_audit.to_dict()
+    manifest["training_ready"] = first_audit.training_ready
+    claimed_split["training_ready"] = first_audit.training_ready
+    manifest["audit"] = {"status": "clean", "exit_code": 0, "finding_count": 0}
+    manifest["semantic_sha256"] = data_contracts.semantic_manifest_hash(manifest)
+    write_candidate()
+    receipt_audit = _auditor()._audit_candidate_split(candidate_path)
+    assert receipt_audit.exit_code == 0, receipt_audit.to_dict()
+    receipt = source_audit.build_frozen_corpus_readiness_receipt(manifest, receipt_audit)
+    receipt_bytes = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    receipt_path = tmp_path / "source_readiness_receipt.json"
+    receipt_path.write_bytes(receipt_bytes)
+    manifest["source_readiness_contract_version"] = 1
+    manifest["source_readiness_receipt_ref"] = {
+        "path": "source_readiness_receipt.json",
+        "file_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+        "semantic_sha256": data_contracts.canonical_json_sha256(receipt),
+    }
+    manifest["semantic_sha256"] = data_contracts.semantic_manifest_hash(manifest)
+    candidate_path.unlink()
     path = tmp_path / "candidate-manifest.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     return path

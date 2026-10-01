@@ -14,17 +14,13 @@ import subprocess
 import uuid
 from typing import Any, Mapping, Optional
 
-from data_contracts import canonical_json_sha256
+from data_contracts import canonical_json_sha256, semantic_manifest_hash
 from evidence_builder import EvidenceInputError, load_entity_bundle
-from leak_audit import AuditReport, audit_split
+from leak_audit import AuditReport, _audit_candidate_split, audit_split
+from source_audit import build_frozen_corpus_readiness_receipt
 
 
 _VERSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_TIME_FIELDS = frozenset({
-    "created_at", "updated_at", "generated_at", "retrieved_at", "fetched_at",
-    "timestamp", "started_at", "completed_at", "built_at", "audited_at",
-    "collected_at", "checked_at", "published_at", "last_modified",
-})
 _CODE_ROOT = Path(__file__).resolve().parent
 _DEFAULT_POLICY_PATHS = {
     "split": _CODE_ROOT / "policies" / "split_policy.json",
@@ -137,25 +133,6 @@ def _read_policy_sources(
         reference = {"path": _POLICY_RELATIVE_PATHS[kind], **actual}
         result[kind] = (source_path, raw, reference)
     return result
-
-
-def _without_time_fields(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            str(key): _without_time_fields(item)
-            for key, item in value.items()
-            if str(key).casefold() not in _TIME_FIELDS and str(key) != "semantic_sha256"
-        }
-    if isinstance(value, (list, tuple)):
-        return [_without_time_fields(item) for item in value]
-    return value
-
-
-def semantic_manifest_hash(manifest: Mapping[str, Any]) -> str:
-    """Hash manifest meaning while excluding nested timestamps and the digest field."""
-    if not isinstance(manifest, Mapping):
-        raise FrozenArtifactError("manifest must be an object")
-    return canonical_json_sha256(_without_time_fields(manifest))
 
 
 def _path_key(path: Path) -> str:
@@ -507,7 +484,7 @@ class FrozenManifestWriter:
                 stream.write(_canonical_bytes(manifest))
                 stream.flush()
                 os.fsync(stream.fileno())
-            audit: AuditReport = audit_split(provisional)
+            audit: AuditReport = _audit_candidate_split(provisional)
             provisional.unlink()
             temporary_paths.discard(provisional)
             if audit.exit_code != 0:
@@ -520,6 +497,45 @@ class FrozenManifestWriter:
                     audit_report=audit.to_dict(),
                     error=audit.error or "independent audit did not return clean",
                 )
+
+            # The first private audit derives readiness without trusting the
+            # builder's provisional boolean. Re-audit the resulting final split
+            # claim before receipt construction so the receipt binds exact bytes.
+            manifest["training_ready"] = audit.training_ready
+            split_payload["training_ready"] = audit.training_ready
+            manifest["semantic_sha256"] = semantic_manifest_hash(manifest)
+            provisional = version_dir / f".manifest.audit.tmp.{token}"
+            temporary_paths.add(provisional)
+            with provisional.open("xb") as stream:
+                stream.write(_canonical_bytes(manifest))
+                stream.flush()
+                os.fsync(stream.fileno())
+            receipt_audit: AuditReport = _audit_candidate_split(provisional)
+            provisional.unlink()
+            temporary_paths.discard(provisional)
+            if receipt_audit.exit_code != 0 or receipt_audit.training_ready != audit.training_ready:
+                status = "audit_violation" if receipt_audit.exit_code == 3 else "not_auditable" if receipt_audit.exit_code == 4 else "incomplete"
+                _cleanup_own_temps(version_dir, token, temporary_paths)
+                return FrozenWriteResult(
+                    status,
+                    receipt_audit.exit_code if receipt_audit.exit_code != 0 else 3,
+                    str(version_dir),
+                    audit_report=receipt_audit.to_dict(),
+                    error=receipt_audit.error or "readiness claim failed independent candidate re-audit",
+                )
+            audit = receipt_audit
+
+            receipt = build_frozen_corpus_readiness_receipt(manifest, audit)
+            receipt_bytes = _canonical_bytes(receipt)
+            receipt_path = version_dir / "source_readiness_receipt.json"
+            _write_atomic(receipt_path, receipt_bytes, token, temporary_paths)
+            manifest["source_readiness_contract_version"] = 1
+            manifest["source_readiness_receipt_ref"] = {
+                "path": "source_readiness_receipt.json",
+                "file_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+                "semantic_sha256": canonical_json_sha256(receipt),
+            }
+            manifest["semantic_sha256"] = semantic_manifest_hash(manifest)
 
             def verify_source_snapshots() -> None:
                 # Audit may take long enough for producer inputs or staged bytes
@@ -541,12 +557,14 @@ class FrozenManifestWriter:
                     frozen_path = version_dir / Path(reference["path"])
                     if frozen_path.read_bytes() != original_bytes:
                         raise FrozenArtifactError(f"frozen {kind} policy bytes changed before manifest commit")
+                if receipt_path.read_bytes() != receipt_bytes:
+                    raise FrozenArtifactError("source readiness receipt changed during frozen publication")
+                if hashlib.sha256(receipt_path.read_bytes()).hexdigest() != manifest["source_readiness_receipt_ref"]["file_sha256"]:
+                    raise FrozenArtifactError("source readiness receipt file hash changed before manifest commit")
 
             verify_source_snapshots()
 
             manifest["audit"] = {"status": "clean", "exit_code": 0, "finding_count": 0}
-            manifest["training_ready"] = audit.training_ready
-            split_payload["training_ready"] = audit.training_ready
             manifest["semantic_sha256"] = semantic_manifest_hash(manifest)
 
             # Re-audit the exact final claims/manifest markers before the only

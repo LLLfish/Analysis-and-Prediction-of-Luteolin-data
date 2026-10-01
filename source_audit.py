@@ -14,7 +14,7 @@ import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from artifact_store import FrozenArtifactError, semantic_manifest_hash
+from data_contracts import canonical_json_sha256, semantic_manifest_hash
 
 
 _SOURCE_SPECS = (
@@ -51,6 +51,112 @@ def _sha256(raw: bytes) -> str:
 
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _frozen_receipt_bindings(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    entities = manifest.get("entities")
+    provenance = manifest.get("source_provenance")
+    policies = manifest.get("policies")
+    activities = manifest.get("activities")
+    pairs = manifest.get("pairs")
+    split = manifest.get("split")
+    if not isinstance(entities, Mapping) or not isinstance(provenance, (list, tuple)):
+        raise SourceAuditError("canonical corpus receipt requires entity and raw-provenance bindings")
+    if not isinstance(policies, Mapping) or not isinstance(activities, Mapping):
+        raise SourceAuditError("canonical corpus receipt requires frozen policies and activity evidence")
+    if not isinstance(pairs, Mapping) or not isinstance(split, Mapping):
+        raise SourceAuditError("canonical corpus receipt requires pair and split claims")
+    entity_fields = ("path", "schema_version", "entity_version", "content_sha256", "file_sha256")
+    policy_fields = ("path", "file_sha256", "semantic_sha256", "schema_version", "policy_version")
+    if any(field not in entities for field in entity_fields):
+        raise SourceAuditError("canonical corpus receipt entity reference is incomplete")
+    if any(not isinstance(policies.get(kind), Mapping) or any(field not in policies[kind] for field in policy_fields)
+           for kind in ("split", "label")):
+        raise SourceAuditError("canonical corpus receipt policy references are incomplete")
+    if not isinstance(activities.get("semantic_sha256"), str):
+        raise SourceAuditError("canonical corpus receipt activity semantic hash is missing")
+    return {
+        "entities": {field: entities[field] for field in entity_fields},
+        "raw_provenance_sha256": canonical_json_sha256(provenance),
+        "policies": {
+            kind: {field: policies[kind][field] for field in policy_fields}
+            for kind in ("split", "label")
+        },
+        "activity_evidence_semantic_sha256": activities["semantic_sha256"],
+        "split_claim_sha256": canonical_json_sha256({"split": split, "pairs": pairs}),
+    }
+
+
+def _receipt_count_map(value: Any, keys: Sequence[str], label: str) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise SourceAuditError(f"canonical corpus receipt {label} metrics are missing")
+    result: dict[str, int] = {}
+    for key in keys:
+        count = value.get(key)
+        if type(count) is not int or count < 0:
+            raise SourceAuditError(f"canonical corpus receipt {label}.{key} must be an evaluated nonnegative integer")
+        result[key] = count
+    return result
+
+
+def build_frozen_corpus_readiness_receipt(manifest: Mapping[str, Any], audit_report: Any) -> dict[str, Any]:
+    """Create an immutable readiness receipt only from a clean independent corpus audit."""
+    if not isinstance(manifest, Mapping):
+        raise SourceAuditError("canonical corpus receipt manifest must be an object")
+    if hasattr(audit_report, "to_dict") and callable(audit_report.to_dict):
+        audit_report = audit_report.to_dict()
+    if not isinstance(audit_report, Mapping):
+        raise SourceAuditError("canonical corpus receipt requires an independent audit report")
+    if (audit_report.get("status") != "clean" or audit_report.get("exit_code") != 0
+            or audit_report.get("findings") not in ([], ())):
+        raise SourceAuditError("canonical corpus readiness receipt requires a clean, complete independent audit")
+    if type(audit_report.get("training_ready")) is not bool:
+        raise SourceAuditError("canonical corpus audit did not derive a boolean training_ready value")
+
+    verified_entities = _receipt_count_map(
+        audit_report.get("verified_entity_counts"), ("molecules", "proteins"), "verified_entity_counts",
+    )
+    component_counts = _receipt_count_map(
+        audit_report.get("component_counts"), ("molecule_clusters", "protein_clusters"), "component_counts",
+    )
+    label_dispositions = audit_report.get("label_disposition_counts")
+    if not isinstance(label_dispositions, Mapping) or any(type(count) is not int or count < 0 for count in label_dispositions.values()):
+        raise SourceAuditError("canonical corpus label dispositions must be independently evaluated nonnegative counts")
+    ledger_dispositions = audit_report.get("ledger_disposition_counts")
+    if not isinstance(ledger_dispositions, Mapping) or any(type(count) is not int or count < 0 for count in ledger_dispositions.values()):
+        raise SourceAuditError("canonical corpus ledger dispositions must be independently evaluated nonnegative counts")
+    support = audit_report.get("class_support")
+    if not isinstance(support, Mapping):
+        raise SourceAuditError("canonical corpus audit omitted independently derived double-cold support")
+    double_cold_support: dict[str, dict[str, int]] = {}
+    for partition in ("train", "val", "test"):
+        double_cold_support[partition] = _receipt_count_map(support.get(partition), ("active", "inactive"), f"class_support.{partition}")
+
+    bindings = _frozen_receipt_bindings(manifest)
+    excluded_labels = {
+        "confirmed": label_dispositions.get("confirmed_excluded", 0),
+        "test_only": label_dispositions.get("test_only_excluded", 0),
+        "ledger": ledger_dispositions.get("excluded", 0),
+    }
+    receipt: dict[str, Any] = {
+        "receipt_schema_version": 1,
+        "scope_kind": "canonical_frozen_corpus",
+        "scope_sha256": canonical_json_sha256(bindings),
+        "bindings": bindings,
+        "metrics": {
+            "verified_entity_counts": verified_entities,
+            "component_counts": component_counts,
+            "label_disposition_counts": dict(label_dispositions),
+            "ledger_disposition_counts": dict(ledger_dispositions),
+            "excluded_label_dispositions": excluded_labels,
+            "double_cold_split_support": double_cold_support,
+            "audit_status": audit_report["status"],
+            "audit_exit_code": audit_report["exit_code"],
+            "training_ready": audit_report["training_ready"],
+        },
+    }
+    receipt["receipt_sha256"] = canonical_json_sha256(receipt)
+    return receipt
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

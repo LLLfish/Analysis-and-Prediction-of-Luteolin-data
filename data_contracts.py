@@ -52,7 +52,11 @@ _ENVELOPE_FIELDS = {
     "request_status", "snapshot_path", "snapshot_root", "snapshot_sha256", "snapshot_records_sha256", "ppi_trace",
     "retrieved_at", "source_uri", "source_sha256",
 }
-_TIME_FIELDS = frozenset({"retrieved_at", "created_at", "generated_at", "timestamp"})
+_SEMANTIC_TIME_FIELDS = frozenset({
+    "created_at", "updated_at", "generated_at", "retrieved_at", "fetched_at",
+    "timestamp", "started_at", "completed_at", "built_at", "audited_at",
+    "collected_at", "checked_at", "published_at", "last_modified",
+})
 
 
 def _plain(value: Any, _depth: int = 0, _active: Optional[set[int]] = None) -> Any:
@@ -114,6 +118,25 @@ def canonical_json_sha256(value: Any, exclude_fields: Sequence[str] = ()) -> str
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _without_semantic_time_fields(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_semantic_time_fields(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _SEMANTIC_TIME_FIELDS and str(key) != "semantic_sha256"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_semantic_time_fields(item) for item in value]
+    return value
+
+
+def semantic_manifest_hash(manifest: Mapping[str, Any]) -> str:
+    """Hash manifest meaning while excluding nested timestamps and its digest."""
+    if not isinstance(manifest, Mapping):
+        raise TypeError("manifest must be an object")
+    return canonical_json_sha256(_without_semantic_time_fields(manifest))
 
 
 def _strict_taxonomy(value: Any) -> Optional[int]:

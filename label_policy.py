@@ -73,6 +73,34 @@ class PairLabelGroup:
 
 
 @dataclass(frozen=True)
+class LabelDecision:
+    pair_key: str
+    split_group_id: str
+    endpoint: str
+    assay_condition_sha256: str
+    label: str
+    evidence_ids: tuple[str, ...]
+    reasons: tuple[str, ...]
+    provenance_partition: str
+
+
+@dataclass(frozen=True)
+class LabelPolicyResult:
+    policy_version: str
+    policy_sha256: str
+    confirmed_labeled_pairs: tuple[LabelDecision, ...]
+    test_only_labeled_pairs: tuple[LabelDecision, ...]
+    gray: tuple[LabelDecision, ...]
+    unknown: tuple[LabelDecision, ...]
+    conflicts: tuple[LabelDecision, ...]
+    excluded: tuple[LabelDecision, ...]
+    unverified: tuple[LabelDecision, ...]
+    counts: Mapping[str, int]
+    ledger: FilteringLedger
+    training_ready: bool = False
+
+
+@dataclass(frozen=True)
 class _PreparedEvidence:
     evidence_id: str
     record_sha256: str
@@ -406,3 +434,33 @@ def group_evidence(
         entry.disposition, entry.reason,
     ))
     return tuple(groups), FilteringLedger(entries=tuple(entries))
+
+
+def apply_label_policy(
+    groups: Iterable[PairLabelGroup],
+    *,
+    ledger: Optional[FilteringLedger] = None,
+    policy_path: Any = None,
+    entity_bundle_path: Any = None,
+    allow_test_only: bool = False,
+) -> LabelPolicyResult:
+    """Apply a versioned measured-label policy to source-verified groups."""
+    return LabelPolicyResult(
+        policy_version="unimplemented",
+        policy_sha256="",
+        confirmed_labeled_pairs=(),
+        test_only_labeled_pairs=(),
+        gray=(),
+        unknown=(),
+        conflicts=(),
+        excluded=(),
+        unverified=(),
+        counts={
+            "confirmed_active": 0, "confirmed_inactive": 0,
+            "test_only_active": 0, "test_only_inactive": 0,
+            "gray": 0, "unknown": 0, "conflict": 0,
+            "excluded": 0, "unverified": 0,
+        },
+        ledger=ledger if ledger is not None else FilteringLedger(),
+        training_ready=False,
+    )

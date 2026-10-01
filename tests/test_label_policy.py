@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from dataclasses import replace
 import json
 from pathlib import Path
 
 import evidence_builder as builder
-from label_policy import group_evidence
+import label_policy
+from label_policy import apply_label_policy, group_evidence
+import pytest
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "activity_pages.json"
@@ -143,3 +146,195 @@ def test_empty_single_reordered_and_concurrent_grouping_are_deterministic():
     with ThreadPoolExecutor(max_workers=4) as pool:
         parallel = list(pool.map(lambda _: _digest(group_evidence(records)), range(8)))
     assert parallel == [expected] * len(parallel)
+
+
+def _test_policy(tmp_path: Path) -> Path:
+    policy = {
+        "schema_version": 1,
+        "policy_version": "label-policy-test-v1",
+        "entity_bundle_schema_version": 2,
+        "confirmed_source_kinds": ["online_snapshot"],
+        "test_only_source_kinds": ["synthetic_test"],
+        "entity_eligibility": {
+            "target_type": "SINGLE PROTEIN",
+            "organism": "Homo sapiens",
+            "taxonomy_id": 9606,
+            "component_type": "PROTEIN",
+            "component_count": 1,
+            "accession_pattern": "^[A-Z0-9]{6}(?:[A-Z0-9]{4})?$",
+        },
+        "endpoints": {"labeled": ["Ki", "Kd"], "independent_only": ["IC50"]},
+        "exact_relation": "=",
+        "minimum_confidence": 8,
+        "units_to_nanomolar": {
+            "pM": "0.001", "nM": "1", "uM": "1000", "µM": "1000",
+            "μM": "1000", "mM": "1000000", "M": "1000000000",
+        },
+        "thresholds": {"active_min_p": 6, "inactive_max_p": 5},
+        "assay_compatibility_fields": [
+            "assay_type", "assay_category", "assay_test_type", "assay_organism",
+            "assay_tax_id", "assay_cell_type", "assay_subcellular_fraction",
+            "bao_format", "bao_label",
+        ],
+    }
+    path = tmp_path / "label_policy.json"
+    path.write_text(json.dumps(policy, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _with_measurement(record, activity_id, endpoint, value, unit, *, relation="=", pchembl="5.0", confidence=None):
+    raw = copy.deepcopy(record.raw_activity_record)
+    raw.update(
+        activity_id=activity_id,
+        standard_type=endpoint,
+        standard_relation=relation,
+        standard_value=value,
+        standard_units=unit,
+        pchembl_value=pchembl,
+    )
+    changes = {
+        "activity_id": activity_id,
+        "standard_type": endpoint,
+        "standard_relation": relation,
+        "standard_value": value,
+        "standard_units": unit,
+        "pchembl_value": pchembl,
+        "raw_activity_record": raw,
+    }
+    if confidence is not None:
+        assay = copy.deepcopy(record.assay_record)
+        assay["confidence_score"] = confidence
+        changes.update(
+            confidence_score=confidence,
+            assay_confidence_score=confidence,
+            assay_record=assay,
+        )
+    return replace(record, **changes)
+
+
+def _apply_test_records(records, tmp_path, *, allow_test_only=True, entity_bundle_path=None, policy_path=None):
+    groups, ledger = group_evidence(records)
+    return apply_label_policy(
+        groups,
+        ledger=ledger,
+        policy_path=policy_path or _test_policy(tmp_path),
+        entity_bundle_path=entity_bundle_path,
+        allow_test_only=allow_test_only,
+    )
+
+
+def test_versioned_policy_declares_only_exact_human_ki_kd_label_rules():
+    policy_path = Path(label_policy.__file__).resolve().parent / "policies" / "label_policy.json"
+
+    assert policy_path.is_file()
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert policy["policy_version"]
+    assert policy["endpoints"] == {"labeled": ["Ki", "Kd"], "independent_only": ["IC50"]}
+    assert policy["exact_relation"] == "="
+    assert policy["minimum_confidence"] == 8
+    assert policy["thresholds"] == {"active_min_p": 6, "inactive_max_p": 5}
+    assert policy["entity_eligibility"]["taxonomy_id"] == 9606
+
+
+def test_measured_value_boundaries_are_inclusive_units_convert_and_pchembl_is_ignored(tmp_path):
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    active = _apply_test_records([_with_measurement(base, 710001, "Ki", "1", "uM", pchembl="1.0")], tmp_path)
+    inactive = _apply_test_records([_with_measurement(base, 710002, "Ki", "10", "uM", pchembl="9.9")], tmp_path)
+    gray = _apply_test_records([_with_measurement(base, 710003, "Ki", "5", "uM", pchembl="10.0")], tmp_path)
+
+    assert [(item.label, item.endpoint) for item in active.test_only_labeled_pairs] == [("active", "Ki")]
+    assert [(item.label, item.endpoint) for item in inactive.test_only_labeled_pairs] == [("inactive", "Ki")]
+    assert len(gray.gray) == 1 and gray.gray[0].label == "gray"
+    assert active.counts["confirmed_active"] == inactive.counts["confirmed_inactive"] == 0
+    assert active.counts["test_only_active"] == 1
+    assert active.training_ready is inactive.training_ready is gray.training_ready is False
+    assert active.test_only_labeled_pairs[0].evidence_ids
+
+
+def test_compatible_assay_conflict_is_quarantined_and_ki_kd_remain_separate(tmp_path):
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    records = [
+        _with_measurement(base, 720001, "Ki", "100", "nM"),
+        _with_measurement(base, 720002, "Ki", "20", "uM"),
+        _with_measurement(base, 720003, "Kd", "200", "nM"),
+    ]
+
+    result = _apply_test_records(records, tmp_path)
+
+    assert len(result.conflicts) == 1
+    assert result.conflicts[0].endpoint == "Ki"
+    assert set(result.conflicts[0].evidence_ids) == {"720001", "720002"}
+    assert [(row.endpoint, row.label) for row in result.test_only_labeled_pairs] == [("Kd", "active")]
+    groups, _ = group_evidence(records)
+    assert len({group.split_group_id for group in groups}) == 1
+
+
+@pytest.mark.parametrize(
+    "endpoint,value,unit,relation,confidence,reason",
+    [
+        ("Ki", "100", "nM", ">", None, "relation_not_exact"),
+        ("Ki", "100", "furlong", "=", None, "unit_not_allowed"),
+        ("Ki", "NaN", "nM", "=", None, "measurement_value_not_finite_positive"),
+        ("Ki", 0, "nM", "=", None, "measurement_value_not_finite_positive"),
+        ("Ki", 100, "nM", "=", 7, "confidence_below_minimum"),
+        ("IC50", "100", "nM", "=", None, "endpoint_not_label_eligible"),
+    ],
+)
+def test_invalid_evidence_is_excluded_with_reason_and_never_becomes_label(
+    tmp_path, endpoint, value, unit, relation, confidence, reason,
+):
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    record = _with_measurement(
+        base, 730001, endpoint, value, unit, relation=relation, confidence=confidence,
+    )
+
+    result = _apply_test_records([record], tmp_path)
+
+    assert result.test_only_labeled_pairs == ()
+    assert len(result.excluded) == 1
+    assert reason in result.excluded[0].reasons
+    assert result.excluded[0].evidence_ids
+
+
+def test_self_reported_status_cannot_bypass_verified_bundle_and_synthetic_stays_test_only(tmp_path):
+    bundle_root = tmp_path / "source-verified-fixture"
+    ingest = builder.ingest_local_manifest(FIXTURE_PATH, bundle_root)
+    assert ingest["status"] == "complete"
+    bundle_path = bundle_root / "entities.json"
+    bundle = builder.load_entity_bundle(bundle_path, verify_sources=True)
+    records = [builder.ActivityEvidence(**item) for item in bundle["activities"]]
+    groups, ledger = group_evidence(records)
+    policy_path = _test_policy(tmp_path)
+
+    test_result = apply_label_policy(
+        groups, ledger=ledger, policy_path=policy_path,
+        entity_bundle_path=bundle_path, allow_test_only=True,
+    )
+    assert test_result.confirmed_labeled_pairs == ()
+    assert test_result.counts["confirmed_active"] == test_result.counts["confirmed_inactive"] == 0
+    assert test_result.test_only_labeled_pairs
+    assert test_result.training_ready is False
+
+    claimed_online = replace(
+        records[0], source_kind="online_snapshot", metadata_status="complete",
+        evidence_status="observed", page_status="complete", pagination_status="complete",
+    )
+    forged_groups, forged_ledger = group_evidence([claimed_online])
+    forged_result = apply_label_policy(
+        forged_groups, ledger=forged_ledger, policy_path=policy_path,
+        entity_bundle_path=bundle_path,
+    )
+    assert forged_result.confirmed_labeled_pairs == ()
+    assert forged_result.unverified
+
+
+def test_invalid_policy_number_fails_closed(tmp_path):
+    policy_path = _test_policy(tmp_path)
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    policy["minimum_confidence"] = float("nan")
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    groups, ledger = group_evidence([base])
+
+    with pytest.raises(label_policy.LabelPolicyInputError):
+        apply_label_policy(groups, ledger=ledger, policy_path=policy_path, allow_test_only=True)

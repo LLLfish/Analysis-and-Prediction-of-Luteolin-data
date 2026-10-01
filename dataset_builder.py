@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from data_contracts import ProteinRecord, canonical_json_sha256, validate_protein_record
 from evidence_builder import load_entity_bundle
+from label_policy import apply_label_policy, group_evidence
 
 
 _POLICY_PATH = Path(__file__).resolve().parent / "policies" / "split_policy.json"
@@ -82,6 +83,8 @@ class PairSplitAssignment:
     labels: tuple[str, ...] = ()
     provenance_partition: str = "unlabeled"
     reasons: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+    group_sha256: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -820,6 +823,188 @@ def _dependency_failure(policy: Mapping[str, Any], policy_hash: str, exc: _Build
     )
 
 
+def _split_failure(
+    status: str,
+    policy_hash: str,
+    error: str,
+    *,
+    bundle: Optional[Mapping[str, Any]] = None,
+    sources: tuple[Mapping[str, Any], ...] = (),
+    test_only: bool = False,
+) -> SplitResult:
+    return SplitResult(
+        strict_split_status=status,
+        training_ready=False,
+        entity_version=bundle.get("entity_version") if bundle else None,
+        entity_bundle_hash=bundle.get("content_sha256") if bundle else None,
+        policy_sha256=policy_hash,
+        label_policy_sha256=None,
+        source_provenance=sources,
+        molecule_clusters=(),
+        protein_clusters=(),
+        molecule_cluster_assignment={},
+        protein_cluster_assignment={},
+        pair_assignments=(),
+        crosspair_quarantine=(),
+        unassigned_pairs=(),
+        test_only_pair_assignments=(),
+        class_support={name: {"active": 0, "inactive": 0} for name in ("train", "val", "test")},
+        split_sha256=None,
+        error=error,
+        test_only=test_only,
+    )
+
+
+def _assign_clusters(clusters: Iterable[Cluster], policy: Mapping[str, Any]) -> dict[str, str]:
+    cluster_ids = sorted(cluster.cluster_id for cluster in clusters)
+    if len(cluster_ids) != len(set(cluster_ids)):
+        raise DatasetBuildError("cluster IDs must be unique before split assignment", code="invalid_clusters")
+    if not cluster_ids:
+        return {}
+    split_policy = policy["split"]
+    rng = random.Random(split_policy["seed"])
+    shuffled = list(cluster_ids)
+    rng.shuffle(shuffled)
+    names = split_policy["names"]
+    ratios = split_policy["ratios"]
+    exact_counts = {name: len(shuffled) * float(ratios[name]) for name in names}
+    counts = {name: math.floor(exact_counts[name]) for name in names}
+    remainder_order = sorted(
+        names,
+        key=lambda name: (
+            -(exact_counts[name] - counts[name]),
+            split_policy["rounding_tie_order"].index(name),
+        ),
+    )
+    remaining = len(shuffled) - sum(counts.values())
+    for name in remainder_order[:remaining]:
+        counts[name] += 1
+    assigned: dict[str, str] = {}
+    offset = 0
+    for name in names:
+        for cluster_id in shuffled[offset:offset + counts[name]]:
+            assigned[cluster_id] = name
+        offset += counts[name]
+    if len(assigned) != len(cluster_ids):
+        raise DatasetBuildError("whole-cluster split allocation lost a cluster", code="invalid_split")
+    return {cluster_id: assigned[cluster_id] for cluster_id in sorted(assigned)}
+
+
+def _cluster_membership(clusters: Iterable[Cluster]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for cluster in clusters:
+        for entity_id in cluster.member_ids:
+            if entity_id in result:
+                raise DatasetBuildError(f"entity appears in multiple clusters: {entity_id}", code="invalid_clusters")
+            result[entity_id] = cluster.cluster_id
+    return result
+
+
+def _decision_maps(label_result: Any, groups: Iterable[Any]) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]]]:
+    group_values = tuple(groups)
+    groups_by_pair = {group.pair_key: group for group in group_values}
+    if len(groups_by_pair) != len(group_values):
+        raise DatasetBuildError("duplicate pair groups returned by label policy", code="label_policy_rejected")
+    confirmed: dict[str, set[str]] = {}
+    test_only: dict[str, set[str]] = {}
+    diagnostics: dict[str, set[str]] = {}
+    for field_name, partition, destination in (
+        ("confirmed_labeled_pairs", "confirmed", confirmed),
+        ("test_only_labeled_pairs", "test_only", test_only),
+    ):
+        for decision in getattr(label_result, field_name, ()):
+            if decision.label not in {"active", "inactive"}:
+                raise DatasetBuildError("label policy emitted an unsupported training class", code="label_policy_rejected")
+            group = groups_by_pair.get(decision.pair_key)
+            if (group is None or decision.split_group_id != group.split_group_id
+                    or decision.provenance_partition != partition
+                    or not set(decision.evidence_ids).issubset(set(group.evidence_ids))):
+                raise DatasetBuildError("label decision is detached from its canonical pair evidence group", code="label_policy_rejected")
+            destination.setdefault(decision.pair_key, set()).add(decision.label)
+    for field_name in ("gray", "unknown", "conflicts", "excluded", "unverified"):
+        for decision in getattr(label_result, field_name, ()):
+            if decision.pair_key in groups_by_pair:
+                diagnostics.setdefault(decision.pair_key, set()).update(
+                    f"{field_name}:{reason}" for reason in decision.reasons
+                )
+    return confirmed, test_only, diagnostics
+
+
+def _assignment_for_group(
+    group: Any,
+    *,
+    molecule_cluster_id: Optional[str],
+    protein_cluster_id: Optional[str],
+    split: Optional[str],
+    labels: Iterable[str],
+    provenance_partition: str,
+    reasons: Iterable[str] = (),
+) -> PairSplitAssignment:
+    return PairSplitAssignment(
+        split_group_id=group.split_group_id,
+        pair_key=group.pair_key,
+        molecule_cluster_id=molecule_cluster_id,
+        protein_cluster_id=protein_cluster_id,
+        split=split,
+        labels=tuple(sorted(set(labels))),
+        provenance_partition=provenance_partition,
+        reasons=tuple(sorted(set(reasons))),
+        evidence_ids=tuple(sorted(group.evidence_ids)),
+        group_sha256=group.group_sha256,
+    )
+
+
+def _class_support(assignments: Iterable[PairSplitAssignment]) -> dict[str, dict[str, int]]:
+    group_ids = {
+        split: {label: set() for label in ("active", "inactive")}
+        for split in ("train", "val", "test")
+    }
+    for assignment in assignments:
+        if assignment.split in group_ids:
+            for label in assignment.labels:
+                if label in group_ids[assignment.split]:
+                    group_ids[assignment.split][label].add(assignment.split_group_id)
+    return {
+        split: {label: len(values) for label, values in labels.items()}
+        for split, labels in group_ids.items()
+    }
+
+
+def _semantic_split_hash(
+    *, bundle: Mapping[str, Any], sources: tuple[Mapping[str, Any], ...],
+    policy: Mapping[str, Any], policy_hash: str, label_result: Any,
+    molecule_clusters: tuple[Cluster, ...], protein_clusters: tuple[Cluster, ...],
+    molecule_assignments: Mapping[str, str], protein_assignments: Mapping[str, str],
+    pair_assignments: tuple[PairSplitAssignment, ...],
+    crosspairs: tuple[PairSplitAssignment, ...],
+    unassigned: tuple[PairSplitAssignment, ...],
+    test_only_assignments: tuple[PairSplitAssignment, ...],
+    support: Mapping[str, Mapping[str, int]], ledger_hash: str,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "entity_version": bundle["entity_version"],
+        "entity_bundle_hash": bundle["content_sha256"],
+        "source_provenance": [dict(source) for source in sources],
+        "split_policy_sha256": policy_hash,
+        "label_policy_version": label_result.policy_version,
+        "label_policy_sha256": label_result.policy_sha256,
+        "label_ledger_sha256": ledger_hash,
+        "seed": policy["split"]["seed"],
+        "ratios": dict(policy["split"]["ratios"]),
+        "molecule_clusters": [asdict(cluster) for cluster in molecule_clusters],
+        "protein_clusters": [asdict(cluster) for cluster in protein_clusters],
+        "molecule_cluster_assignment": dict(sorted(molecule_assignments.items())),
+        "protein_cluster_assignment": dict(sorted(protein_assignments.items())),
+        "pair_assignments": [asdict(row) for row in pair_assignments],
+        "crosspair_quarantine": [asdict(row) for row in crosspairs],
+        "unassigned_pairs": [asdict(row) for row in unassigned],
+        "test_only_pair_assignments": [asdict(row) for row in test_only_assignments],
+        "class_support": {key: dict(value) for key, value in sorted(support.items())},
+    }
+    return canonical_json_sha256(payload)
+
+
 def _build_public_cluster_result(entity_bundle_path: Any, *, policy_path: Any,
                                  molecule: bool) -> ClusterBuildResult:
     policy, policy_hash = _load_policy(policy_path)
@@ -860,5 +1045,173 @@ def strict_double_cold_split(
     allow_test_only: bool = False,
 ) -> SplitResult:
     """Split whole molecule/protein clusters and quarantine cross-partition pairs."""
+    if type(allow_test_only) is not bool:
+        raise DatasetBuildError("allow_test_only must be a boolean", code="invalid_input")
     policy, policy_hash = _load_policy(policy_path)
-    raise NotImplementedError("strict double-cold splitting is implemented in Task 2")
+    try:
+        _require_rdkit()
+        _alignment_context(policy)
+    except _BuildAbort as exc:
+        return _split_failure(exc.code, policy_hash, str(exc))
+    bundle, resolved_path = _load_verified_bundle(entity_bundle_path)
+    sources = _bundle_sources(bundle)
+    molecule_result = _molecule_cluster_from_bundle(bundle, policy, policy_hash, sources)
+    protein_result = _protein_cluster_from_bundle(bundle, policy, policy_hash, sources)
+    for cluster_result in (molecule_result, protein_result):
+        if cluster_result.status in {"size_limit", "dependency_missing"}:
+            return _split_failure(
+                cluster_result.status,
+                policy_hash,
+                cluster_result.error or cluster_result.status,
+                bundle=bundle,
+                sources=sources,
+                test_only=cluster_result.test_only,
+            )
+
+    try:
+        groups, ledger = group_evidence(bundle["activities"])
+        label_result = apply_label_policy(
+            groups,
+            ledger=ledger,
+            policy_path=label_policy_path,
+            entity_bundle_path=resolved_path,
+            allow_test_only=allow_test_only,
+        )
+    except Exception as exc:
+        raise DatasetBuildError(
+            f"source-verified label policy rejected split input: {exc}",
+            code="label_policy_rejected",
+        ) from exc
+
+    current_bundle, _ = _load_verified_bundle(resolved_path)
+    if (current_bundle.get("entity_version") != bundle.get("entity_version")
+            or current_bundle.get("content_sha256") != bundle.get("content_sha256")):
+        raise DatasetBuildError("entity bundle changed while the split was being built", code="bundle_changed")
+
+    confirmed_labels, test_only_labels, diagnostic_reasons = _decision_maps(label_result, groups)
+    molecule_members = _cluster_membership(molecule_result.clusters)
+    protein_members = _cluster_membership(protein_result.clusters)
+    molecule_assignments = _assign_clusters(molecule_result.clusters, policy)
+    protein_assignments = _assign_clusters(protein_result.clusters, policy)
+    pair_assignments: list[PairSplitAssignment] = []
+    crosspairs: list[PairSplitAssignment] = []
+    unassigned: list[PairSplitAssignment] = []
+    test_only_assignments: list[PairSplitAssignment] = []
+
+    for group in sorted(groups, key=lambda row: (row.pair_key, row.split_group_id)):
+        molecule_cluster_id = molecule_members.get(group.molecule_chembl_id)
+        protein_entity_id = f"{group.taxonomy_id}|{group.protein_accession}"
+        protein_cluster_id = protein_members.get(protein_entity_id)
+        confirmed = confirmed_labels.get(group.pair_key, set())
+        test_labels = test_only_labels.get(group.pair_key, set())
+        labels = confirmed or test_labels
+        partition = "confirmed" if confirmed else "test_only" if test_labels else "unlabeled"
+        diagnostics = diagnostic_reasons.get(group.pair_key, set())
+        if molecule_cluster_id is None or protein_cluster_id is None:
+            row = _assignment_for_group(
+                group,
+                molecule_cluster_id=molecule_cluster_id,
+                protein_cluster_id=protein_cluster_id,
+                split=None,
+                labels=labels,
+                provenance_partition=partition,
+                reasons=diagnostics | {"entity_not_clusterable"},
+            )
+            unassigned.append(row)
+            continue
+        molecule_split = molecule_assignments[molecule_cluster_id]
+        protein_split = protein_assignments[protein_cluster_id]
+        if molecule_split != protein_split:
+            row = _assignment_for_group(
+                group,
+                molecule_cluster_id=molecule_cluster_id,
+                protein_cluster_id=protein_cluster_id,
+                split=None,
+                labels=labels,
+                provenance_partition=partition,
+                reasons=diagnostics | {"crosspair_cluster_partition_mismatch"},
+            )
+            crosspairs.append(row)
+            continue
+        if confirmed:
+            pair_assignments.append(_assignment_for_group(
+                group,
+                molecule_cluster_id=molecule_cluster_id,
+                protein_cluster_id=protein_cluster_id,
+                split=molecule_split,
+                labels=confirmed,
+                provenance_partition="confirmed",
+            ))
+        elif test_labels:
+            test_only_assignments.append(_assignment_for_group(
+                group,
+                molecule_cluster_id=molecule_cluster_id,
+                protein_cluster_id=protein_cluster_id,
+                split=molecule_split,
+                labels=test_labels,
+                provenance_partition="test_only",
+            ))
+        else:
+            unassigned.append(_assignment_for_group(
+                group,
+                molecule_cluster_id=molecule_cluster_id,
+                protein_cluster_id=protein_cluster_id,
+                split=None,
+                labels=(),
+                provenance_partition="unlabeled",
+                reasons=diagnostics or {"no_confirmed_label"},
+            ))
+
+    pair_assignments.sort(key=lambda row: (row.split or "", row.pair_key, row.split_group_id))
+    crosspairs.sort(key=lambda row: (row.pair_key, row.split_group_id))
+    unassigned.sort(key=lambda row: (row.pair_key, row.split_group_id))
+    test_only_assignments.sort(key=lambda row: (row.split or "", row.pair_key, row.split_group_id))
+    pair_assignments_tuple = tuple(pair_assignments)
+    crosspairs_tuple = tuple(crosspairs)
+    unassigned_tuple = tuple(unassigned)
+    test_only_tuple = tuple(test_only_assignments)
+    support = _class_support(pair_assignments_tuple)
+    strict_status = (
+        "ready"
+        if all(support[split][label] > 0 for split in ("train", "val", "test")
+               for label in ("active", "inactive"))
+        else "insufficient"
+    )
+    split_hash = _semantic_split_hash(
+        bundle=bundle,
+        sources=sources,
+        policy=policy,
+        policy_hash=policy_hash,
+        label_result=label_result,
+        molecule_clusters=molecule_result.clusters,
+        protein_clusters=protein_result.clusters,
+        molecule_assignments=molecule_assignments,
+        protein_assignments=protein_assignments,
+        pair_assignments=pair_assignments_tuple,
+        crosspairs=crosspairs_tuple,
+        unassigned=unassigned_tuple,
+        test_only_assignments=test_only_tuple,
+        support=support,
+        ledger_hash=label_result.ledger.sha256,
+    )
+    return SplitResult(
+        strict_split_status=strict_status,
+        training_ready=False,
+        entity_version=bundle["entity_version"],
+        entity_bundle_hash=bundle["content_sha256"],
+        policy_sha256=policy_hash,
+        label_policy_sha256=label_result.policy_sha256,
+        source_provenance=sources,
+        molecule_clusters=molecule_result.clusters,
+        protein_clusters=protein_result.clusters,
+        molecule_cluster_assignment=molecule_assignments,
+        protein_cluster_assignment=protein_assignments,
+        pair_assignments=pair_assignments_tuple,
+        crosspair_quarantine=crosspairs_tuple,
+        unassigned_pairs=unassigned_tuple,
+        test_only_pair_assignments=test_only_tuple,
+        class_support=support,
+        split_sha256=split_hash,
+        test_only=(molecule_result.test_only or protein_result.test_only
+                   or bool(test_only_tuple)),
+    )

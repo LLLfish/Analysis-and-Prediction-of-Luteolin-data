@@ -46,7 +46,10 @@ def _producer_evidence(*, duplicate_first: bool = False):
     if duplicate_first:
         activities.append(copy.deepcopy(measured))
 
-    target = next(item for item in chembl["targets"] if item["target_chembl_id"] == "CHEMBL900201")
+    target_records = {
+        item["target_chembl_id"]: copy.deepcopy(item)
+        for item in chembl["targets"]
+    }
     assays = {item["assay_chembl_id"]: copy.deepcopy(item) for item in chembl["assays"]}
     documents = {item["document_chembl_id"]: copy.deepcopy(item) for item in chembl["documents"]}
     for assay_id in ("CHEMBL900004", "CHEMBL900005"):
@@ -73,7 +76,7 @@ def _producer_evidence(*, duplicate_first: bool = False):
         "chembl_id": "CHEMBL151",
         "source_kind": "synthetic_test",
         "activity_pages": [page],
-        "target_records": {target["target_chembl_id"]: target},
+        "target_records": target_records,
         "assay_records": assays,
         "document_records": documents,
     }
@@ -97,14 +100,15 @@ def test_group_activity_evidence_from_real_producer_keeps_all_pair_endpoints_tog
     assert group.molecule_chembl_id == "CHEMBL151"
     assert group.protein_accession == "P12345"
     assert group.taxonomy_id == 9606
-    assert set(group.evidence_ids) == {"700001", "700004", "700005"}
     grouped_records = [json.loads(item) for item in group.records_json]
+    assert {str(item["activity_id"]) for item in grouped_records} == {"700001", "700004", "700005"}
     assert {item["standard_type"] for item in grouped_records} == {"Ki", "Kd", "IC50"}
     assert {item["assay_chembl_id"] for item in grouped_records} == {
         "CHEMBL900001", "CHEMBL900004", "CHEMBL900005",
     }
-    assert grouped_records[0]["raw_activity_record"]["conformation_id"] == "conf-A"
-    assert grouped_records[0]["raw_activity_record"]["sequence_chunk_id"] == "chunk-1"
+    first_record = next(item for item in grouped_records if item["activity_id"] == 700001)
+    assert first_record["raw_activity_record"]["conformation_id"] == "conf-A"
+    assert first_record["raw_activity_record"]["sequence_chunk_id"] == "chunk-1"
     assert group.split_group_id.startswith("pair-v1-")
     assert ledger.input_count == len(records)
 

@@ -49,6 +49,65 @@ def _issue_test_feature_result(output_dir: Path, bundle_path: Path, monkeypatch)
     return extractor, result
 
 
+def _fake_full_pipeline_framework(output_root: Path):
+    framework = main_module.NetworkPharmacologyFramework(
+        output_dir=str(output_root), allow_online=True,
+    )
+    calls = {"collection": 0, "reports": 0}
+    dataset = {
+        "compound": {"name": "synthetic"},
+        "targets": [],
+        "proteins": [],
+        "interactions": [],
+        "collection_status": "complete",
+        "status": "complete",
+    }
+
+    class FakeCollector:
+        def run_pipeline(self):
+            calls["collection"] += 1
+            return dataset
+
+    framework.data_collector = FakeCollector()
+
+    def run_feature_extraction(current_dataset):
+        result = {
+            "feature_readiness": {"overall_status": "ready", "stages": {}},
+            "gnn": {"centrality": {"synthetic": 1.0}},
+        }
+        framework.results["feature_extraction"] = result
+        return result
+
+    def run_feature_fusion(features):
+        result = {"status": "ready"}
+        framework.results["feature_fusion"] = result
+        return result
+
+    def run_docking(current_dataset):
+        result = {"binding_affinity": None}
+        framework.results["docking"] = result
+        return result
+
+    def run_knowledge_graph(current_dataset):
+        result = {"graph": {"stats": {"num_nodes": 0, "num_edges": 0}}}
+        framework.results["knowledge_graph"] = result
+        return result
+
+    def run_output_generation():
+        calls["reports"] += 1
+        report_path = output_root / "output" / "reports" / "summary.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps({"report_number": calls["reports"]}), encoding="utf-8")
+        framework.results["output"] = {"report_path": str(report_path)}
+
+    framework.run_feature_extraction = run_feature_extraction
+    framework.run_feature_fusion = run_feature_fusion
+    framework.run_docking = run_docking
+    framework.run_knowledge_graph = run_knowledge_graph
+    framework.run_output_generation = run_output_generation
+    return framework, calls
+
+
 def _readiness() -> dict:
     return {
         "overall_status": "partial",
@@ -819,3 +878,71 @@ def test_local_entity_feature_pipeline_creates_status_report_in_new_output_root(
     assert results["output"]["feature_readiness"] == readiness
     assert results["output"]["gnn_summary"]["model_type"] == "network_statistics_only"
     assert output_dir.is_dir()
+
+
+def test_full_pipeline_is_single_use_and_new_root_runs_independently(tmp_path):
+    output_root = tmp_path / "first-run"
+    framework, calls = _fake_full_pipeline_framework(output_root)
+
+    result = framework.run_full_pipeline()
+    assert result["pipeline_status"] == "complete"
+    results_path = output_root / "framework_results.json"
+    report_path = output_root / "output" / "reports" / "summary.json"
+    results_before = results_path.read_bytes()
+    report_before = report_path.read_bytes()
+
+    with pytest.raises(FileExistsError, match="single|fresh|new"):
+        framework.run_full_pipeline()
+
+    assert calls == {"collection": 1, "reports": 1}
+    assert results_path.read_bytes() == results_before
+    assert report_path.read_bytes() == report_before
+    assert json.loads(results_before)["results"]["pipeline_status"] == "complete"
+
+    second_root = tmp_path / "second-run"
+    second_framework, second_calls = _fake_full_pipeline_framework(second_root)
+    second_result = second_framework.run_full_pipeline()
+    assert second_result["pipeline_status"] == "complete"
+    assert second_calls == {"collection": 1, "reports": 1}
+    second_saved = json.loads((second_root / "framework_results.json").read_text(encoding="utf-8"))
+    assert second_saved["results"]["pipeline_status"] == "complete"
+
+
+def test_full_pipeline_raises_when_result_persistence_fails(tmp_path):
+    output_root = tmp_path / "save-fails"
+    framework, calls = _fake_full_pipeline_framework(output_root)
+    framework.save_results = lambda: ""
+
+    with pytest.raises(RuntimeError, match="persist|save"):
+        framework.run_full_pipeline()
+
+    assert framework.results["pipeline_status"] == "failed"
+    assert framework.results["pipeline_status_reason"] == "framework_results_persistence_failed"
+    assert calls["reports"] == 1
+    assert not (output_root / "framework_results.json").exists()
+
+
+def test_feature_only_public_pipeline_raises_when_result_persistence_fails(tmp_path, monkeypatch):
+    bundle_path, _ = _bundle(tmp_path)
+    output_root = tmp_path / "feature-only-save-fails"
+
+    class FailedSaveFramework:
+        def __init__(self, output_dir):
+            self.output_dir = output_dir
+            self.results = {}
+
+        def run_feature_extraction(self, dataset):
+            return {"feature_readiness": {"overall_status": "unavailable"}}
+
+        def run_feature_fusion(self, features):
+            return {"status": "unavailable"}
+
+        def run_output_generation(self):
+            return {}
+
+        def save_results(self):
+            return ""
+
+    monkeypatch.setattr(main_module, "NetworkPharmacologyFramework", FailedSaveFramework)
+    with pytest.raises(RuntimeError, match="could not be saved"):
+        main_module.run_feature_pipeline(str(bundle_path), str(output_root))

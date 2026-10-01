@@ -486,11 +486,12 @@ def audit_legacy_sources(apl_root: os.PathLike[str] | str, *, output_dir: Any = 
     """Audit the three legacy roots separately; never add their counts together."""
     root = _assert_safe_source_root(Path(apl_root))
     sources = [_source_report(root, source_id, relative, kind) for source_id, relative, kind in _SOURCE_SPECS]
+    code_version_control = _git_state(root)
     collection: dict[str, Any] = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "apl_root": str(root),
-        "code_version_control": _git_state(root),
+        "code_version_control": code_version_control,
         "sources": sources,
         "training_ready": False,
         "note": "Each source is audited independently; file and record counts are not summed across roots.",
@@ -503,7 +504,9 @@ def audit_legacy_sources(apl_root: os.PathLike[str] | str, *, output_dir: Any = 
         report_paths: dict[str, str] = {}
         for source in sources:
             path = destination / f"{source['source_id']}.json"
-            raw = _canonical_bytes(source)
+            report = dict(source)
+            report["code_version_control"] = code_version_control
+            raw = _canonical_bytes(report)
             temp = path.with_name(path.name + ".tmp")
             with temp.open("xb") as stream:
                 stream.write(raw)

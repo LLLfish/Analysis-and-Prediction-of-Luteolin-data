@@ -295,6 +295,11 @@ def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_referen
     assert by_id["apl_data"]["source_sha256"] != by_id["framework_output_data"]["source_sha256"]
     assert len(collection["report_paths"]) == 3
     assert all(Path(path).is_file() for path in collection["report_paths"].values())
+    assert collection["code_version_control"]["status"] == "not_initialized"
+    for path in collection["report_paths"].values():
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+        assert report["code_version_control"]["status"] == "not_initialized"
+        assert report["code_version_control"]["commit"] is None
 
 
 def test_source_audit_cli_returns_zero_for_successful_not_ready_reports_and_two_for_bad_input(tmp_path):

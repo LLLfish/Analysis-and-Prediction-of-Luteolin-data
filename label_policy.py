@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
-from decimal import Decimal
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal, InvalidOperation, localcontext
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Optional
 
-from evidence_builder import ActivityEvidence
+from evidence_builder import ActivityEvidence, load_entity_bundle
 
 
 _ACCESSION = re.compile(r"^[A-Z0-9]{6}(?:[A-Z0-9]{4})?$")
@@ -19,6 +21,31 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LEDGER_CATEGORIES = (
     "retained", "duplicate", "excluded", "unverified", "conflict_candidate",
 )
+_POLICY_PATH = Path(__file__).resolve().parent / "policies" / "label_policy.json"
+_POLICY_KEYS = {
+    "schema_version", "policy_version", "entity_bundle_schema_version",
+    "confirmed_source_kinds", "test_only_source_kinds", "entity_eligibility",
+    "endpoints", "exact_relation", "minimum_confidence", "units_to_nanomolar",
+    "thresholds", "assay_compatibility_fields",
+}
+_ENTITY_POLICY = {
+    "target_type": "SINGLE PROTEIN",
+    "organism": "Homo sapiens",
+    "taxonomy_id": 9606,
+    "component_type": "PROTEIN",
+    "component_count": 1,
+    "accession_pattern": _ACCESSION.pattern,
+}
+_ENDPOINT_POLICY = {"labeled": ["Ki", "Kd"], "independent_only": ["IC50"]}
+_UNIT_POLICY = {
+    "pM": "0.001", "nM": "1", "uM": "1000", "µM": "1000",
+    "μM": "1000", "mM": "1000000", "M": "1000000000",
+}
+_ASSAY_FIELDS = {
+    "assay_type", "assay_category", "assay_test_type", "assay_organism",
+    "assay_tax_id", "assay_cell_type", "assay_subcellular_fraction",
+    "bao_format", "bao_label",
+}
 
 
 class LabelPolicyInputError(ValueError):
@@ -309,6 +336,29 @@ def _prepare_evidence(value: Any) -> _PreparedEvidence:
         "source_kind": source_kind,
         "activity_id": activity_id,
         "snapshot_sha256": snapshot,
+        "source_context_sha256": _sha256({
+            "source_path": record.get("source_path"),
+            "source_version": record.get("source_version"),
+            "target_type": record.get("target_type"),
+            "target_organism": record.get("target_organism"),
+            "target_taxonomy_id": record.get("target_taxonomy_id"),
+            "target_components": record.get("target_components"),
+            "target_record": record.get("target_record"),
+            "target_record_source_path": record.get("target_record_source_path"),
+            "target_record_source_sha256": record.get("target_record_source_sha256"),
+            "assay_record": record.get("assay_record"),
+            "assay_record_source_path": record.get("assay_record_source_path"),
+            "assay_record_source_sha256": record.get("assay_record_source_sha256"),
+            "document_record": record.get("document_record"),
+            "document_record_source_path": record.get("document_record_source_path"),
+            "document_record_source_sha256": record.get("document_record_source_sha256"),
+            "confidence_score": record.get("confidence_score"),
+            "confidence_source": record.get("confidence_source"),
+            "assay_confidence_score": record.get("assay_confidence_score"),
+            "metadata_status": record.get("metadata_status"),
+            "entity_bundle_version": record.get("entity_bundle_version"),
+            "entity_bundle_hash": record.get("entity_bundle_hash"),
+        }),
     }
     duplicate_key = _json_text(duplicate_payload)
     evidence_payload = {**duplicate_payload, "measurement_sha256": measurement_sha}
@@ -436,6 +486,318 @@ def group_evidence(
     return tuple(groups), FilteringLedger(entries=tuple(entries))
 
 
+def _reject_json_constant(token: str) -> None:
+    raise LabelPolicyInputError(f"non-finite JSON constant is forbidden: {token}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise LabelPolicyInputError(f"duplicate policy key: {key}")
+        result[key] = value
+    return result
+
+
+def _load_policy(policy_path: Any = None) -> tuple[dict[str, Any], str, dict[str, Decimal]]:
+    path = _POLICY_PATH if policy_path is None else policy_path
+    if not isinstance(path, (str, os.PathLike)):
+        raise LabelPolicyInputError("policy_path must be a filesystem path")
+    try:
+        policy_bytes = Path(path).read_bytes()
+        policy = json.loads(
+            policy_bytes.decode("utf-8-sig"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+    except LabelPolicyInputError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise LabelPolicyInputError(f"label policy could not be read as strict UTF-8 JSON: {exc}") from exc
+    if not isinstance(policy, dict) or set(policy) != _POLICY_KEYS:
+        raise LabelPolicyInputError("label policy has an unsupported or incomplete schema")
+    if type(policy["schema_version"]) is not int or policy["schema_version"] != 1:
+        raise LabelPolicyInputError("unsupported label policy schema_version")
+    if type(policy["entity_bundle_schema_version"]) is not int or policy["entity_bundle_schema_version"] != 2:
+        raise LabelPolicyInputError("label policy requires entity bundle schema version 2")
+    if not isinstance(policy["policy_version"], str) or not policy["policy_version"].strip():
+        raise LabelPolicyInputError("policy_version must be a non-empty string")
+    if policy["confirmed_source_kinds"] != ["online_snapshot"]:
+        raise LabelPolicyInputError("only verified online_snapshot sources may be confirmed")
+    if policy["test_only_source_kinds"] != ["synthetic_test"]:
+        raise LabelPolicyInputError("synthetic_test must remain in its own partition")
+    if (not isinstance(policy["entity_eligibility"], dict)
+            or _json_text(policy["entity_eligibility"]) != _json_text(_ENTITY_POLICY)):
+        raise LabelPolicyInputError("policy entity eligibility must remain human SINGLE PROTEIN")
+    if (not isinstance(policy["endpoints"], dict)
+            or _json_text(policy["endpoints"]) != _json_text(_ENDPOINT_POLICY)):
+        raise LabelPolicyInputError("only Ki/Kd are labeled and IC50 stays independent")
+    if policy["exact_relation"] != "=":
+        raise LabelPolicyInputError("only exact relation '=' is supported")
+    if type(policy["minimum_confidence"]) is not int or policy["minimum_confidence"] != 8:
+        raise LabelPolicyInputError("this policy version requires integer confidence >= 8")
+    thresholds = policy["thresholds"]
+    if (not isinstance(thresholds, dict)
+            or set(thresholds) != {"active_min_p", "inactive_max_p"}
+            or type(thresholds.get("active_min_p")) is not int
+            or type(thresholds.get("inactive_max_p")) is not int
+            or thresholds != {"active_min_p": 6, "inactive_max_p": 5}):
+        raise LabelPolicyInputError("this policy version requires inclusive p thresholds 6 and 5")
+    if policy["units_to_nanomolar"] != _UNIT_POLICY:
+        raise LabelPolicyInputError("unit table differs from the reviewed exact unit allowlist")
+    fields = policy["assay_compatibility_fields"]
+    if (not isinstance(fields, list) or not fields
+            or any(not isinstance(field, str) or field not in _ASSAY_FIELDS for field in fields)
+            or len(fields) != len(set(fields))):
+        raise LabelPolicyInputError("assay_compatibility_fields is invalid")
+
+    units: dict[str, Decimal] = {}
+    for unit, raw_factor in policy["units_to_nanomolar"].items():
+        if not isinstance(unit, str) or not isinstance(raw_factor, str):
+            raise LabelPolicyInputError("unit names and conversion factors must be strings")
+        try:
+            factor = Decimal(raw_factor)
+        except InvalidOperation as exc:
+            raise LabelPolicyInputError(f"invalid conversion factor for {unit}") from exc
+        if not factor.is_finite() or factor <= 0:
+            raise LabelPolicyInputError(f"conversion factor for {unit} must be finite and positive")
+        units[unit] = factor
+    return policy, hashlib.sha256(policy_bytes).hexdigest(), units
+
+
+def _load_source_bundle(path: Any) -> Optional[dict[str, Any]]:
+    if path is None:
+        return None
+    if not isinstance(path, (str, os.PathLike)):
+        raise LabelPolicyInputError("entity_bundle_path must be a filesystem path")
+    try:
+        bundle = load_entity_bundle(path, verify_sources=True)
+    except Exception as exc:
+        raise LabelPolicyInputError(f"entity bundle failed source verification: {exc}") from exc
+    if bundle.get("schema_version") != 2:
+        raise LabelPolicyInputError("entity bundle schema does not match the policy")
+    return bundle
+
+
+def _mapping_matches(left: Any, right: Any) -> bool:
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    try:
+        return _json_text(left) == _json_text(right)
+    except LabelPolicyInputError:
+        return False
+
+
+def _verified_bundle_membership(
+    record_json: str,
+    record: Mapping[str, Any],
+    bundle: Optional[Mapping[str, Any]],
+    policy: Mapping[str, Any],
+) -> tuple[str, str]:
+    source_kind = record.get("source_kind")
+    if source_kind in policy["test_only_source_kinds"]:
+        if bundle is not None:
+            bundle_activities = bundle.get("activities", [])
+            if not any(_mapping_matches(record, item) for item in bundle_activities):
+                return "unverified", "activity_not_member_of_verified_entity_bundle"
+        return "test_only", "synthetic_test_only"
+    if source_kind not in policy["confirmed_source_kinds"]:
+        return "unverified", "source_kind_not_confirmable"
+    if bundle is None:
+        return "unverified", "verified_entity_bundle_required"
+    if not any(_mapping_matches(record, item) for item in bundle.get("activities", [])):
+        return "unverified", "activity_not_member_of_verified_entity_bundle"
+    if (record.get("entity_bundle_version") != bundle.get("entity_version")
+            or record.get("entity_bundle_hash") != bundle.get("content_sha256")):
+        return "unverified", "activity_entity_bundle_link_mismatch"
+    if (record.get("metadata_status") != "complete"
+            or record.get("evidence_status") != "observed"
+            or record.get("page_status") != "complete"
+            or record.get("pagination_status") != "complete"):
+        return "unverified", "source_activity_capture_incomplete"
+
+    identity, disposition, reason_or_key = _pair_identity(record)
+    if identity is None or disposition != "retained":
+        return "unverified", reason_or_key
+    molecule_id, taxonomy_id, accession = identity
+    molecule = next((item for item in bundle.get("molecules", [])
+                     if isinstance(item, Mapping)
+                     and item.get("molecule_chembl_id") == molecule_id), None)
+    if (molecule is None or molecule.get("structure_status") != "verified"
+            or molecule.get("source_kind") != "online_snapshot"):
+        return "unverified", "molecule_entity_not_source_verified"
+    protein = next((item for item in bundle.get("proteins", [])
+                    if isinstance(item, Mapping)
+                    and item.get("accession") == accession
+                    and item.get("taxonomy_id") == taxonomy_id), None)
+    if (protein is None or protein.get("identity_status") != "verified"
+            or protein.get("sequence_status") != "verified"
+            or protein.get("source_kind") != "online_snapshot"):
+        return "unverified", "protein_entity_not_source_verified"
+    return "confirmed", ""
+
+
+def _linked_metadata_error(record: Mapping[str, Any]) -> Optional[str]:
+    if (record.get("metadata_status") != "complete"
+            or record.get("evidence_status") != "observed"
+            or record.get("page_status") != "complete"
+            or record.get("pagination_status") != "complete"):
+        return "source_activity_capture_incomplete"
+    target = record.get("target_record")
+    assay = record.get("assay_record")
+    document = record.get("document_record")
+    if not isinstance(target, Mapping) or target.get("target_chembl_id") != record.get("target_chembl_id"):
+        return "target_snapshot_link_mismatch"
+    if (target.get("target_type") != "SINGLE PROTEIN"
+            or target.get("organism") != "Homo sapiens"
+            or target.get("tax_id") != 9606
+            or not _mapping_matches(
+                {"components": target.get("target_components")},
+                {"components": record.get("target_components")},
+            )):
+        return "target_snapshot_entity_mismatch"
+    if (not isinstance(assay, Mapping)
+            or assay.get("assay_chembl_id") != record.get("assay_chembl_id")
+            or assay.get("target_chembl_id") != record.get("target_chembl_id")):
+        return "assay_snapshot_link_mismatch"
+    if (not isinstance(document, Mapping)
+            or document.get("document_chembl_id") != record.get("document_chembl_id")):
+        return "document_snapshot_link_mismatch"
+    return None
+
+
+def _assay_condition(record: Mapping[str, Any], fields: list[str]) -> tuple[Optional[str], Optional[str]]:
+    assay = record.get("assay_record")
+    if (not isinstance(assay, Mapping)
+            or assay.get("assay_chembl_id") != record.get("assay_chembl_id")
+            or assay.get("target_chembl_id") != record.get("target_chembl_id")):
+        return None, "assay_snapshot_link_mismatch"
+    condition: dict[str, Any] = {}
+    for field in fields:
+        value = assay.get(field)
+        if value is None:
+            condition[field] = None
+        elif field == "assay_tax_id" and type(value) is int and value > 0:
+            condition[field] = value
+        elif field != "assay_tax_id" and isinstance(value, str):
+            condition[field] = value
+        else:
+            return None, f"invalid_assay_condition:{field}"
+    return _sha256(condition), None
+
+
+def _confidence_error(record: Mapping[str, Any], minimum: int) -> Optional[str]:
+    raw = record.get("raw_activity_record")
+    assay = record.get("assay_record")
+    source = record.get("confidence_source")
+    if source == "activity" and isinstance(raw, Mapping):
+        source_value = raw.get("confidence_score")
+    elif source == "assay" and isinstance(assay, Mapping):
+        source_value = assay.get("confidence_score")
+        if record.get("assay_confidence_score") != source_value:
+            return "assay_confidence_source_mismatch"
+    else:
+        return "confidence_source_missing"
+    effective = record.get("confidence_score")
+    if type(source_value) is not int or type(effective) is not int:
+        return "confidence_invalid_type"
+    if effective != source_value:
+        return "confidence_source_mismatch"
+    if effective < minimum:
+        return "confidence_below_minimum"
+    return None
+
+
+def _decimal_measurement(value: Any) -> tuple[Optional[Decimal], Optional[str]]:
+    if type(value) is int:
+        text = str(value)
+    elif type(value) is float:
+        if not math.isfinite(value):
+            return None, "measurement_value_not_finite_positive"
+        text = str(value)
+    elif isinstance(value, str) and value and value == value.strip() and len(value) <= 64:
+        text = value
+    else:
+        return None, "measurement_value_invalid_type"
+    try:
+        parsed = Decimal(text)
+    except InvalidOperation:
+        return None, "measurement_value_invalid_number"
+    if not parsed.is_finite() or parsed <= 0 or abs(parsed.adjusted()) > 300:
+        return None, "measurement_value_not_finite_positive"
+    if len(parsed.as_tuple().digits) > 128:
+        return None, "measurement_value_precision_limit"
+    return parsed, None
+
+
+def _evaluate_measurement(
+    record: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    unit_factors: Mapping[str, Decimal],
+) -> tuple[str, str, str, Optional[str]]:
+    endpoint = record.get("standard_type")
+    endpoint_value = endpoint if isinstance(endpoint, str) else "unknown"
+    condition_hash, condition_error = _assay_condition(
+        record, policy["assay_compatibility_fields"],
+    )
+    if condition_error:
+        return "excluded", condition_error, endpoint_value, None
+    link_error = _linked_metadata_error(record)
+    if link_error:
+        return "unverified", link_error, endpoint_value, condition_hash
+    if endpoint_value == "IC50" or endpoint_value not in policy["endpoints"]["labeled"]:
+        return "excluded", "endpoint_not_label_eligible", endpoint_value, condition_hash
+    if record.get("standard_relation") != policy["exact_relation"]:
+        return "excluded", "relation_not_exact", endpoint_value, condition_hash
+    confidence_error = _confidence_error(record, policy["minimum_confidence"])
+    if confidence_error:
+        return "excluded", confidence_error, endpoint_value, condition_hash
+    value = record.get("standard_value")
+    if value is None:
+        return "unknown", "measurement_value_missing", endpoint_value, condition_hash
+    unit = record.get("standard_units")
+    if not isinstance(unit, str) or unit not in unit_factors:
+        return "excluded", "unit_not_allowed", endpoint_value, condition_hash
+    decimal_value, value_error = _decimal_measurement(value)
+    if value_error:
+        return "excluded", value_error, endpoint_value, condition_hash
+    assert decimal_value is not None
+    with localcontext() as context:
+        context.prec = 256
+        value_nm = decimal_value * unit_factors[unit]
+        active_boundary = Decimal(10) ** (9 - policy["thresholds"]["active_min_p"])
+        inactive_boundary = Decimal(10) ** (9 - policy["thresholds"]["inactive_max_p"])
+    if value_nm <= active_boundary:
+        return "active", "measured_value_meets_inclusive_p6_boundary", endpoint_value, condition_hash
+    if value_nm >= inactive_boundary:
+        return "inactive", "measured_value_meets_inclusive_p5_boundary", endpoint_value, condition_hash
+    return "gray", "measured_value_inside_gray_band", endpoint_value, condition_hash
+
+
+def _make_decision(
+    group: Optional[PairLabelGroup],
+    *,
+    pair_key: str,
+    split_group_id: str,
+    endpoint: str,
+    condition_hash: str,
+    label: str,
+    evidence_ids: Iterable[str],
+    reasons: Iterable[str],
+    partition: str,
+) -> LabelDecision:
+    return LabelDecision(
+        pair_key=pair_key,
+        split_group_id=split_group_id,
+        endpoint=endpoint,
+        assay_condition_sha256=condition_hash,
+        label=label,
+        evidence_ids=tuple(sorted(set(evidence_ids))),
+        reasons=tuple(sorted(set(reasons))),
+        provenance_partition=partition,
+    )
+
+
 def apply_label_policy(
     groups: Iterable[PairLabelGroup],
     *,
@@ -444,23 +806,220 @@ def apply_label_policy(
     entity_bundle_path: Any = None,
     allow_test_only: bool = False,
 ) -> LabelPolicyResult:
-    """Apply a versioned measured-label policy to source-verified groups."""
+    """Apply measured Ki/Kd rules after independent source/entity verification.
+
+    A real confirmed label must be an exact activity row in a source-verified
+    schema-v2 entity bundle. Synthetic evidence may exercise the algorithm only
+    when explicitly requested, and is returned in a disjoint test-only table.
+    """
+    if type(allow_test_only) is not bool:
+        raise LabelPolicyInputError("allow_test_only must be a boolean")
+    if not isinstance(ledger, FilteringLedger):
+        raise LabelPolicyInputError("a FilteringLedger from group_evidence is required")
+    policy, policy_hash, unit_factors = _load_policy(policy_path)
+    bundle = _load_source_bundle(entity_bundle_path)
+    try:
+        group_values = list(groups)
+    except TypeError as exc:
+        raise LabelPolicyInputError("groups must be iterable") from exc
+    if any(not isinstance(group, PairLabelGroup) for group in group_values):
+        raise LabelPolicyInputError("groups must contain PairLabelGroup values")
+
+    ledger_primary: dict[str, LedgerEntry] = {}
+    for entry in ledger.entries:
+        if entry.occurrence == 1:
+            ledger_primary[entry.evidence_id] = entry
+
+    grouped_evidence_ids: set[str] = set()
+    outcomes: list[tuple[PairLabelGroup, str, dict[str, Any], str, str, str, str]] = []
+    for group in group_values:
+        if (not isinstance(group.evidence_ids, tuple)
+                or not isinstance(group.records_json, tuple)
+                or len(group.evidence_ids) != len(group.records_json)
+                or len(set(group.evidence_ids)) != len(group.evidence_ids)):
+            raise LabelPolicyInputError("pair group evidence arrays are malformed")
+        parsed: list[tuple[str, dict[str, Any], str]] = []
+        for evidence_id, record_json in zip(group.evidence_ids, group.records_json):
+            if not isinstance(evidence_id, str) or not isinstance(record_json, str):
+                raise LabelPolicyInputError("pair group evidence IDs and records must be strings")
+            try:
+                record = json.loads(record_json, parse_constant=_reject_json_constant)
+            except (json.JSONDecodeError, LabelPolicyInputError) as exc:
+                raise LabelPolicyInputError(f"pair group contains invalid evidence JSON: {exc}") from exc
+            if not isinstance(record, dict):
+                raise LabelPolicyInputError("pair group activity evidence must be an object")
+            prepared = _prepare_evidence(record)
+            if prepared.evidence_id != evidence_id or prepared.record_json != record_json:
+                raise LabelPolicyInputError("pair group evidence identity or canonical content mismatch")
+            if prepared.pair_identity != (
+                group.molecule_chembl_id, group.taxonomy_id, group.protein_accession,
+            ):
+                raise LabelPolicyInputError("pair group identity does not match its activity evidence")
+            ledger_entry = ledger_primary.get(evidence_id)
+            if (ledger_entry is None or ledger_entry.record_sha256 != prepared.record_sha256
+                    or ledger_entry.record_json != record_json):
+                raise LabelPolicyInputError("pair group evidence does not match its filtering ledger")
+            parsed.append((evidence_id, record, record_json))
+            grouped_evidence_ids.add(evidence_id)
+        split_hash = _sha256({
+            "schema": "pair-label-group-v1",
+            "molecule_chembl_id": group.molecule_chembl_id,
+            "taxonomy_id": group.taxonomy_id,
+            "accession": group.protein_accession,
+        })
+        expected_group_hash = _sha256({
+            "split_group_id": f"pair-v1-{split_hash}",
+            "evidence_ids": list(group.evidence_ids),
+            "record_sha256": [hashlib.sha256(value.encode("utf-8")).hexdigest()
+                              for value in group.records_json],
+        })
+        if (group.split_group_id != f"pair-v1-{split_hash}"
+                or group.group_sha256 != expected_group_hash):
+            raise LabelPolicyInputError("pair group split identity or content hash mismatch")
+
+        for evidence_id, record, record_json in parsed:
+            partition, trust_reason = _verified_bundle_membership(
+                record_json, record, bundle, policy,
+            )
+            if partition == "unverified":
+                outcomes.append((group, evidence_id, record, partition, "unverified",
+                                 trust_reason, ""))
+                continue
+            status, reason, endpoint, condition_hash = _evaluate_measurement(
+                record, policy, unit_factors,
+            )
+            outcomes.append((group, evidence_id, record, partition, status,
+                             reason, condition_hash or ""))
+
+    decisions_by_class: dict[str, list[LabelDecision]] = {
+        "confirmed_labeled_pairs": [], "test_only_labeled_pairs": [],
+        "gray": [], "unknown": [], "conflicts": [], "excluded": [], "unverified": [],
+    }
+    ledger_updates: dict[str, tuple[str, str]] = {}
+    buckets: dict[tuple[str, str, str, str], list[tuple[PairLabelGroup, str, dict[str, Any], str, str, str]]] = {}
+    for group, evidence_id, record, partition, status, reason, condition_hash in outcomes:
+        endpoint = record.get("standard_type") if isinstance(record.get("standard_type"), str) else "unknown"
+        bucket_key = (group.pair_key, endpoint, condition_hash, partition)
+        buckets.setdefault(bucket_key, []).append((group, evidence_id, record, status, reason, condition_hash))
+
+    for bucket_key in sorted(buckets):
+        rows = buckets[bucket_key]
+        group = rows[0][0]
+        pair_key, endpoint, condition_hash, partition = bucket_key
+        candidate_rows = [row for row in rows if row[3] in {"active", "inactive"}]
+        candidate_labels = {row[3] for row in candidate_rows}
+        if candidate_labels == {"active", "inactive"}:
+            evidence_ids = [row[1] for row in candidate_rows]
+            decision = _make_decision(
+                group, pair_key=pair_key, split_group_id=group.split_group_id,
+                endpoint=endpoint, condition_hash=condition_hash, label="conflict",
+                evidence_ids=evidence_ids,
+                reasons=("active_inactive_same_endpoint_assay_condition",), partition=partition,
+            )
+            decisions_by_class["conflicts"].append(decision)
+            if partition == "confirmed":
+                for evidence_id in evidence_ids:
+                    ledger_updates[evidence_id] = ("conflict_candidate", "active_inactive_conflict")
+        elif candidate_labels:
+            label = next(iter(candidate_labels))
+            evidence_ids = [row[1] for row in candidate_rows]
+            reasons = [row[4] for row in candidate_rows]
+            decision = _make_decision(
+                group, pair_key=pair_key, split_group_id=group.split_group_id,
+                endpoint=endpoint, condition_hash=condition_hash, label=label,
+                evidence_ids=evidence_ids, reasons=reasons, partition=partition,
+            )
+            result_key = "confirmed_labeled_pairs" if partition == "confirmed" else "test_only_labeled_pairs"
+            decisions_by_class[result_key].append(decision)
+            if partition == "confirmed":
+                for evidence_id in evidence_ids:
+                    ledger_updates[evidence_id] = ("retained", f"label_{label}")
+
+        for status in ("gray", "unknown", "excluded", "unverified"):
+            status_rows = [row for row in rows if row[3] == status]
+            if not status_rows:
+                continue
+            # Keep distinct reason classes independently auditable.
+            reason_groups: dict[str, list[tuple[PairLabelGroup, str, dict[str, Any], str, str, str]]] = {}
+            for row in status_rows:
+                reason_groups.setdefault(row[4], []).append(row)
+            result_key = {"gray": "gray", "unknown": "unknown", "excluded": "excluded",
+                          "unverified": "unverified"}[status]
+            for reason in sorted(reason_groups):
+                reason_rows = reason_groups[reason]
+                decision = _make_decision(
+                    group, pair_key=pair_key, split_group_id=group.split_group_id,
+                    endpoint=endpoint, condition_hash=condition_hash, label=status,
+                    evidence_ids=[row[1] for row in reason_rows], reasons=(reason,), partition=partition,
+                )
+                decisions_by_class[result_key].append(decision)
+                if partition == "confirmed":
+                    disposition = "retained" if status == "gray" else status
+                    if disposition not in _LEDGER_CATEGORIES:
+                        disposition = "unverified"
+                    for row in reason_rows:
+                        ledger_updates[row[1]] = (disposition, reason)
+
+    # Preserve invalid-entity and malformed evidence that could not form a pair group.
+    for entry in ledger.entries:
+        if entry.evidence_id in grouped_evidence_ids or entry.disposition == "duplicate":
+            continue
+        label = "excluded" if entry.disposition == "excluded" else "unverified"
+        decision = _make_decision(
+            None, pair_key=entry.pair_key or "", split_group_id="", endpoint="unknown",
+            condition_hash="", label=label, evidence_ids=(entry.evidence_id,),
+            reasons=(entry.reason,), partition="unverified",
+        )
+        decisions_by_class[label].append(decision)
+
+    updated_entries: list[LedgerEntry] = []
+    for entry in ledger.entries:
+        update = ledger_updates.get(entry.evidence_id)
+        if update is not None and entry.disposition != "duplicate" and entry.occurrence == 1:
+            updated_entries.append(replace(entry, disposition=update[0], reason=update[1]))
+        else:
+            updated_entries.append(entry)
+    updated_entries.sort(key=lambda entry: (
+        entry.evidence_id, entry.occurrence, entry.record_sha256,
+        entry.disposition, entry.reason,
+    ))
+    result_ledger = FilteringLedger(entries=tuple(updated_entries))
+
+    for values in decisions_by_class.values():
+        values.sort(key=lambda item: (
+            item.pair_key, item.endpoint, item.assay_condition_sha256,
+            item.provenance_partition, item.label, item.evidence_ids,
+        ))
+    counts = {
+        "confirmed_active": 0, "confirmed_inactive": 0,
+        "test_only_active": 0, "test_only_inactive": 0,
+        "confirmed_gray": 0, "test_only_gray": 0,
+        "confirmed_unknown": 0, "test_only_unknown": 0,
+        "confirmed_conflict": 0, "test_only_conflict": 0,
+        "confirmed_excluded": 0, "test_only_excluded": 0,
+        "unverified": 0,
+    }
+    for result_key, rows in decisions_by_class.items():
+        for decision in rows:
+            if decision.provenance_partition == "unverified":
+                counts["unverified"] += len(decision.evidence_ids)
+                continue
+            prefix = "confirmed" if decision.provenance_partition == "confirmed" else "test_only"
+            suffix = decision.label
+            if suffix in {"active", "inactive", "gray", "unknown", "conflict", "excluded"}:
+                counts[f"{prefix}_{suffix}"] += len(decision.evidence_ids)
+
     return LabelPolicyResult(
-        policy_version="unimplemented",
-        policy_sha256="",
-        confirmed_labeled_pairs=(),
-        test_only_labeled_pairs=(),
-        gray=(),
-        unknown=(),
-        conflicts=(),
-        excluded=(),
-        unverified=(),
-        counts={
-            "confirmed_active": 0, "confirmed_inactive": 0,
-            "test_only_active": 0, "test_only_inactive": 0,
-            "gray": 0, "unknown": 0, "conflict": 0,
-            "excluded": 0, "unverified": 0,
-        },
-        ledger=ledger if ledger is not None else FilteringLedger(),
+        policy_version=policy["policy_version"],
+        policy_sha256=policy_hash,
+        confirmed_labeled_pairs=tuple(decisions_by_class["confirmed_labeled_pairs"]),
+        test_only_labeled_pairs=tuple(decisions_by_class["test_only_labeled_pairs"]),
+        gray=tuple(decisions_by_class["gray"]),
+        unknown=tuple(decisions_by_class["unknown"]),
+        conflicts=tuple(decisions_by_class["conflicts"]),
+        excluded=tuple(decisions_by_class["excluded"]),
+        unverified=tuple(decisions_by_class["unverified"]),
+        counts=counts,
+        ledger=result_ledger,
         training_ready=False,
     )

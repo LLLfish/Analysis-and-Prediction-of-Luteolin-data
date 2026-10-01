@@ -130,6 +130,25 @@ def test_identical_activity_source_is_deduplicated_and_every_input_gets_one_ledg
     assert sum(ledger.counts.values()) == len(records)
 
 
+def test_different_linked_source_receipts_are_not_collapsed_as_activity_duplicates():
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    alternate = replace(
+        base,
+        assay_record_source_path="raw/assay-revision.json",
+        assay_record_source_sha256="a" * 64,
+    )
+
+    groups, ledger = group_evidence([base, alternate])
+
+    assert len(groups) == 1
+    assert len(groups[0].evidence_ids) == 2
+    assert ledger.counts["duplicate"] == 0
+    assert {
+        json.loads(record)["assay_record_source_path"]
+        for record in groups[0].records_json
+    } == {None, "raw/assay-revision.json"}
+
+
 def test_empty_single_reordered_and_concurrent_grouping_are_deterministic():
     records = _producer_evidence(duplicate_first=True)
 
@@ -263,9 +282,14 @@ def test_compatible_assay_conflict_is_quarantined_and_ki_kd_remain_separate(tmp_
 
     assert len(result.conflicts) == 1
     assert result.conflicts[0].endpoint == "Ki"
-    assert set(result.conflicts[0].evidence_ids) == {"720001", "720002"}
-    assert [(row.endpoint, row.label) for row in result.test_only_labeled_pairs] == [("Kd", "active")]
     groups, _ = group_evidence(records)
+    grouped_ids = {
+        evidence_id
+        for evidence_id, record_json in zip(groups[0].evidence_ids, groups[0].records_json)
+        if json.loads(record_json)["activity_id"] in {720001, 720002}
+    }
+    assert set(result.conflicts[0].evidence_ids) == grouped_ids
+    assert [(row.endpoint, row.label) for row in result.test_only_labeled_pairs] == [("Kd", "active")]
     assert len({group.split_group_id for group in groups}) == 1
 
 

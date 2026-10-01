@@ -368,6 +368,87 @@ def test_target_component_resolution_requires_human_single_protein_and_accession
     assert unhydrated["component_evidence"]["component"]["accession"] == "AKT1"
 
 
+def test_component_species_and_taxonomy_conflicts_stay_excluded_through_bundle_and_hydration(tmp_path):
+    fixture = _fixture()
+    source_hash = "e" * 64
+    target = json.loads(json.dumps(fixture["chembl"]["targets"][0]))
+    target["target_components"][0]["organism"] = "Mus musculus"
+    resolved = builder.resolve_target_components(
+        target, source_kind="synthetic_test",
+        source_path="raw/source_manifest.json", source_sha256=source_hash,
+    )[0]
+    assert resolved["resolution_status"] == "excluded"
+    assert resolved["reason_code"] == "component_organism_mismatch"
+
+    payload = fixture["uniprot"]["P12345"]
+    raw_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    hydrated = _plain(builder.hydrate_protein_record(
+        resolved,
+        source_kind="synthetic_test",
+        source_path="raw/uniprot/P12345.json",
+        uniprot_json=payload,
+        raw_response_bytes=raw_bytes,
+    ))
+    assert hydrated["identity_status"] != "verified"
+    assert hydrated["sequence_status"] != "verified"
+
+    forged = json.loads(json.dumps(resolved))
+    forged["resolution_status"] = "verified"
+    forged_hydrated = _plain(builder.hydrate_protein_record(
+        forged,
+        source_kind="synthetic_test",
+        source_path="raw/uniprot/P12345.json",
+        uniprot_json=payload,
+        raw_response_bytes=raw_bytes,
+    ))
+    assert forged_hydrated["identity_status"] != "verified"
+    assert forged_hydrated["sequence_status"] != "verified"
+
+    invalid_component_taxonomy = json.loads(json.dumps(fixture["chembl"]["targets"][0]))
+    invalid_component_taxonomy["target_components"][0]["component_tax_id"] = "not-a-taxonomy"
+    invalid_taxonomy = builder.resolve_target_components(
+        invalid_component_taxonomy,
+        source_kind="synthetic_test", source_path="raw/source_manifest.json",
+        source_sha256=source_hash,
+    )[0]
+    assert invalid_taxonomy["resolution_status"] == "excluded"
+    assert invalid_taxonomy["reason_code"] == "invalid_component_taxonomy"
+
+    normalized_target = json.loads(json.dumps(fixture["chembl"]["targets"][0]))
+    normalized_target["organism"] = "  HOMO   SAPIENS "
+    normalized_target["target_components"][0]["organism"] = "homo sapiens"
+    normalized = builder.resolve_target_components(
+        normalized_target,
+        source_kind="synthetic_test", source_path="raw/source_manifest.json",
+        source_sha256=source_hash,
+    )[0]
+    assert normalized["resolution_status"] == "verified"
+    assert normalized["organism"] == "  HOMO   SAPIENS "
+    assert normalized["component"]["organism"] == "homo sapiens"
+
+    conflicting_target_taxonomy = json.loads(json.dumps(fixture["chembl"]["targets"][0]))
+    conflicting_target_taxonomy["target_tax_id"] = 10116
+    target_tax_conflict = builder.resolve_target_components(
+        conflicting_target_taxonomy,
+        source_kind="synthetic_test", source_path="raw/source_manifest.json",
+        source_sha256=source_hash,
+    )[0]
+    assert target_tax_conflict["resolution_status"] == "excluded"
+    assert target_tax_conflict["reason_code"] == "conflicting_target_taxonomy"
+
+    manifest = _fixture()
+    manifest["chembl"]["molecules"] = [manifest["chembl"]["molecules"][0]]
+    manifest["chembl"]["targets"][0]["target_components"][0]["organism"] = "Mus musculus"
+    manifest_path = tmp_path / "conflicting-component-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    output_dir = tmp_path / "conflicting-component-bundle"
+    builder.ingest_local_manifest(manifest_path, output_dir)
+    bundle = builder.load_entity_bundle(output_dir / "entities.json", verify_sources=True)
+    assert bundle["proteins"] == []
+    exclusion = next(row for row in bundle["exclusions"] if row.get("target_chembl_id") == "CHEMBL900201")
+    assert exclusion["reason_code"] == "component_organism_mismatch"
+
+
 def test_uniprot_json_and_fasta_plus_taxonomy_metadata_hash_the_complete_sequence(tmp_path):
     fixture = _fixture()
     hydrate = getattr(builder, "hydrate_protein_record", None)

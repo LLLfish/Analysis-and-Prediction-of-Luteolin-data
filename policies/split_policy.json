@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "policy_version": "double-cold-neighbor-split-v1",
+  "entity_bundle_schema_version": 2,
+  "molecule": {
+    "identity_fields": ["molecule_chembl_id"],
+    "scaffold": {
+      "method": "RDKit Murcko scaffold",
+      "edge_when": "both nonempty canonical scaffold strings are equal",
+      "empty_scaffold_links": false
+    },
+    "fingerprint": {
+      "method": "Morgan",
+      "radius": 2,
+      "bits": 2048,
+      "similarity": "Tanimoto",
+      "threshold": 0.8,
+      "operator": ">=",
+      "inclusive": true
+    }
+  },
+  "protein": {
+    "identity_fields": ["taxonomy_id", "accession"],
+    "alignment": {
+      "api": "Bio.Align.PairwiseAligner",
+      "mode": "global",
+      "substitution_matrix": "BLOSUM62",
+      "open_gap_score": -10.0,
+      "extend_gap_score": -0.5,
+      "epsilon": 0.0,
+      "tie_policy": "first optimal alignment in PairwiseAligner iteration order after stable sequence identity ordering",
+      "aligned_non_gap_columns": "columns where both complete-sequence indices advance together",
+      "gap_columns_in_identity": false
+    },
+    "identity": {
+      "formula": "exact_residue_matches / aligned_non_gap_columns",
+      "threshold": 0.3,
+      "operator": ">=",
+      "inclusive": true
+    },
+    "coverage": {
+      "formula": "aligned_non_gap_columns / each full_sequence_length",
+      "threshold": 0.8,
+      "operator": ">=",
+      "inclusive": true
+    }
+  },
+  "connected_components": "undirected transitive connected components",
+  "split": {
+    "names": ["train", "val", "test"],
+    "ratios": {"train": 0.8, "val": 0.1, "test": 0.1},
+    "seed": 42,
+    "cluster_order": "sort stable cluster IDs, then random.Random(seed).shuffle",
+    "allocation": "largest_remainder",
+    "rounding_tie_order": ["train", "val", "test"]
+  },
+  "budgets": {
+    "molecule_pairs": 2000000,
+    "protein_pairs": 10000,
+    "alignment_cells": 1000000,
+    "alignment_cells_measure": "sum of len(sequence_a) * len(sequence_b) for every alignment attempted in one build"
+  }
+}

@@ -22,6 +22,75 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STANDARD_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
 _POOLING_POLICY = "residue-mask-mean-v1"
 
+
+def _paths_intersect(first: str, second: str) -> bool:
+    try:
+        common = os.path.commonpath((first, second))
+    except ValueError:
+        return False
+    normalized = os.path.normcase(common)
+    return normalized in {os.path.normcase(first), os.path.normcase(second)}
+
+
+def _assert_feature_output_path_is_unprotected(requested: str, resolved: str) -> None:
+    protected_names = (
+        "data", "framework_output", "offline_data.json", ".model_cache",
+        "model_cache", "features", "history", "output_dashboard.html",
+    )
+    candidates = (os.path.abspath(requested), os.path.realpath(resolved))
+    for name in protected_names:
+        protected_path = os.path.join(_BASE_DIR, name)
+        lexical_protected = os.path.abspath(protected_path)
+        resolved_protected = os.path.realpath(lexical_protected)
+        if any(
+            _paths_intersect(candidate, protected)
+            for candidate in candidates
+            for protected in (lexical_protected, resolved_protected)
+        ):
+            raise ValueError("feature output path intersects protected historical data or model paths")
+
+
+def _prepare_safe_output_directory(
+    output_dir: Optional[str], subdirectory: Optional[str] = None,
+) -> tuple[str, str]:
+    if not output_dir:
+        raise ValueError("an explicit safe output_dir is required")
+    requested_root = os.path.abspath(os.path.expanduser(os.fspath(output_dir)))
+    resolved_root = os.path.realpath(requested_root)
+    _assert_feature_output_path_is_unprotected(requested_root, resolved_root)
+    if os.path.normcase(requested_root) != os.path.normcase(resolved_root):
+        raise ValueError("feature output root must not be a symlink or junction")
+    if os.path.lexists(requested_root) and not os.path.isdir(requested_root):
+        raise FileExistsError(f"feature output root is not a directory: {requested_root}")
+    if not os.path.lexists(requested_root):
+        os.makedirs(requested_root, exist_ok=False)
+    resolved_root = os.path.realpath(requested_root)
+    _assert_feature_output_path_is_unprotected(requested_root, resolved_root)
+    if os.path.normcase(requested_root) != os.path.normcase(resolved_root):
+        raise ValueError("feature output root changed resolution during creation")
+
+    target_directory = requested_root if subdirectory is None else os.path.join(requested_root, subdirectory)
+    resolved_target = os.path.realpath(target_directory)
+    _assert_feature_output_path_is_unprotected(target_directory, resolved_target)
+    try:
+        if os.path.normcase(os.path.commonpath((resolved_root, resolved_target))) != os.path.normcase(resolved_root):
+            raise ValueError("feature output directory resolves outside the configured root")
+    except ValueError as exc:
+        if "feature output directory resolves" in str(exc):
+            raise
+        raise ValueError("feature output directory resolves outside the configured root") from exc
+    if os.path.normcase(target_directory) != os.path.normcase(resolved_target):
+        raise ValueError("feature output directory must not be a symlink or junction")
+    if os.path.lexists(target_directory) and not os.path.isdir(target_directory):
+        raise FileExistsError(f"feature output path is not a directory: {target_directory}")
+    if not os.path.lexists(target_directory):
+        os.makedirs(target_directory, exist_ok=False)
+    resolved_target = os.path.realpath(target_directory)
+    _assert_feature_output_path_is_unprotected(target_directory, resolved_target)
+    if os.path.normcase(target_directory) != os.path.normcase(resolved_target):
+        raise ValueError("feature output directory changed resolution during creation")
+    return resolved_root, resolved_target
+
 TORCH_AVAILABLE = False
 try:
     import torch
@@ -139,7 +208,7 @@ class ProteinFeatureExtractor:
 
     def __init__(
         self,
-        output_dir: str = "",
+        output_dir: Optional[str] = None,
         esm_model_name: str = "facebook/esm2_t6_8M_UR50D",
         device: str = "auto",
         *,
@@ -150,9 +219,7 @@ class ProteinFeatureExtractor:
         cache_dir: Optional[str] = None,
         test_only: bool = False,
     ):
-        if not output_dir:
-            output_dir = os.path.join(_BASE_DIR, "features", "protein")
-        self.output_dir = os.path.abspath(output_dir)
+        self.output_dir = os.path.abspath(os.fspath(output_dir)) if output_dir else None
         self.esm_model_name = esm_model_name
         self._model_cache_dir = os.path.abspath(cache_dir or os.path.join(_BASE_DIR, ".model_cache"))
         if type(max_tokens) is not int or max_tokens < 1:
@@ -803,21 +870,16 @@ class ProteinFeatureExtractor:
             or filename.endswith((" ", "."))
         ):
             raise ValueError("filename must be a basename without path separators")
-        output_root = os.path.realpath(self.output_dir)
-        os.makedirs(output_root, exist_ok=True)
-        embeddings_dir = os.path.join(output_root, "embeddings")
-        resolved_embeddings_dir = os.path.realpath(embeddings_dir)
-        if os.path.normcase(os.path.commonpath((output_root, resolved_embeddings_dir))) != os.path.normcase(output_root):
-            raise ValueError("embeddings directory resolves outside the configured output root")
-        os.makedirs(embeddings_dir, exist_ok=True)
-        resolved_embeddings_dir = os.path.realpath(embeddings_dir)
-        if os.path.normcase(os.path.commonpath((output_root, resolved_embeddings_dir))) != os.path.normcase(output_root):
-            raise ValueError("embeddings directory resolves outside the configured output root")
-        filepath = os.path.realpath(os.path.join(resolved_embeddings_dir, filename))
-        if os.path.normcase(os.path.commonpath((resolved_embeddings_dir, filepath))) != os.path.normcase(resolved_embeddings_dir):
+        _, embeddings_dir = _prepare_safe_output_directory(self.output_dir, "embeddings")
+        filepath = os.path.join(embeddings_dir, filename)
+        resolved_filepath = os.path.realpath(filepath)
+        if os.path.normcase(os.path.commonpath((embeddings_dir, resolved_filepath))) != os.path.normcase(embeddings_dir):
             raise ValueError("feature path resolves outside the embeddings directory")
+        _assert_feature_output_path_is_unprotected(filepath, resolved_filepath)
+        if os.path.lexists(filepath):
+            raise FileExistsError(f"feature snapshot already exists: {filepath}")
         data = {'protein': self.protein_name, 'features': self.features}
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with open(filepath, 'x', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)
         logger.info("Saved protein features: %s", filepath)
         return filepath

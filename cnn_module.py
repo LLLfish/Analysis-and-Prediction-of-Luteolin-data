@@ -70,16 +70,14 @@ class CNN3D(nn.Module):
 class MolecularCNN:
     def __init__(
         self,
-        output_dir: str = "",
+        output_dir: Optional[str] = None,
         grid_size: int = 32,
         voxel_size: float = 1.0,
         *,
         weights_status: str = "unverified",
         model=None,
     ):
-        if not output_dir:
-            output_dir = os.path.join(_BASE_DIR, "features", "cnn")
-        self.output_dir = os.path.abspath(output_dir)
+        self.output_dir = os.path.abspath(os.fspath(output_dir)) if output_dir else None
         self.grid_size = grid_size
         self.voxel_size = voxel_size
         self.model = model
@@ -161,10 +159,19 @@ class MolecularCNN:
             or filename.endswith((" ", "."))
         ):
             raise ValueError("filename must be a basename without path separators")
-        output_root = os.path.realpath(self.output_dir)
-        os.makedirs(output_root, exist_ok=True)
-        filepath = os.path.realpath(os.path.join(output_root, filename))
-        if os.path.normcase(os.path.commonpath((output_root, filepath))) != os.path.normcase(output_root):
+        if self.output_dir is None:
+            raise ValueError("an explicit safe output_dir is required")
+        from protein_features import _assert_feature_output_path_is_unprotected, _prepare_safe_output_directory
+
+        _, output_root = _prepare_safe_output_directory(self.output_dir)
+        output_name = filename if filename.endswith(".npy") else f"{filename}.npy"
+        filepath = os.path.join(output_root, output_name)
+        resolved_filepath = os.path.realpath(filepath)
+        if os.path.normcase(os.path.commonpath((output_root, resolved_filepath))) != os.path.normcase(output_root):
             raise ValueError("feature path resolves outside the configured output root")
-        np.save(filepath, features)
+        _assert_feature_output_path_is_unprotected(filepath, resolved_filepath)
+        if os.path.lexists(filepath):
+            raise FileExistsError(f"feature snapshot already exists: {filepath}")
+        with open(filepath, "xb") as stream:
+            np.save(stream, features, allow_pickle=False)
         logger.info("Saved CNN features: %s", filepath)

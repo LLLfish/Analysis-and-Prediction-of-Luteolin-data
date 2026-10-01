@@ -236,7 +236,7 @@ def test_feature_save_requires_explicit_unprotected_output_and_refuses_conflicts
     with pytest.raises(ValueError, match="output_dir"):
         default_extractor.save_features()
 
-    protected_root = APL_ROOT / "features" / "protein"
+    protected_root = Path(protein_features.__file__).resolve().parent / "features" / "protein"
     protected_extractor = protein_features.ProteinFeatureExtractor(output_dir=str(protected_root))
     with pytest.raises(ValueError, match="protected"):
         protected_extractor.save_features()

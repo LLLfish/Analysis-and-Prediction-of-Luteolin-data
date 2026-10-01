@@ -658,7 +658,9 @@ def independently_recompute_neighbors(
         return NeighborRecomputeResult("invalid_input", error=str(exc))
 
 
-def _component_memberships(entity_ids: Iterable[str], hits: Iterable[NeighborHit]) -> dict[str, str]:
+def _component_memberships(
+    entity_ids: Iterable[str], hits: Iterable[NeighborHit], *, prefix: str,
+) -> dict[str, str]:
     parent = {identifier: identifier for identifier in entity_ids}
 
     def find(identifier: str) -> str:
@@ -686,7 +688,7 @@ def _component_memberships(entity_ids: Iterable[str], hits: Iterable[NeighborHit
         groups[find(identifier)].append(identifier)
     result: dict[str, str] = {}
     for members in groups.values():
-        component_id = min(members)
+        component_id = f"{prefix}:{min(members)}"
         result.update({identifier: component_id for identifier in members})
     return result
 
@@ -989,6 +991,18 @@ def audit_split(
         split = manifest.get("split")
         if not isinstance(split, Mapping):
             return _manifest_failure("split manifest split object is missing")
+        audit_marker = manifest.get("audit")
+        audit_is_final = (
+            isinstance(audit_marker, Mapping)
+            and audit_marker.get("status") == "clean"
+            and audit_marker.get("exit_code") == 0
+            and audit_marker.get("finding_count") == 0
+        )
+        if "audit" in manifest and not audit_is_final:
+            findings.append(AuditFinding(
+                code="manifest_audit_marker_invalid",
+                message="a committed audit marker must record clean status, exit code 0, and zero findings",
+            ))
         activity_binding = manifest.get("activities")
         pair_binding = manifest.get("pairs")
         if not isinstance(activity_binding, Mapping) or not isinstance(pair_binding, Mapping):
@@ -1105,8 +1119,12 @@ def audit_split(
             findings=findings, evidence_by_entity=protein_evidence,
         )
 
-        molecule_components = _component_memberships(verified_molecule_ids, neighbor_result.molecule_neighbors)
-        protein_components = _component_memberships(verified_protein_ids, neighbor_result.protein_neighbors)
+        molecule_components = _component_memberships(
+            verified_molecule_ids, neighbor_result.molecule_neighbors, prefix="molecule-cluster-v1",
+        )
+        protein_components = _component_memberships(
+            verified_protein_ids, neighbor_result.protein_neighbors, prefix="protein-cluster-v1",
+        )
         for hit in neighbor_result.molecule_neighbors + neighbor_result.protein_neighbors:
             memberships = molecule_memberships if hit.kind.startswith("molecule_") else protein_memberships
             split_a = memberships.get(hit.entity_ids[0])
@@ -1355,14 +1373,21 @@ def audit_split(
                 ))
 
         support_ready = all(independently_derived_support[partition][label] > 0 for partition in _SPLITS for label in _CLASSES)
-        no_quarantine = not expected["crosspair_quarantine"] and not expected["ambiguous_label_quarantine"] and not expected["unassigned_pairs"]
-        computed_ready = support_ready and no_quarantine and not findings
+        expected_split_status = "ready" if support_ready else "insufficient"
+        if split.get("strict_split_status") != expected_split_status:
+            findings.append(AuditFinding(
+                code="strict_split_status_mismatch",
+                message="caller strict_split_status differs from independently recomputed retained class support",
+                entity_ids=(str(split.get("strict_split_status")), expected_split_status),
+            ))
+        computed_ready = support_ready and not findings
         if type(split.get("training_ready")) is not bool:
             findings.append(AuditFinding(code="training_ready_invalid", message="training_ready must be boolean"))
-        elif split.get("training_ready") != computed_ready:
+        elif ((split.get("training_ready") is True and not computed_ready)
+              or (audit_is_final and split.get("training_ready") != computed_ready)):
             findings.append(AuditFinding(
                 code="training_ready_mismatch",
-                message="caller training_ready does not match independent support and audit results",
+                message="final/affirmative training_ready claim does not match independent retained support and audit results",
                 source_evidence=tuple(_json_safe(item) for item in bundle.get("source_provenance", []) if isinstance(item, Mapping)),
             ))
         computed_ready = computed_ready and not findings

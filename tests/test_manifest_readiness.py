@@ -177,6 +177,44 @@ def _source_verified_ready_mock_bundle(tmp_path: Path) -> Path:
         )
         activity_pages[molecule_id] = {"pages": [page]}
 
+    unverified_target_id = "CHEMBL930999"
+    unverified_assay_id = "CHEMBL940999"
+    unverified_document_id = "CHEMBL950999"
+    unverified_target = deepcopy(base_target)
+    unverified_target.update(
+        target_chembl_id=unverified_target_id,
+        pref_name="tool fixture target with no sequence receipt",
+        target_components=[{
+            "component_id": 999,
+            "accession": "P99999",
+            "component_type": "PROTEIN",
+            "organism": "Homo sapiens",
+        }],
+    )
+    targets.append(unverified_target)
+    unverified_assay = deepcopy(base_assay)
+    unverified_assay.update(assay_chembl_id=unverified_assay_id, target_chembl_id=unverified_target_id, confidence_score=9)
+    assays.append(unverified_assay)
+    unverified_document = deepcopy(base_document)
+    unverified_document.update(document_chembl_id=unverified_document_id, doi="10.0000/tool-fixture.unverified")
+    documents.append(unverified_document)
+    unverified_row = deepcopy(base_activity)
+    unverified_row.update(
+        activity_id=97999999,
+        molecule_chembl_id="CHEMBL920001",
+        target_chembl_id=unverified_target_id,
+        assay_chembl_id=unverified_assay_id,
+        document_chembl_id=unverified_document_id,
+        standard_type="Ki",
+        standard_relation="=",
+        standard_value="100",
+        standard_units="nM",
+    )
+    unverified_page = activity_pages["CHEMBL920001"]["pages"][0]
+    unverified_page["activities"].append(unverified_row)
+    unverified_page["page_meta"]["limit"] += 1
+    unverified_page["page_meta"]["total_count"] += 1
+
     chembl["molecules"] = molecules
     chembl["targets"] = targets
     chembl["assays"] = assays
@@ -462,7 +500,9 @@ def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_referen
     assert by_id["offline_data"]["observed_counts"]["activity_records"] == 0
     assert by_id["offline_data"]["observed_counts"]["unverified_activity_records"] == 0
     assert by_id["offline_data"]["label_statistics_status"] == "not_evaluated_no_activity_records"
-    assert by_id["offline_data"]["observed_counts"]["confirmed_active"] is None
+    assert by_id["offline_data"]["observed_counts"]["activity_records_status"] == "no_source_activity_rows_observed"
+    assert by_id["offline_data"]["observed_counts"]["confirmed_active"] == 0
+    assert by_id["offline_data"]["observed_counts"]["confirmed_inactive"] == 0
     assert by_id["offline_data"]["observed_counts"]["compound_records"] == 1
     assert by_id["offline_data"]["observed_counts"]["protein_records"] == 1
     assert by_id["offline_data"]["observed_counts"]["ppi_edges"] == 1
@@ -470,11 +510,14 @@ def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_referen
     for source_id in ("apl_data", "framework_output_data"):
         source = by_id[source_id]
         assert source["observed_counts"]["unverified_activity_records"] == 1
+        assert source["observed_counts"]["activity_records_status"] == "unverified_legacy_source_rows"
         assert source["label_statistics_status"] == "not_evaluated"
         assert source["observed_counts"]["confirmed_active"] is None
         assert source["observed_counts"]["confirmed_inactive"] is None
         assert source["observed_counts"]["unknown"] is None
         assert source["observed_counts"]["quarantine"] is None
+        assert "source_label_statistics_not_evaluated" in source["reasons"]
+        assert "no_source_verified_confirmed_active_measurements" not in source["reasons"]
     offline_file = by_id["offline_data"]["files"][0]
     assert offline_file["embedded_static_reference"]["source_kind"] == "static_reference"
     assert offline_file["embedded_static_reference"]["collection_counts"]["$.targets"] == 2
@@ -594,6 +637,16 @@ def test_public_cli_promotes_builder_provisional_claim_only_after_independent_re
     independent = leak_audit.audit_split(manifest_path)
     assert independent.exit_code == 0
     assert independent.training_ready is True
+
+    tampered = json.loads(json.dumps(manifest))
+    tampered["training_ready"] = False
+    tampered["split"]["training_ready"] = False
+    tampered["semantic_sha256"] = _store().semantic_manifest_hash(tampered)
+    tampered_path = manifest_path.parent / "tampered-ready-state.json"
+    tampered_path.write_text(json.dumps(tampered, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    rejected = leak_audit.audit_split(tampered_path)
+    assert rejected.exit_code == 3
+    assert any(row.code == "training_ready_mismatch" for row in rejected.findings)
 
 
 def test_dataset_builder_cli_incomplete_version_argument_returns_two_without_output(tmp_path):

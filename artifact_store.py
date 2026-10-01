@@ -207,8 +207,8 @@ def _exclusive_claim(version_dir: Path) -> tuple[str, Optional[str]]:
         return "claimed", None
     except FileExistsError:
         manifest_path = version_dir / "manifest.json"
-        if manifest_path.is_file() and not manifest_path.is_symlink():
-            return "exists", str(manifest_path)
+        if manifest_path.exists() or manifest_path.is_symlink():
+            return "conflict", str(manifest_path)
         return "busy", None
     except OSError as exc:
         return "incomplete", str(exc)
@@ -320,8 +320,11 @@ class FrozenManifestWriter:
             output_root.mkdir(parents=True, exist_ok=True)
             _assert_no_reparse_components(output_root)
             claim, existing_manifest = _exclusive_claim(version_dir)
-            if claim == "exists":
-                return FrozenWriteResult("exists", 0, str(version_dir), existing_manifest)
+            if claim == "conflict":
+                return FrozenWriteResult(
+                    "conflict", 2, str(version_dir), existing_manifest,
+                    error="version identifiers are immutable and cannot be reused",
+                )
             if claim == "busy":
                 return FrozenWriteResult("busy", 2, str(version_dir), error="version directory is already claimed without a committed manifest")
             if claim != "claimed":
@@ -413,24 +416,54 @@ class FrozenManifestWriter:
                     error=audit.error or "independent audit did not return clean",
                 )
 
-            # Verify that neither the producer's inputs nor our staged copies
-            # changed while the independent audit was reading them.
-            if entity_path.read_bytes() != bundle_bytes or hashlib.sha256((version_dir / "entities.json").read_bytes()).hexdigest() != manifest["entities"]["file_sha256"]:
-                raise FrozenArtifactError("entities.json changed during frozen publication")
-            for relative, (source_path, original_bytes, expected_hash) in snapshots.items():
-                if source_path.read_bytes() != original_bytes:
-                    raise FrozenArtifactError(f"source input changed while audit ran: {relative}")
-                frozen_path = version_dir / Path(relative)
-                if hashlib.sha256(frozen_path.read_bytes()).hexdigest() != expected_hash:
-                    raise FrozenArtifactError(f"frozen raw or metadata bytes changed before manifest commit: {relative}")
+            def verify_source_snapshots() -> None:
+                # Audit may take long enough for producer inputs or staged bytes
+                # to change, so re-bind both at each manifest-commit boundary.
+                if (entity_path.read_bytes() != bundle_bytes
+                        or hashlib.sha256((version_dir / "entities.json").read_bytes()).hexdigest()
+                        != manifest["entities"]["file_sha256"]):
+                    raise FrozenArtifactError("entities.json changed during frozen publication")
+                for relative, (source_path, original_bytes, expected_hash) in snapshots.items():
+                    if source_path.read_bytes() != original_bytes:
+                        raise FrozenArtifactError(f"source input changed while audit ran: {relative}")
+                    frozen_path = version_dir / Path(relative)
+                    if hashlib.sha256(frozen_path.read_bytes()).hexdigest() != expected_hash:
+                        raise FrozenArtifactError(f"frozen raw or metadata bytes changed before manifest commit: {relative}")
+
+            verify_source_snapshots()
 
             manifest["audit"] = {"status": "clean", "exit_code": 0, "finding_count": 0}
             manifest["training_ready"] = audit.training_ready
             split_payload["training_ready"] = audit.training_ready
             manifest["semantic_sha256"] = semantic_manifest_hash(manifest)
+
+            # Re-audit the exact final claims/manifest markers before the only
+            # committed manifest is atomically published.
+            final_candidate = version_dir / f".manifest.final.audit.tmp.{token}"
+            temporary_paths.add(final_candidate)
+            with final_candidate.open("xb") as stream:
+                stream.write(_canonical_bytes(manifest))
+                stream.flush()
+                os.fsync(stream.fileno())
+            final_audit: AuditReport = audit_split(final_candidate)
+            final_candidate.unlink()
+            temporary_paths.discard(final_candidate)
+            if final_audit.exit_code != 0 or final_audit.training_ready != audit.training_ready:
+                final_exit_code = final_audit.exit_code if final_audit.exit_code != 0 else 3
+                status = "audit_violation" if final_exit_code == 3 else "not_auditable" if final_exit_code == 4 else "incomplete"
+                _cleanup_own_temps(version_dir, token, temporary_paths)
+                return FrozenWriteResult(
+                    status,
+                    final_exit_code,
+                    str(version_dir),
+                    audit_report=final_audit.to_dict(),
+                    error=final_audit.error or "final manifest failed independent re-audit",
+                )
+
+            verify_source_snapshots()
             _write_atomic(manifest_path, _canonical_bytes(manifest), token, temporary_paths)
             return FrozenWriteResult(
-                "complete", 0, str(version_dir), str(manifest_path), manifest["semantic_sha256"], audit.to_dict(),
+                "complete", 0, str(version_dir), str(manifest_path), manifest["semantic_sha256"], final_audit.to_dict(),
             )
         except (FrozenArtifactError, EvidenceInputError, OSError, TypeError, ValueError) as exc:
             _cleanup_own_temps(version_dir, token, temporary_paths)

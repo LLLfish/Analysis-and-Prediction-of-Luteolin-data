@@ -284,6 +284,8 @@ def _audit_file(source_id: str, source_root: Path, path: Path) -> dict[str, Any]
                     "declared_source": static_reference.get("source"),
                     "collection_counts": _collections(static_reference),
                     "id_values": _flatten_ids(static_reference),
+                    "label_statistics_status": "not_evaluated_static_reference",
+                    "qualified_label_counts": None,
                 }
         if isinstance(payload, Mapping) and isinstance(payload.get("source"), str):
             base["declared_source"] = payload.get("source")
@@ -352,21 +354,33 @@ def _root_metrics(source_id: str, files: Sequence[Mapping[str, Any]], source_kin
     if uniprot_files:
         present = set().union(*(set(row.get("fields_present", [])) for row in uniprot_files))
         missing_protein_fields = [field for field in _PROTEIN_REQUIRED_FIELDS if field not in present]
+    label_statistics_status = "not_evaluated" if activity_count else "not_evaluated_no_activity_records"
+    no_source_activity_rows = activity_count == 0
     return {
+        "label_statistics_status": label_statistics_status,
+        "activity_row_audit": {
+            "status": label_statistics_status,
+            "observed_source_rows": activity_count,
+            "unverified_activity_records": activity_count,
+            "qualified_label_counts": None,
+            "reason": "Source audit counts legacy source rows but does not run canonical grouping or the approved label policy.",
+        },
         "observed_counts": {
             "compound_records": molecule_count,
             "distinct_molecule_ids": len(id_values("molecule_chembl_id", "chembl_id")),
             "activity_records": activity_count,
+            "activity_records_status": "no_source_activity_rows_observed" if no_source_activity_rows else "unverified_legacy_source_rows",
+            "unverified_activity_records": activity_count,
             "distinct_target_ids": target_count,
             "protein_records": protein_count,
             "distinct_accessions": len(id_values("accession", "primaryaccession", "uniprot_id")),
             "records_with_sequence": sequence_count,
             "ppi_edges": ppi_count,
-            "confirmed_active": 0,
-            "confirmed_inactive": 0,
-            "gray": 0,
-            "unknown": 0,
-            "quarantine": 0,
+            "confirmed_active": 0 if no_source_activity_rows else None,
+            "confirmed_inactive": 0 if no_source_activity_rows else None,
+            "gray": None,
+            "unknown": None,
+            "quarantine": None,
         },
         "ids": {key: sorted(values) for key, values in sorted(ids.items())},
         "missing_activity_fields": missing_activity_fields,
@@ -387,10 +401,16 @@ def compute_readiness(source_report: Mapping[str, Any]) -> dict[str, Any]:
         reasons.append("source_is_legacy_or_static_not_verified_online_snapshot")
     if int(counts.get("compound_records") or 0) < 2:
         reasons.append("fewer_than_two_distinct_real_compounds")
-    if int(counts.get("confirmed_active") or 0) == 0:
-        reasons.append("no_source_verified_confirmed_active_measurements")
-    if int(counts.get("confirmed_inactive") or 0) == 0:
-        reasons.append("no_source_verified_confirmed_inactive_measurements")
+    label_status = source_report.get("label_statistics_status")
+    if label_status == "not_evaluated":
+        reasons.append("source_label_statistics_not_evaluated")
+    elif label_status == "not_evaluated_no_activity_records":
+        reasons.append("no_activity_records_available_for_source_label_classification")
+    elif label_status == "evaluated":
+        if type(counts.get("confirmed_active")) is not int or counts["confirmed_active"] == 0:
+            reasons.append("no_source_verified_confirmed_active_measurements")
+        if type(counts.get("confirmed_inactive")) is not int or counts["confirmed_inactive"] == 0:
+            reasons.append("no_source_verified_confirmed_inactive_measurements")
     missing_activity = source_report.get("missing_activity_fields", [])
     if missing_activity:
         reasons.append("activity_evidence_missing_fields:" + ",".join(sorted(str(item) for item in missing_activity)))
@@ -402,7 +422,7 @@ def compute_readiness(source_report: Mapping[str, Any]) -> dict[str, Any]:
     if not source_report.get("page_proof_present"):
         reasons.append("no_complete_source_page_chain_proof")
     if source_report.get("source_id") == "offline_data":
-        reasons.append("offline_reference_is_static_unknown_pair_evidence")
+        reasons.append("offline_reference_is_static_not_measurement_evidence")
     reasons.append("no_independent_double_cold_split_support_was_established_by_this_legacy_source_audit")
     return {"training_ready": False, "reasons": sorted(set(reasons))}
 

@@ -271,33 +271,29 @@ class NetworkPharmacologyFramework:
         return value
 
     def _canonicalize_dataset_ppi(self, dataset: Dict[str, Any]) -> CanonicalPpiResult:
-        trace = dataset.get("ppi_trace")
-        trace = trace if isinstance(trace, dict) else {}
-        source_kind = dataset.get("ppi_source_kind")
-        if source_kind is None:
-            source_kind = trace.get("source_kind")
-        request_status = dataset.get("ppi_request_status")
-        if request_status is None:
-            request_status = trace.get("request_status")
-        snapshot_path = dataset.get("ppi_snapshot_path")
-        snapshot_root = dataset.get("ppi_snapshot_root")
-        if snapshot_root is None:
-            snapshot_root = trace.get("snapshot_root")
-        if snapshot_path is None:
-            snapshot_path = trace.get("snapshot_path")
-        snapshot_sha256 = dataset.get("ppi_snapshot_sha256")
-        if snapshot_sha256 is None:
-            snapshot_sha256 = trace.get("snapshot_sha256")
+        metadata_names = {
+            "ppi_source_kind": "source_kind",
+            "ppi_request_status": "request_status",
+            "ppi_snapshot_path": "snapshot_path",
+            "ppi_snapshot_root": "snapshot_root",
+            "ppi_snapshot_sha256": "snapshot_sha256",
+        }
+        top_level_metadata = {
+            contract_name: dataset[dataset_name]
+            for dataset_name, contract_name in metadata_names.items()
+            if dataset_name in dataset
+        }
+        metadata_sources = []
+        if top_level_metadata:
+            metadata_sources.append(top_level_metadata)
+        if "ppi_trace" in dataset:
+            metadata_sources.append(dataset["ppi_trace"])
         result = canonicalize_ppi(
-            dataset.get('interactions', []),
-            source_kind=source_kind,
-            alias_mappings=dataset.get('ppi_alias_mappings'),
-            request_status=request_status,
-            snapshot_path=snapshot_path,
-            snapshot_root=snapshot_root,
-            snapshot_sha256=snapshot_sha256,
+            dataset.get("interactions", []),
+            alias_mappings=dataset.get("ppi_alias_mappings"),
+            ppi_trace=metadata_sources or None,
         )
-        cached = getattr(self, '_ppi_result', None)
+        cached = getattr(self, "_ppi_result", None)
         if (
             cached is not None
             and cached.input_sha256 == result.input_sha256
@@ -307,11 +303,13 @@ class NetworkPharmacologyFramework:
             and cached.snapshot_path == result.snapshot_path
             and cached.snapshot_root == result.snapshot_root
             and cached.snapshot_sha256 == result.snapshot_sha256
+            and cached.snapshot_records_sha256 == result.snapshot_records_sha256
             and cached.issues == result.issues
         ):
             return cached
         self._ppi_result = result
         return result
+
     @staticmethod
     def _feature_readiness(stage_statuses: Dict[str, StageStatus]) -> Dict[str, Any]:
         stage_data = {name: status.to_dict() for name, status in stage_statuses.items()}
@@ -850,6 +848,15 @@ class NetworkPharmacologyFramework:
                 if isinstance(report, dict) and isinstance(ppi_report, dict):
                     report["ppi_trace"] = ppi_report.get("ppi_trace")
                     report["ppi_contract"] = ppi_report
+                if isinstance(report, dict):
+                    report["pipeline_status"] = self.results.get("pipeline_status", "partial")
+                    report["pipeline_status_reason"] = self.results.get("pipeline_status_reason")
+                report_path = None
+                save_report = getattr(self.output_module, "save_report", None)
+                if callable(save_report):
+                    report_path = save_report(report, "summary.json")
+                    if not isinstance(report_path, str) or not report_path:
+                        raise RuntimeError("Summary report persistence returned no path")
                 self.output_module.generate_dashboard_html(report)
                 plot_input = {
                     'targets': target_data,
@@ -859,6 +866,9 @@ class NetworkPharmacologyFramework:
                 }
                 self.output_module.generate_plots(plot_input)
                 output_results = report
+                if report_path is not None:
+                    output_results = dict(report)
+                    output_results["summary_report_path"] = report_path
             except Exception as e:
                 logger.error("Output generation failed: %s", e)
 
@@ -975,11 +985,39 @@ class NetworkPharmacologyFramework:
             raise FileExistsError(
                 "Full pipeline requires a new output directory; existing framework outputs are read-only."
             )
-        if self.output_dir is None or not getattr(self, "allow_online", False):
+        if self.output_dir is None:
             dataset = self.run_data_collection()
             self.results["pipeline_status"] = "partial"
             self.results["pipeline_status_reason"] = dataset.get("reason", "explicit_output_and_online_opt_in_required")
             logger.info("Pipeline remains partial because collection is not configured")
+            return self.results
+
+        if not getattr(self, "allow_online", False):
+            dataset = self.run_data_collection()
+            features = self.run_feature_extraction(dataset)
+            self.run_feature_fusion(features)
+            self.results["docking"] = {
+                "status": "unavailable",
+                "reason": "explicit_online_collection_opt_in_required_for_receptor_retrieval",
+                "targets": {},
+            }
+            self.run_knowledge_graph(dataset)
+            self.results["pipeline_status"] = "partial"
+            self.results["pipeline_status_reason"] = dataset.get(
+                "reason", "explicit_online_collection_opt_in_required",
+            )
+            self.run_output_generation()
+            report_path = self.results.get("output", {}).get("summary_report_path")
+            if not report_path:
+                self.results["pipeline_status"] = "failed"
+                self.results["pipeline_status_reason"] = "summary_report_persistence_failed"
+                self.save_results()
+                raise RuntimeError("Offline partial pipeline summary report could not be persisted")
+            if not self.save_results():
+                self.results["pipeline_status"] = "failed"
+                self.results["pipeline_status_reason"] = "framework_results_persistence_failed"
+                raise RuntimeError("Framework results could not be persisted; full pipeline did not complete")
+            logger.info("Pipeline remains partial because online collection was not opted in")
             return self.results
 
         logger.info("Starting full pipeline execution...")
@@ -990,9 +1028,6 @@ class NetworkPharmacologyFramework:
         self.run_feature_fusion(features)
         self.run_docking(dataset)
         self.run_knowledge_graph(dataset)
-        self.run_output_generation()
-
-        runtime = (datetime.now() - start_time).total_seconds()
         status = self.results.get("feature_extraction", {}).get(
             "feature_readiness", {},
         ).get("overall_status", "unavailable")
@@ -1003,6 +1038,10 @@ class NetworkPharmacologyFramework:
             if collection_status == "complete" and status == "ready" and fusion_status == "ready"
             else "partial"
         )
+        self.results.pop("pipeline_status_reason", None)
+        self.run_output_generation()
+
+        runtime = (datetime.now() - start_time).total_seconds()
         saved_path = self.save_results()
         if not saved_path:
             self.results["pipeline_status"] = "failed"

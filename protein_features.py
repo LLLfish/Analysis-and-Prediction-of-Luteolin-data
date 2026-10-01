@@ -231,6 +231,7 @@ class ProteinFeatureExtractor:
         self.sequence = None
         self.protein_name = None
         self.features = {}
+        self.last_result: Optional[FeatureResult] = None
         self.model_id = esm_model_name
         self.esm_model = model if self.test_only else None
         self.esm_tokenizer = tokenizer if self.test_only else None
@@ -694,6 +695,7 @@ class ProteinFeatureExtractor:
         extractor.sequence = None
         extractor.protein_name = None
         extractor.features = {}
+        extractor.last_result = None
 
     def _result(
         self,
@@ -707,7 +709,7 @@ class ProteinFeatureExtractor:
         cache_key: Optional[str] = None,
         features: Optional[Dict[str, Any]] = None,
     ) -> FeatureResult:
-        return FeatureResult(
+        result = FeatureResult(
             status=status,
             reason=reason,
             features=features or {},
@@ -727,6 +729,8 @@ class ProteinFeatureExtractor:
             cache_key=cache_key,
             test_provenance=self._test_provenance if status == "test_only" else None,
         )
+        self.last_result = result
+        return result
 
     def _extract_validated_record(
         self,
@@ -770,7 +774,9 @@ class ProteinFeatureExtractor:
         cached = self._cache.get(cache_key)
         if cached is not None:
             self.features = deepcopy(cached.features)
-            return deepcopy(cached)
+            result = deepcopy(cached)
+            self.last_result = result
+            return result
 
         embedding, status, reason = self._extract_residue_embedding(sequence)
         if status != "ready" or embedding is None:
@@ -804,19 +810,29 @@ class ProteinFeatureExtractor:
         from evidence_builder import load_entity_bundle
 
         with self._feature_lock:
-            bundle = load_entity_bundle(bundle_path, verify_sources=True)
+            self._clear_sample_state(self)
+            try:
+                bundle = load_entity_bundle(bundle_path, verify_sources=True)
+            except Exception:
+                self.last_result = FeatureResult(
+                    status="unavailable",
+                    reason="entity_bundle_verification_failed",
+                )
+                raise
             results = []
             for protein_data in bundle.get("proteins", []):
                 try:
                     protein = ProteinRecord(**protein_data)
                 except (TypeError, ValueError) as exc:
-                    results.append(FeatureResult(
+                    result = FeatureResult(
                         status="invalid_sequence",
                         reason=f"invalid_protein_record:{exc}",
                         entity_version=bundle.get("entity_version"),
                         entity_bundle_hash=bundle.get("content_sha256"),
                         source_kind=protein_data.get("source_kind"),
-                    ))
+                    )
+                    self.last_result = result
+                    results.append(result)
                     continue
                 results.append(self._extract_validated_record(
                     protein, bundle, test_only=test_only,
@@ -834,7 +850,15 @@ class ProteinFeatureExtractor:
         from evidence_builder import load_entity_bundle
 
         with self._feature_lock:
-            bundle = load_entity_bundle(bundle_path, verify_sources=True)
+            self._clear_sample_state(self)
+            try:
+                bundle = load_entity_bundle(bundle_path, verify_sources=True)
+            except Exception:
+                self.last_result = FeatureResult(
+                    status="unavailable",
+                    reason="entity_bundle_verification_failed",
+                )
+                raise
             return self._extract_validated_record(
                 protein, bundle, test_only=test_only,
             )
@@ -855,7 +879,12 @@ class ProteinFeatureExtractor:
             "features": {},
         }
 
-    def save_features(self, filename: str = "protein_features.json") -> str:
+    def save_features(
+        self,
+        filename: str = "protein_features.json",
+        *,
+        result: Optional[FeatureResult] = None,
+    ) -> str:
         if (
             not isinstance(filename, str)
             or not filename
@@ -878,7 +907,11 @@ class ProteinFeatureExtractor:
         _assert_feature_output_path_is_unprotected(filepath, resolved_filepath)
         if os.path.lexists(filepath):
             raise FileExistsError(f"feature snapshot already exists: {filepath}")
-        data = {'protein': self.protein_name, 'features': self.features}
+        if result is None:
+            raise ValueError("save_features requires an explicit FeatureResult")
+        if not isinstance(result, FeatureResult):
+            raise TypeError("result must be a validated FeatureResult")
+        data = result.to_dict()
         with open(filepath, 'x', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)
         logger.info("Saved protein features: %s", filepath)

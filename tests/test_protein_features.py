@@ -344,6 +344,11 @@ def test_extractor_tracks_latest_result_across_extraction_cache_and_failure(tmp_
     assert failed.status == "unverified_source"
     assert extractor.last_result == failed
 
+    with pytest.raises(FileNotFoundError):
+        extractor.extract_from_bundle(str(tmp_path / "missing" / "entities.json"), test_only=True)
+    assert extractor.last_result.status == "unavailable"
+    assert extractor.last_result.reason == "entity_bundle_verification_failed"
+
 
 def test_unbound_sequence_api_cannot_emit_protein_features(tmp_path):
     extractor = _extractor(tmp_path)

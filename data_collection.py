@@ -639,6 +639,7 @@ class LuteolinDataCollector:
                 "resolution_status": "resolved" if interactions else "empty",
                 "snapshot_path": snapshot_path,
                 "snapshot_sha256": snapshot_sha256,
+                "snapshot_root": self.output_dir,
                 "raw_response_sha256": snapshot_sha256,
             }
         except Exception as exc:
@@ -660,6 +661,7 @@ class LuteolinDataCollector:
                 "request_status": "failed",
                 "snapshot_path": snapshot_path,
                 "snapshot_sha256": snapshot_sha256,
+                "snapshot_root": self.output_dir if snapshot_path is not None else None,
                 "reason": str(exc),
             }
         self.raw_data["string"] = result
@@ -684,6 +686,8 @@ class LuteolinDataCollector:
             "snapshot_path": ppi_payload.get("snapshot_path"),
             "snapshot_sha256": ppi_payload.get("snapshot_sha256"),
         }
+        if ppi_payload.get("snapshot_root") is not None:
+            ppi_trace["snapshot_root"] = ppi_payload["snapshot_root"]
         activity_rows = activity_evidence_from_collector_payload(chembl_payload)
         serialized_evidence = [asdict(row) for row in activity_rows]
         cleaned_data = {
@@ -696,6 +700,7 @@ class LuteolinDataCollector:
             "ppi_request_status": ppi_trace["request_status"],
             "ppi_snapshot_path": ppi_trace["snapshot_path"],
             "ppi_snapshot_sha256": ppi_trace["snapshot_sha256"],
+            "ppi_snapshot_root": ppi_trace.get("snapshot_root"),
             "proteins": [],
             "metadata": {
                 "processing_time": datetime.now().isoformat(),

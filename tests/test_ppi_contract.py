@@ -271,6 +271,15 @@ def test_framework_managed_collector_snapshot_root_survives_report_handoff(tmp_p
     assert kg_results["ppi_contract"]["ppi_trace"] == trace
     assert features["ppi"]["edge_count"] == kg_results["ppi_contract"]["edge_count"] == 1
 
+    snapshot.write_bytes(b"tampered persisted snapshot")
+    rejected_features = framework.run_feature_extraction(dataset)
+    rejected_kg = framework.run_knowledge_graph(dataset)
+    assert rejected_features["ppi"]["status"] == rejected_kg["ppi_contract"]["status"] == "invalid"
+    assert rejected_features["ppi"]["edge_count"] == rejected_kg["ppi_contract"]["edge_count"] == 0
+    assert "snapshot_hash_mismatch" in {issue["code"] for issue in rejected_features["ppi"]["issues"]}
+    assert rejected_features["gnn"]["num_edges"] == 0
+    assert framework.kg_module.compute_graph_statistics()["num_edges"] == 0
+
 
 def test_online_ppi_snapshot_binding_resolves_and_checks_actual_bytes(tmp_path):
     raw_bytes = json.dumps([ONLINE_EDGE], separators=(",", ":")).encode("utf-8")

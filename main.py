@@ -279,6 +279,9 @@ class NetworkPharmacologyFramework:
         if request_status is None:
             request_status = trace.get("request_status")
         snapshot_path = dataset.get("ppi_snapshot_path")
+        snapshot_root = dataset.get("ppi_snapshot_root")
+        if snapshot_root is None:
+            snapshot_root = trace.get("snapshot_root")
         if snapshot_path is None:
             snapshot_path = trace.get("snapshot_path")
         snapshot_sha256 = dataset.get("ppi_snapshot_sha256")
@@ -290,6 +293,7 @@ class NetworkPharmacologyFramework:
             alias_mappings=dataset.get('ppi_alias_mappings'),
             request_status=request_status,
             snapshot_path=snapshot_path,
+            snapshot_root=snapshot_root,
             snapshot_sha256=snapshot_sha256,
         )
         cached = getattr(self, '_ppi_result', None)
@@ -300,6 +304,7 @@ class NetworkPharmacologyFramework:
             and cached.provenance_sha256 == result.provenance_sha256
             and cached.request_status == result.request_status
             and cached.snapshot_path == result.snapshot_path
+            and cached.snapshot_root == result.snapshot_root
             and cached.snapshot_sha256 == result.snapshot_sha256
             and cached.issues == result.issues
         ):
@@ -520,6 +525,7 @@ class NetworkPharmacologyFramework:
                 "source_kind": getattr(ppi_result, "source_kind", None),
                 "request_status": getattr(ppi_result, "request_status", None),
                 "snapshot_path": getattr(ppi_result, "snapshot_path", None),
+                "snapshot_root": getattr(ppi_result, "snapshot_root", None),
                 "snapshot_sha256": getattr(ppi_result, "snapshot_sha256", None),
             }
             if isinstance(ppi_features, dict):
@@ -776,6 +782,7 @@ class NetworkPharmacologyFramework:
                 "source_kind": getattr(ppi_result, "source_kind", None),
                 "request_status": getattr(ppi_result, "request_status", None),
                 "snapshot_path": getattr(ppi_result, "snapshot_path", None),
+                "snapshot_root": getattr(ppi_result, "snapshot_root", None),
                 "snapshot_sha256": getattr(ppi_result, "snapshot_sha256", None),
             }
             if isinstance(kg_contract, dict):

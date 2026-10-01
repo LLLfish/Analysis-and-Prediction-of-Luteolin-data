@@ -148,6 +148,8 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
     claimed_split = {
         "strict_split_status": split.strict_split_status,
         "split_policy_sha256": split.policy_sha256,
+        "entity_version": bundle["entity_version"],
+        "entity_bundle_hash": bundle["content_sha256"],
         "molecule_memberships": _memberships(molecules.clusters, split.molecule_cluster_assignment),
         "protein_memberships": _memberships(proteins.clusters, split.protein_cluster_assignment),
         "pair_assignments": [asdict(row) for row in split.pair_assignments],
@@ -161,6 +163,10 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
         "training_ready": split.training_ready,
     }
     entity_bytes = bundle_path.read_bytes()
+    pair_payload = {key: claimed_split[key] for key in (
+        "pair_assignments", "crosspair_quarantine", "unassigned_pairs",
+        "test_only_pair_assignments", "ambiguous_label_quarantine",
+    )}
     manifest = {
         "schema_version": 1,
         "entities": {
@@ -171,6 +177,18 @@ def _candidate_manifest(tmp_path: Path, bundle_path: Path, bundle: dict) -> Path
             "file_sha256": hashlib.sha256(entity_bytes).hexdigest(),
         },
         "source_provenance": bundle["source_provenance"],
+        "activities": {
+            "entity_version": bundle["entity_version"],
+            "entity_bundle_hash": bundle["content_sha256"],
+            "record_count": len(bundle["activities"]),
+            "semantic_sha256": evidence_builder.canonical_json_sha256(bundle["activities"]),
+        },
+        "pairs": {
+            "entity_version": bundle["entity_version"],
+            "entity_bundle_hash": bundle["content_sha256"],
+            "semantic_sha256": evidence_builder.canonical_json_sha256(pair_payload),
+            "ledger_counts": {key: len(value) for key, value in pair_payload.items()},
+        },
         "split": claimed_split,
         "version_control": {"status": "not_initialized", "commit": None},
     }
@@ -199,6 +217,23 @@ def _rebind_entity_manifest(manifest_path: Path, bundle_path: Path, bundle: dict
         content_sha256=digest,
         file_sha256=hashlib.sha256(raw).hexdigest(),
     )
+    manifest["activities"].update(
+        entity_version=version,
+        entity_bundle_hash=digest,
+        record_count=len(bundle["activities"]),
+        semantic_sha256=evidence_builder.canonical_json_sha256(bundle["activities"]),
+    )
+    pair_payload = {key: manifest["split"][key] for key in (
+        "pair_assignments", "crosspair_quarantine", "unassigned_pairs",
+        "test_only_pair_assignments", "ambiguous_label_quarantine",
+    )}
+    manifest["pairs"].update(
+        entity_version=version,
+        entity_bundle_hash=digest,
+        semantic_sha256=evidence_builder.canonical_json_sha256(pair_payload),
+        ledger_counts={key: len(value) for key, value in pair_payload.items()},
+    )
+    manifest["split"].update(entity_version=version, entity_bundle_hash=digest)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
@@ -271,6 +306,52 @@ def test_protein_neighbor_audit_recomputes_full_sequence_identity_and_both_cover
     assert hit.details["epsilon"] == 0.0
     assert report.exit_code == 3
     assert any(row.code == "protein_neighbor_cross_split" for row in report.findings)
+
+
+@pytest.mark.parametrize(
+    ("coordinates", "expected_identity", "expected_coverage"),
+    [
+        (((0, 10), (0, 10)), 0.3, 1.0),
+        (((0, 8, 10, 10), (0, 8, 8, 10)), 0.375, 0.8),
+    ],
+)
+def test_protein_identity_and_bidirectional_coverage_thresholds_are_inclusive(
+    tmp_path, monkeypatch, coordinates, expected_identity, expected_coverage,
+):
+    import Bio.Align
+
+    fixture = _two_protein_fixture()
+    for accession, sequence in (("P12345", "AAAAAAAAAA"), ("P23456", "AAACCCCCCC")):
+        fixture["uniprot"][accession]["sequence"]["value"] = sequence
+        fixture["uniprot"][accession]["sequence"]["length"] = len(sequence)
+    bundle_path, _bundle = _write_bundle(tmp_path, fixture)
+
+    class CoordinateMatrix:
+        def __init__(self, rows):
+            self.rows = rows
+            self.shape = (2, len(rows[0]))
+
+        def __getitem__(self, index):
+            row, column = index
+            return self.rows[row][column]
+
+    class Alignment:
+        def __init__(self):
+            self.coordinates = CoordinateMatrix(coordinates)
+
+    class FakeAligner:
+        def align(self, _sequence_a, _sequence_b):
+            return [Alignment()]
+
+    aligner = FakeAligner()
+    monkeypatch.setattr(Bio.Align, "PairwiseAligner", lambda: aligner)
+    result = _auditor().independently_recompute_neighbors(bundle_path)
+
+    assert result.status == "ok"
+    hit = next(row for row in result.protein_neighbors if set(row.entity_ids) == {"9606|P12345", "9606|P23456"})
+    assert hit.metric == pytest.approx(expected_identity)
+    assert hit.details["coverage_a"] == pytest.approx(expected_coverage)
+    assert hit.details["coverage_b"] == pytest.approx(expected_coverage)
 
 
 def test_alignment_budget_exhaustion_is_not_a_clean_audit(tmp_path):
@@ -408,3 +489,51 @@ def test_cli_malicious_fixture_returns_audit_violation_exit_code(tmp_path):
 
     assert completed.returncode == 3, (completed.stdout or "") + (completed.stderr or "")
     assert "molecule_neighbor_cross_split" in completed.stdout
+
+
+def test_cli_alignment_budget_failure_returns_exit4_not_clean(tmp_path):
+    bundle_path, bundle = _write_bundle(tmp_path, _two_protein_fixture())
+    manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
+    policy = json.loads((APL_ROOT / "policies" / "split_policy.json").read_text(encoding="utf-8"))
+    policy["budgets"]["alignment_cells"] = 1
+    policy_path = tmp_path / "bounded-policy.json"
+    policy_path.write_text(json.dumps(policy, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    env = dict(os.environ)
+    env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")})
+
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "leak_audit.py"),
+         "--manifest", str(manifest_path), "--policy", str(policy_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+
+    assert completed.returncode == 4, (completed.stdout or "") + (completed.stderr or "")
+    assert '"status": "size_limit"' in completed.stdout
+
+
+def test_cli_missing_bio_dependency_returns_exit4(tmp_path):
+    bundle_path, bundle = _write_bundle(tmp_path, _two_protein_fixture())
+    manifest_path = _candidate_manifest(tmp_path, bundle_path, bundle)
+    code = (
+        "import builtins,sys;\n"
+        f"sys.path.insert(0,{str(APL_ROOT)!r});\n"
+        "original=builtins.__import__;\n"
+        "def blocked(name,*args,**kwargs):\n"
+        "    if name=='Bio' or name.startswith('Bio.'): raise ImportError('Bio.Align unavailable');\n"
+        "    return original(name,*args,**kwargs)\n"
+        "builtins.__import__=blocked;\n"
+        "import leak_audit;\n"
+        "raise SystemExit(leak_audit.main(sys.argv[1:]))\n"
+    )
+    env = dict(os.environ)
+    env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")})
+
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", "-c", code, "--manifest", str(manifest_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+
+    assert completed.returncode == 4, (completed.stdout or "") + (completed.stderr or "")
+    assert '"status": "dependency_missing"' in completed.stdout

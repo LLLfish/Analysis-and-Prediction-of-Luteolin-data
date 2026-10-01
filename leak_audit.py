@@ -989,8 +989,12 @@ def audit_split(
         split = manifest.get("split")
         if not isinstance(split, Mapping):
             return _manifest_failure("split manifest split object is missing")
+        activity_binding = manifest.get("activities")
+        pair_binding = manifest.get("pairs")
+        if not isinstance(activity_binding, Mapping) or not isinstance(pair_binding, Mapping):
+            return _manifest_failure("manifest must bind activity and pair ledgers to the frozen entity version")
         required_split_fields = (
-            "molecule_memberships", "protein_memberships", "pair_assignments",
+            "entity_version", "entity_bundle_hash", "molecule_memberships", "protein_memberships", "pair_assignments",
             "crosspair_quarantine", "unassigned_pairs", "test_only_pair_assignments",
             "ambiguous_label_quarantine", "class_support", "training_ready",
         )
@@ -1003,6 +1007,42 @@ def audit_split(
             findings.append(AuditFinding(
                 code="split_policy_hash_mismatch", message="split policy hash does not identify the policy used by this independent audit",
                 entity_ids=(str(claimed_policy_hash), policy_sha256),
+            ))
+        expected_entity_version = bundle.get("entity_version")
+        expected_entity_hash = bundle.get("content_sha256")
+        if split.get("entity_version") != expected_entity_version or split.get("entity_bundle_hash") != expected_entity_hash:
+            findings.append(AuditFinding(
+                code="split_entity_binding_mismatch",
+                message="split ledger is not bound to the same frozen entity version/content hash",
+                entity_ids=(str(split.get("entity_version")), str(split.get("entity_bundle_hash"))),
+            ))
+        expected_activity_hash = _canonical_hash(bundle.get("activities", []))
+        if (activity_binding.get("entity_version") != expected_entity_version
+                or activity_binding.get("entity_bundle_hash") != expected_entity_hash
+                or activity_binding.get("record_count") != len(bundle.get("activities", []))
+                or activity_binding.get("semantic_sha256") != expected_activity_hash):
+            findings.append(AuditFinding(
+                code="activity_entity_binding_mismatch",
+                message="activity record count/hash/version does not bind to the frozen entities.json bytes",
+                entity_ids=(str(activity_binding.get("entity_version")), str(activity_binding.get("entity_bundle_hash"))),
+            ))
+        pair_fields = (
+            "pair_assignments", "crosspair_quarantine", "unassigned_pairs",
+            "test_only_pair_assignments", "ambiguous_label_quarantine",
+        )
+        claimed_pair_payload = {field_name: split.get(field_name) for field_name in pair_fields}
+        claimed_ledger_counts = {
+            field_name: len(split[field_name]) if isinstance(split.get(field_name), list) else -1
+            for field_name in pair_fields
+        }
+        if (pair_binding.get("entity_version") != expected_entity_version
+                or pair_binding.get("entity_bundle_hash") != expected_entity_hash
+                or pair_binding.get("semantic_sha256") != _canonical_hash(claimed_pair_payload)
+                or pair_binding.get("ledger_counts") != claimed_ledger_counts):
+            findings.append(AuditFinding(
+                code="pair_entity_binding_mismatch",
+                message="pair/quarantine ledger counts or hash are not bound to the same frozen entity version",
+                entity_ids=(str(pair_binding.get("entity_version")), str(pair_binding.get("entity_bundle_hash"))),
             ))
 
         neighbor_result = _recompute_neighbors(bundle, policy, limits)

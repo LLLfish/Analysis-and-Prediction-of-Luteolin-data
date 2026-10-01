@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import hashlib
@@ -1299,3 +1300,105 @@ def strict_double_cold_split(
         test_only=(molecule_result.test_only or protein_result.test_only
                    or bool(test_only_tuple)),
     )
+
+
+def _entity_memberships(clusters: Iterable[Cluster], assignments: Mapping[str, str]) -> dict[str, str]:
+    memberships: dict[str, str] = {}
+    for cluster in clusters:
+        partition = assignments.get(cluster.cluster_id)
+        if partition not in {"train", "val", "test"}:
+            continue
+        for entity_id in cluster.member_ids:
+            if entity_id in memberships:
+                raise DatasetBuildError(f"entity appears in multiple split clusters: {entity_id}", code="invalid_clusters")
+            memberships[entity_id] = partition
+    return dict(sorted(memberships.items()))
+
+
+def frozen_split_claim(result: SplitResult) -> dict[str, Any]:
+    """Serialize builder claims for the independent auditor; these are not audit facts."""
+    if not isinstance(result, SplitResult):
+        raise DatasetBuildError("result must be a SplitResult", code="invalid_input")
+    return {
+        "strict_split_status": result.strict_split_status,
+        "split_policy_sha256": result.policy_sha256,
+        "label_policy_sha256": result.label_policy_sha256,
+        "split_sha256": result.split_sha256,
+        "entity_version": result.entity_version,
+        "entity_bundle_hash": result.entity_bundle_hash,
+        "molecule_memberships": _entity_memberships(result.molecule_clusters, result.molecule_cluster_assignment),
+        "protein_memberships": _entity_memberships(result.protein_clusters, result.protein_cluster_assignment),
+        "pair_assignments": [asdict(row) for row in result.pair_assignments],
+        "crosspair_quarantine": [asdict(row) for row in result.crosspair_quarantine],
+        "unassigned_pairs": [asdict(row) for row in result.unassigned_pairs],
+        "test_only_pair_assignments": [asdict(row) for row in result.test_only_pair_assignments],
+        "ambiguous_label_quarantine": [asdict(row) for row in result.ambiguous_label_quarantine],
+        "class_support": {key: dict(value) for key, value in result.class_support.items()},
+        "training_ready": result.training_ready,
+        "error": result.error,
+    }
+
+
+def publish_frozen_dataset(
+    entity_bundle_path: Any,
+    output_root: Any,
+    *,
+    version_id: str,
+    policy_path: Any = None,
+    label_policy_path: Any = None,
+    allow_test_only: bool = False,
+) -> Any:
+    """Build a candidate split and publish only through FrozenManifestWriter."""
+    from artifact_store import FrozenManifestWriter, FrozenWriteResult
+
+    try:
+        result = strict_double_cold_split(
+            entity_bundle_path,
+            policy_path=policy_path,
+            label_policy_path=label_policy_path,
+            allow_test_only=allow_test_only,
+        )
+    except (DatasetBuildError, OSError, TypeError, ValueError) as exc:
+        return FrozenWriteResult("incomplete", 2, error=str(exc))
+    if result.strict_split_status in {"size_limit", "dependency_missing"}:
+        return FrozenWriteResult(result.strict_split_status, 4, error=result.error or result.strict_split_status)
+    if result.strict_split_status not in {"ready", "insufficient"}:
+        return FrozenWriteResult("incomplete", 2, error=result.error or f"unsupported split status: {result.strict_split_status}")
+    try:
+        claim = frozen_split_claim(result)
+        writer = FrozenManifestWriter(output_root, version_id=version_id, code_root=Path(__file__).resolve().parent)
+        return writer.publish(entity_bundle_path, split=claim)
+    except (DatasetBuildError, TypeError, ValueError, OSError) as exc:
+        return FrozenWriteResult("incomplete", 2, error=str(exc))
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Build, independently audit, and freeze a source-bound double-cold dataset")
+    parser.add_argument("--entities", required=True, help="source-verified schema-v2 entities.json")
+    parser.add_argument("--out", required=True, help="new independent output root")
+    parser.add_argument("--version", required=True, help="filesystem-safe immutable version identifier")
+    parser.add_argument("--policy", help="optional split policy JSON")
+    parser.add_argument("--label-policy", help="optional source-verified label policy JSON")
+    parser.add_argument("--allow-test-only", action="store_true", help="keep synthetic labels isolated in the test-only ledger")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    try:
+        args = build_argument_parser().parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code)
+    result = publish_frozen_dataset(
+        args.entities,
+        args.out,
+        version_id=args.version,
+        policy_path=args.policy,
+        label_policy_path=args.label_policy,
+        allow_test_only=args.allow_test_only,
+    )
+    print(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True, allow_nan=False))
+    return result.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

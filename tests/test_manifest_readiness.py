@@ -99,9 +99,10 @@ def _fake_legacy_sources(root: Path) -> None:
         "targets": [{"target_chembl_id": "CHEMBL900201", "pchembl_value": "7.0"}],
     }), encoding="utf-8")
     (root / "offline_data.json").write_text(json.dumps({
+        "compound": {"name": "Luteolin"},
         "targets": [{"gene_symbol": "EGFR"}],
-        "proteins": [{"accession": "P00533", "length": 1210}],
-        "ppi": [{"protein_a": "EGFR", "protein_b": "GRB2"}],
+        "proteins": {"EGFR": {"uniprot_id": "P00533", "length": 1210}},
+        "interactions": [{"protein_a": "EGFR", "protein_b": "GRB2"}],
     }), encoding="utf-8")
 
 
@@ -138,6 +139,12 @@ def test_frozen_writer_copies_exact_entities_and_all_raw_bytes_and_audits_the_pu
     frozen_root = manifest_path.parent
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert (frozen_root / manifest["entities"]["path"]).read_bytes() == bundle_path.read_bytes()
+    code_state = manifest["code_version_control"]
+    head = subprocess.run(["git", "-C", str(APL_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    assert code_state["status"] == "git"
+    assert code_state["branch"] == "codex/p0-data-foundation"
+    assert code_state["commit"] == head
+    assert code_state["dirty"] is True
     for source in bundle["source_provenance"]:
         relative = Path(source["source_path"])
         assert (frozen_root / relative).read_bytes() == (bundle_path.parent / relative).read_bytes()
@@ -195,6 +202,39 @@ def test_interruption_before_manifest_commit_leaves_no_completed_version_and_cle
     assert not list(version_dir.glob("*.tmp.*"))
 
 
+def test_input_change_after_independent_audit_blocks_manifest_commit(tmp_path, monkeypatch):
+    bundle_path, bundle = _empty_verified_bundle(tmp_path)
+    split = _split_payload(bundle_path, bundle)
+    output_root = tmp_path / "source-change"
+    output_root.mkdir()
+    store = _store()
+    writer = store.FrozenManifestWriter(output_root, version_id="changed-input-v1")
+    original_audit = store.audit_split
+    source_path = bundle_path.parent / "raw" / "metadata.json"
+
+    def change_source_after_audit(manifest_path):
+        report = original_audit(manifest_path)
+        source_path.write_bytes(source_path.read_bytes() + b"changed-during-publication")
+        return report
+
+    monkeypatch.setattr(store, "audit_split", change_source_after_audit)
+    result = writer.publish(bundle_path, split=split)
+
+    assert result.status == "incomplete"
+    assert not (output_root / "changed-input-v1" / "manifest.json").exists()
+
+
+def test_writer_rejects_output_root_inside_protected_history_without_creating_it(tmp_path):
+    bundle_path, bundle = _empty_verified_bundle(tmp_path)
+    split = _split_payload(bundle_path, bundle)
+    protected_target = APL_ROOT / "data" / f"p0_01_06_forbidden_{tmp_path.name}"
+    result = _store().FrozenManifestWriter(protected_target, version_id="v1").publish(bundle_path, split=split)
+
+    assert result.exit_code == 2
+    assert result.status == "incomplete"
+    assert not protected_target.exists()
+
+
 def test_existing_version_is_immutable_when_input_claim_changes(tmp_path):
     bundle_path, bundle = _empty_verified_bundle(tmp_path)
     split = _split_payload(bundle_path, bundle)
@@ -214,6 +254,20 @@ def test_existing_version_is_immutable_when_input_claim_changes(tmp_path):
     assert manifest_path.read_bytes() == before
 
 
+def test_no_git_input_records_not_initialized_and_null_commit(tmp_path):
+    bundle_path, bundle = _empty_verified_bundle(tmp_path)
+    split = _split_payload(bundle_path, bundle)
+    output_root = tmp_path / "no-git-output"
+    writer = _store().FrozenManifestWriter(output_root, version_id="no-git-v1", code_root=tmp_path / "not-a-repository")
+
+    result = writer.publish(bundle_path, split=split)
+    manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+
+    assert result.status == "complete"
+    assert manifest["code_version_control"]["status"] == "not_initialized"
+    assert manifest["code_version_control"]["commit"] is None
+
+
 def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_reference(tmp_path):
     apl_root = tmp_path / "fake-apl"
     _fake_legacy_sources(apl_root)
@@ -224,6 +278,10 @@ def test_three_legacy_sources_are_reported_separately_and_tcms_is_static_referen
     by_id = {row["source_id"]: row for row in collection["sources"]}
     assert set(by_id) == {"apl_data", "framework_output_data", "offline_data"}
     assert all(row["training_ready"] is False for row in by_id.values())
+    assert by_id["offline_data"]["observed_counts"]["activity_records"] == 0
+    assert by_id["offline_data"]["observed_counts"]["compound_records"] == 1
+    assert by_id["offline_data"]["observed_counts"]["protein_records"] == 1
+    assert by_id["offline_data"]["observed_counts"]["ppi_edges"] == 1
     tcmsp = next(file for file in by_id["apl_data"]["files"] if file["relative_path"].endswith("tcmsp_luteolin.json"))
     assert tcmsp["source_kind"] == "static_reference"
     assert by_id["apl_data"]["source_sha256"] != by_id["framework_output_data"]["source_sha256"]
@@ -278,3 +336,39 @@ def test_dataset_builder_publishes_only_through_the_frozen_writer(tmp_path, monk
     assert result.status == "complete"
     assert called[0] == (output_root, "builder-v1")
     assert called[1][0] == bundle_path
+
+
+def test_dataset_builder_cli_returns_zero_for_tool_success_with_training_not_ready(tmp_path):
+    bundle_path, _bundle = _empty_verified_bundle(tmp_path)
+    output_root = tmp_path / "cli-frozen"
+    env = dict(os.environ)
+    env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")})
+
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "dataset_builder.py"),
+         "--entities", str(bundle_path), "--out", str(output_root), "--version", "cli-v1"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=45, check=False,
+    )
+
+    assert completed.returncode == 0, (completed.stdout or "") + (completed.stderr or "")
+    result = json.loads(completed.stdout)
+    assert result["status"] == "complete"
+    assert result["audit_report"]["training_ready"] is False
+
+
+def test_dataset_builder_cli_incomplete_version_argument_returns_two_without_output(tmp_path):
+    bundle_path, _bundle = _empty_verified_bundle(tmp_path)
+    output_root = tmp_path / "invalid-version-output"
+    env = dict(os.environ)
+    env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")})
+
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "dataset_builder.py"),
+         "--entities", str(bundle_path), "--out", str(output_root), "--version", "../escape"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=45, check=False,
+    )
+
+    assert completed.returncode == 2
+    assert not output_root.exists()

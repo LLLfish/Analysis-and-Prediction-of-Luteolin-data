@@ -313,7 +313,7 @@ def test_semantic_manifest_hash_ignores_timestamps_but_keeps_source_bytes_and_po
     assert digest(first) != digest(second)
 
 
-def test_frozen_writer_copies_exact_entities_and_all_raw_bytes_and_audits_the_published_directory(tmp_path):
+def test_source_readiness_receipt_frozen_writer_copies_exact_entities_and_all_raw_bytes(tmp_path):
     bundle_path, bundle = _empty_verified_bundle(tmp_path)
     split = _split_payload(bundle_path, bundle)
     output_root = tmp_path / "frozen"
@@ -344,6 +344,155 @@ def test_frozen_writer_copies_exact_entities_and_all_raw_bytes_and_audits_the_pu
     report = leak_audit.audit_split(manifest_path)
     assert report.exit_code == 0
     assert report.training_ready is False
+
+
+def _write_rehashed_manifest(manifest_path: Path, manifest: dict) -> None:
+    manifest["semantic_sha256"] = _store().semantic_manifest_hash(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _published_empty_manifest(tmp_path: Path, name: str):
+    bundle_path, bundle = _empty_verified_bundle(tmp_path / name)
+    output_root = tmp_path / name / "frozen"
+    writer = _store().FrozenManifestWriter(output_root, version_id="v1", code_root=APL_ROOT)
+    result = writer.publish(bundle_path, split=_split_payload(bundle_path, bundle))
+    assert result.status == "complete", result.to_dict()
+    return bundle_path, writer, Path(result.manifest_path)
+
+
+def test_source_readiness_receipt_is_bound_to_canonical_frozen_corpus(tmp_path):
+    _bundle_path, _writer_instance, manifest_path = _published_empty_manifest(tmp_path, "receipt-valid")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "source_readiness_contract_version" in manifest
+    assert "source_readiness_receipt_ref" in manifest
+    receipt_ref = manifest["source_readiness_receipt_ref"]
+    receipt_path = manifest_path.parent / receipt_ref["path"]
+    receipt_bytes = receipt_path.read_bytes()
+    receipt = json.loads(receipt_bytes.decode("utf-8"))
+
+    assert manifest["source_readiness_contract_version"] == 1
+    assert receipt_ref["path"] == "source_readiness_receipt.json"
+    assert hashlib.sha256(receipt_bytes).hexdigest() == receipt_ref["file_sha256"]
+    assert data_contracts.canonical_json_sha256(receipt) == receipt_ref["semantic_sha256"]
+    assert receipt["receipt_schema_version"] == 1
+    assert receipt["scope_kind"] == "canonical_frozen_corpus"
+    receipt_body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    assert receipt["receipt_sha256"] == data_contracts.canonical_json_sha256(receipt_body)
+    assert receipt["scope_sha256"] == data_contracts.canonical_json_sha256(receipt["bindings"])
+    assert receipt["bindings"]["entities"] == manifest["entities"]
+    assert receipt["bindings"]["raw_provenance_sha256"] == data_contracts.canonical_json_sha256(manifest["source_provenance"])
+    assert receipt["bindings"]["policies"] == manifest["policies"]
+    assert receipt["bindings"]["activity_evidence_semantic_sha256"] == manifest["activities"]["semantic_sha256"]
+    assert receipt["bindings"]["split_claim_sha256"] == data_contracts.canonical_json_sha256({
+        "split": manifest["split"], "pairs": manifest["pairs"],
+    })
+    assert receipt["metrics"]["verified_entity_counts"] == {"molecules": 0, "proteins": 0}
+    assert receipt["metrics"]["component_counts"] == {"molecule_clusters": 0, "protein_clusters": 0}
+    assert receipt["metrics"]["double_cold_split_support"] == {
+        name: {"active": 0, "inactive": 0} for name in ("train", "val", "test")
+    }
+    assert receipt["metrics"]["audit_status"] == "clean"
+    assert receipt["metrics"]["training_ready"] is False
+
+    report = leak_audit.audit_split(manifest_path)
+    assert report.exit_code == 0
+    assert report.training_ready is False
+    assert report.verified_entity_counts == {"molecules": 0, "proteins": 0}
+    assert report.component_counts == {"molecule_clusters": 0, "protein_clusters": 0}
+
+
+def test_source_readiness_receipt_missing_and_unsupported_contracts_are_violations(tmp_path):
+    _bundle_path, _writer_instance, missing_sidecar_manifest = _published_empty_manifest(tmp_path, "receipt-missing")
+    missing_sidecar = missing_sidecar_manifest.parent / "source_readiness_receipt.json"
+    missing_sidecar.unlink()
+    missing_report = leak_audit.audit_split(missing_sidecar_manifest)
+    assert missing_report.exit_code == 3
+    assert "source_readiness_receipt_missing" in {row.code for row in missing_report.findings}
+
+    _bundle_path, _writer_instance, unsupported_contract_manifest = _published_empty_manifest(tmp_path, "receipt-contract-version")
+    unsupported_contract = json.loads(unsupported_contract_manifest.read_text(encoding="utf-8"))
+    unsupported_contract["source_readiness_contract_version"] = 2
+    _write_rehashed_manifest(unsupported_contract_manifest, unsupported_contract)
+    unsupported_contract_report = leak_audit.audit_split(unsupported_contract_manifest)
+    assert unsupported_contract_report.exit_code == 3
+    assert "source_readiness_contract_unsupported" in {row.code for row in unsupported_contract_report.findings}
+
+    _bundle_path, _writer_instance, unsupported_receipt_manifest = _published_empty_manifest(tmp_path, "receipt-payload-version")
+    unsupported_receipt_path = unsupported_receipt_manifest.parent / "source_readiness_receipt.json"
+    unsupported_receipt = json.loads(unsupported_receipt_path.read_text(encoding="utf-8"))
+    unsupported_receipt["receipt_schema_version"] = 2
+    receipt_body = {key: value for key, value in unsupported_receipt.items() if key != "receipt_sha256"}
+    unsupported_receipt["receipt_sha256"] = data_contracts.canonical_json_sha256(receipt_body)
+    receipt_bytes = json.dumps(unsupported_receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    unsupported_receipt_path.write_bytes(receipt_bytes)
+    unsupported_receipt_manifest_value = json.loads(unsupported_receipt_manifest.read_text(encoding="utf-8"))
+    unsupported_receipt_manifest_value["source_readiness_receipt_ref"]["file_sha256"] = hashlib.sha256(receipt_bytes).hexdigest()
+    unsupported_receipt_manifest_value["source_readiness_receipt_ref"]["semantic_sha256"] = data_contracts.canonical_json_sha256(unsupported_receipt)
+    _write_rehashed_manifest(unsupported_receipt_manifest, unsupported_receipt_manifest_value)
+    unsupported_receipt_report = leak_audit.audit_split(unsupported_receipt_manifest)
+    assert unsupported_receipt_report.exit_code == 3
+    assert "source_readiness_receipt_unsupported" in {row.code for row in unsupported_receipt_report.findings}
+
+
+def test_source_readiness_receipt_rejects_rehashed_cross_corpus_metrics(tmp_path):
+    _bundle_path, _writer_instance, manifest_path = _published_empty_manifest(tmp_path, "receipt-cross-corpus")
+    receipt_path = manifest_path.parent / "source_readiness_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["bindings"]["entities"]["content_sha256"] = "0" * 64
+    receipt["metrics"]["verified_entity_counts"]["molecules"] = 1
+    receipt_body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    receipt["receipt_sha256"] = data_contracts.canonical_json_sha256(receipt_body)
+    receipt_bytes = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    receipt_path.write_bytes(receipt_bytes)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_readiness_receipt_ref"]["file_sha256"] = hashlib.sha256(receipt_bytes).hexdigest()
+    manifest["source_readiness_receipt_ref"]["semantic_sha256"] = data_contracts.canonical_json_sha256(receipt)
+    _write_rehashed_manifest(manifest_path, manifest)
+
+    report = leak_audit.audit_split(manifest_path)
+
+    assert report.exit_code == 3
+    codes = {row.code for row in report.findings}
+    assert "source_readiness_receipt_binding_mismatch" in codes
+    assert "source_readiness_receipt_metrics_mismatch" in codes
+
+
+def test_source_readiness_receipt_sidecar_detects_rehashed_signal_removal(tmp_path):
+    _bundle_path, _writer_instance, manifest_path = _published_empty_manifest(tmp_path, "receipt-sidecar-signal")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("source_readiness_contract_version")
+    manifest.pop("source_readiness_receipt_ref")
+    _write_rehashed_manifest(manifest_path, manifest)
+
+    report = leak_audit.audit_split(manifest_path)
+
+    assert report.exit_code == 3
+    assert "source_readiness_receipt_reference_missing" in {row.code for row in report.findings}
+
+
+def test_legacy_unreceipted_manifest_is_read_only_exit4_and_cannot_promote_readiness(tmp_path):
+    bundle_path, writer_instance, manifest_path = _published_empty_manifest(tmp_path, "legacy-unreceipted")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("source_readiness_contract_version")
+    manifest.pop("source_readiness_receipt_ref")
+    manifest["training_ready"] = True
+    manifest["split"]["training_ready"] = True
+    (manifest_path.parent / "source_readiness_receipt.json").unlink()
+    _write_rehashed_manifest(manifest_path, manifest)
+    original_bytes = manifest_path.read_bytes()
+
+    report = leak_audit.audit_split(manifest_path)
+    republish = writer_instance.publish(bundle_path, split=_split_payload(bundle_path, evidence_builder.load_entity_bundle(bundle_path, verify_sources=True)))
+
+    assert report.status == "legacy_unreceipted"
+    assert report.exit_code == 4
+    assert report.training_ready is False
+    assert manifest_path.read_bytes() == original_bytes
+    assert republish.status == "conflict"
+    assert republish.exit_code == 2
 
 
 def test_competing_writers_have_one_success_and_never_publish_a_partial_manifest(tmp_path, monkeypatch):
@@ -807,7 +956,7 @@ def test_custom_policy_input_change_during_publication_leaves_no_manifest(tmp_pa
     assert not (output_root / "policy-change-v1" / "manifest.json").exists()
 
 
-def test_public_cli_promotes_builder_provisional_claim_only_after_independent_ready_audit(tmp_path):
+def test_source_readiness_receipt_public_cli_promotes_ready_fixture_only_after_independent_audit(tmp_path):
     bundle_path = _source_verified_ready_mock_bundle(tmp_path)
     output_root = tmp_path / "ready-frozen"
     env = dict(os.environ)
@@ -828,6 +977,10 @@ def test_public_cli_promotes_builder_provisional_claim_only_after_independent_re
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["split"]["training_ready"] is True
     assert manifest["audit"]["status"] == "clean"
+    assert manifest["source_readiness_contract_version"] == 1
+    assert manifest["source_readiness_receipt_ref"]["path"] == "source_readiness_receipt.json"
+    receipt = json.loads((manifest_path.parent / manifest["source_readiness_receipt_ref"]["path"]).read_text(encoding="utf-8"))
+    assert receipt["metrics"]["training_ready"] is True
     assert manifest["split"]["crosspair_quarantine"]
     assert manifest["split"]["unassigned_pairs"]
     independent = leak_audit.audit_split(manifest_path)

@@ -231,6 +231,27 @@ def _with_measurement(record, activity_id, endpoint, value, unit, *, relation="=
     return replace(record, **changes)
 
 
+def _with_assay_variant(record, activity_id, endpoint, value, unit, assay_id, assay_category):
+    result = _with_measurement(record, activity_id, endpoint, value, unit)
+    raw = copy.deepcopy(result.raw_activity_record)
+    raw["assay_chembl_id"] = assay_id
+    assay = copy.deepcopy(result.assay_record)
+    assay["assay_chembl_id"] = assay_id
+    assay["assay_category"] = assay_category
+    return replace(
+        result,
+        assay_chembl_id=assay_id,
+        raw_activity_record=raw,
+        assay_record=assay,
+    )
+
+
+def _with_molecule(record, molecule_id):
+    raw = copy.deepcopy(record.raw_activity_record)
+    raw["molecule_chembl_id"] = molecule_id
+    return replace(record, molecule_chembl_id=molecule_id, raw_activity_record=raw)
+
+
 def _apply_test_records(records, tmp_path, *, allow_test_only=True, entity_bundle_path=None, policy_path=None):
     groups, ledger = group_evidence(records)
     return apply_label_policy(
@@ -289,21 +310,120 @@ def test_compatible_assay_conflict_is_quarantined_and_ki_kd_remain_separate(tmp_
         _with_measurement(base, 720001, "Ki", "100", "nM"),
         _with_measurement(base, 720002, "Ki", "20", "uM"),
         _with_measurement(base, 720003, "Kd", "200", "nM"),
+        _with_assay_variant(base, 720004, "Ki", "100", "nM", "CHEMBL900004", "functional"),
+        _with_molecule(_with_measurement(base, 720005, "Ki", "100", "nM"), "CHEMBL123456"),
     ]
 
     result = _apply_test_records(records, tmp_path)
 
-    assert len(result.conflicts) == 1
-    assert result.conflicts[0].endpoint == "Ki"
     groups, _ = group_evidence(records)
-    grouped_ids = {
-        evidence_id
-        for evidence_id, record_json in zip(groups[0].evidence_ids, groups[0].records_json)
-        if json.loads(record_json)["activity_id"] in {720001, 720002}
+    activity_by_evidence = {
+        evidence_id: json.loads(record_json)["activity_id"]
+        for group in groups
+        for evidence_id, record_json in zip(group.evidence_ids, group.records_json)
     }
-    assert set(result.conflicts[0].evidence_ids) == grouped_ids
-    assert [(row.endpoint, row.label) for row in result.test_only_labeled_pairs] == [("Kd", "active")]
-    assert len({group.split_group_id for group in groups}) == 1
+    pair_conflicts = [row for row in result.conflicts if row.pair_key == "CHEMBL151|9606|P12345"]
+    assert len(pair_conflicts) == 3
+    assert all(row.label == "conflict" for row in pair_conflicts)
+    ki_conflict = next(
+        row for row in pair_conflicts
+        if row.endpoint == "Ki" and "active_inactive_same_endpoint_assay_condition" in row.reasons
+    )
+    assert {activity_by_evidence[evidence_id] for evidence_id in ki_conflict.evidence_ids} == {720001, 720002}
+    assert sum("pair_quarantined_by_conflicting_endpoint" in row.reasons for row in pair_conflicts) == 2
+    assert [row.pair_key for row in result.test_only_labeled_pairs] == ["CHEMBL123456|9606|P12345"]
+    assert {group.pair_key for group in groups} == {"CHEMBL151|9606|P12345", "CHEMBL123456|9606|P12345"}
+
+
+def test_apply_rejects_caller_pair_key_tampering(tmp_path):
+    record = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    groups, ledger = group_evidence([record])
+    tampered = replace(groups[0], pair_key="WRONG_PAIR")
+
+    with pytest.raises(label_policy.LabelPolicyInputError, match="pair_key"):
+        apply_label_policy(
+            [tampered], ledger=ledger, policy_path=_test_policy(tmp_path), allow_test_only=True,
+        )
+
+
+def test_apply_rejects_forked_groups_for_one_canonical_pair(tmp_path):
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    records = [
+        _with_measurement(base, 725001, "Ki", "100", "nM"),
+        _with_measurement(base, 725002, "Kd", "200", "nM"),
+    ]
+    combined_groups, ledger = group_evidence(records)
+    left_groups, _ = group_evidence([records[0]])
+    right_groups, _ = group_evidence([records[1]])
+
+    assert len(combined_groups) == len(left_groups) == len(right_groups) == 1
+    assert left_groups[0].pair_key == right_groups[0].pair_key
+    with pytest.raises(label_policy.LabelPolicyInputError, match="duplicate or forked"):
+        apply_label_policy(
+            [left_groups[0], right_groups[0]], ledger=ledger,
+            policy_path=_test_policy(tmp_path), allow_test_only=True,
+        )
+
+
+def test_source_verified_official_shape_mock_admits_confirmed_labels_without_readiness(tmp_path):
+    # A local, official-shape mock exercises the real producer and bundle verifier only.
+    fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    fixture["source_kind"] = "online_snapshot"
+    fixture["purpose"] = "synthetic_test_only_official_shape_mock"
+    chembl = fixture["chembl"]
+
+    luteolin_pages = chembl["activities_by_molecule"]["CHEMBL151"]["pages"]
+    luteolin_rows = [copy.deepcopy(row) for page in luteolin_pages for row in page["activities"]]
+    luteolin_active = next(row for row in luteolin_rows if row["activity_id"] == 700001)
+    luteolin_inactive = copy.deepcopy(luteolin_active)
+    luteolin_inactive.update(activity_id=740001, standard_value="20000", standard_units="nM")
+    luteolin_kd = copy.deepcopy(luteolin_active)
+    luteolin_kd.update(activity_id=740002, standard_type="Kd", standard_value="200", standard_units="nM")
+    luteolin_rows.extend((luteolin_inactive, luteolin_kd))
+    luteolin_pages[:] = [{
+        "page_meta": {"limit": len(luteolin_rows), "next": None, "offset": 0,
+                       "previous": None, "total_count": len(luteolin_rows)},
+        "activities": luteolin_rows,
+    }]
+
+    caffeine_pages = chembl["activities_by_molecule"]["CHEMBL123456"]["pages"]
+    caffeine_rows = [copy.deepcopy(row) for page in caffeine_pages for row in page["activities"]]
+    caffeine_active = copy.deepcopy(caffeine_rows[0])
+    caffeine_active.update(activity_id=840001, standard_relation="=", standard_value="500")
+    caffeine_rows.append(caffeine_active)
+    caffeine_pages[:] = [{
+        "page_meta": {"limit": len(caffeine_rows), "next": None, "offset": 0,
+                       "previous": None, "total_count": len(caffeine_rows)},
+        "activities": caffeine_rows,
+    }]
+
+    manifest_path = tmp_path / "official_shape_mock_test_only.json"
+    manifest_path.write_text(json.dumps(fixture, ensure_ascii=False), encoding="utf-8")
+    bundle_root = tmp_path / "verified_mock_bundle"
+    ingest = builder.ingest_local_manifest(manifest_path, bundle_root)
+    assert ingest["status"] == "complete"
+    bundle_path = bundle_root / "entities.json"
+    bundle = builder.load_entity_bundle(bundle_path, verify_sources=True)
+    records = [builder.ActivityEvidence(**item) for item in bundle["activities"]]
+    groups, ledger = group_evidence(records)
+
+    result = apply_label_policy(groups, ledger=ledger, entity_bundle_path=bundle_path)
+
+    clean_labels = [row for row in result.confirmed_labeled_pairs
+                    if row.pair_key == "CHEMBL123456|9606|P12345"]
+    luteolin_labels = [row for row in result.confirmed_labeled_pairs
+                       if row.pair_key == "CHEMBL151|9606|P12345"]
+    assert [(row.endpoint, row.label) for row in clean_labels] == [("Ki", "active")]
+    assert luteolin_labels == []
+    assert {row.endpoint for row in result.conflicts if row.pair_key == "CHEMBL151|9606|P12345"} == {"Ki", "Kd"}
+    assert result.counts["confirmed_active"] == 1
+    assert result.counts["confirmed_inactive"] == 0
+    assert result.confirmed_labeled_pairs
+    assert result.test_only_labeled_pairs == ()
+    assert result.ledger.input_count == len(records)
+    assert sum(result.ledger.counts.values()) == len(records)
+    assert len(result.ledger.sha256) == 64
+    assert result.training_ready is False
 
 
 @pytest.mark.parametrize(

@@ -194,8 +194,10 @@ def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, 
         "request_status": "complete",
         "snapshot_path": captured["snapshot_path"],
         "snapshot_sha256": captured["snapshot_sha256"],
+        "snapshot_root": captured["snapshot_root"],
     }
     assert dataset["ppi_trace"] == expected_trace
+    assert (Path(expected_trace["snapshot_root"]) / expected_trace["snapshot_path"]).read_bytes() == raw_bytes
 
     framework = _framework(tmp_path, "collector-framework")
     Path(framework.output_dir).mkdir()
@@ -229,6 +231,78 @@ def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, 
     saved = json.loads(Path(saved_path).read_text(encoding="utf-8"))
     assert saved["results"]["feature_extraction"]["ppi"]["ppi_trace"] == expected_trace
     assert saved["results"]["knowledge_graph"]["ppi_contract"]["ppi_trace"] == expected_trace
+
+
+def test_framework_managed_collector_snapshot_root_survives_report_handoff(tmp_path, monkeypatch):
+    from data_collection import LuteolinDataCollector
+
+    raw_bytes = json.dumps([ONLINE_EDGE], separators=(",", ":")).encode("utf-8")
+
+    class Response:
+        status_code = 200
+        content = raw_bytes
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [ONLINE_EDGE]
+
+    run_root = tmp_path / "framework-managed-run"
+    framework = NetworkPharmacologyFramework(output_dir=str(run_root), allow_online=True)
+    collector = framework.data_collector
+    assert isinstance(collector, LuteolinDataCollector)
+    monkeypatch.setattr("data_collection.requests.post", lambda *args, **kwargs: Response())
+    collector.raw_data["string"] = collector.fetch_string_data(["AKT1"])
+    cleaned = collector.clean_and_standardize()
+    collector.run_pipeline = lambda: cleaned
+
+    dataset = framework.run_data_collection()
+    trace = dataset["ppi_trace"]
+    expected_root = str((run_root / "data").resolve())
+    assert trace["snapshot_root"] == expected_root
+    snapshot = Path(trace["snapshot_root"]) / trace["snapshot_path"]
+    assert snapshot.resolve().is_relative_to(Path(expected_root))
+    assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == trace["snapshot_sha256"]
+
+    features = framework.run_feature_extraction(dataset)
+    kg_results = framework.run_knowledge_graph(dataset)
+    assert features["ppi"]["ppi_trace"] == trace
+    assert kg_results["ppi_contract"]["ppi_trace"] == trace
+    assert features["ppi"]["edge_count"] == kg_results["ppi_contract"]["edge_count"] == 1
+
+
+def test_online_ppi_snapshot_binding_resolves_and_checks_actual_bytes(tmp_path):
+    raw_bytes = json.dumps([ONLINE_EDGE], separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    snapshot_root = tmp_path / "snapshot-root"
+    relative_path = Path("raw") / "string" / f"{digest}.json"
+    snapshot = snapshot_root / relative_path
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(raw_bytes)
+    metadata = {
+        "source_kind": "online_snapshot",
+        "request_status": "complete",
+        "snapshot_path": relative_path.as_posix(),
+        "snapshot_sha256": digest,
+    }
+
+    valid = canonicalize_ppi([ONLINE_EDGE], snapshot_root=str(snapshot_root), **metadata)
+    assert valid.status == "ready"
+    assert valid.edge_count == 1
+    assert valid.ppi_trace["snapshot_root"] == str(snapshot_root.resolve())
+
+    snapshot.write_bytes(b"changed snapshot bytes")
+    tampered = canonicalize_ppi([ONLINE_EDGE], snapshot_root=str(snapshot_root), **metadata)
+    assert tampered.status == "invalid"
+    assert tampered.edge_count == 0
+    assert "snapshot_hash_mismatch" in {issue.code for issue in tampered.issues}
+    assert canonicalize_ppi(tampered).to_dict() == tampered.to_dict()
+
+    missing_root = canonicalize_ppi([ONLINE_EDGE], **metadata)
+    assert missing_root.status == "invalid"
+    assert missing_root.edge_count == 0
+    assert "missing_snapshot_root" in {issue.code for issue in missing_root.issues}
 
 
 def test_symbol_only_offline_row_without_mapping_is_unresolved(tmp_path):

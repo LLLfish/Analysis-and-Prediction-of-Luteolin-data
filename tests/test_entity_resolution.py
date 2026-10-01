@@ -437,14 +437,18 @@ def test_component_species_and_taxonomy_conflicts_stay_excluded_through_bundle_a
     assert target_tax_conflict["reason_code"] == "conflicting_target_taxonomy"
 
     manifest = _fixture()
-    manifest["chembl"]["molecules"] = [manifest["chembl"]["molecules"][0]]
     manifest["chembl"]["targets"][0]["target_components"][0]["organism"] = "Mus musculus"
     manifest_path = tmp_path / "conflicting-component-manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     output_dir = tmp_path / "conflicting-component-bundle"
     builder.ingest_local_manifest(manifest_path, output_dir)
     bundle = builder.load_entity_bundle(output_dir / "entities.json", verify_sources=True)
-    assert bundle["proteins"] == []
+    assert bundle["proteins"]
+    assert all(
+        reference.get("target_chembl_id") != "CHEMBL900201"
+        for protein in bundle["proteins"]
+        for reference in protein.get("component_evidence", {}).get("references", [])
+    )
     exclusion = next(row for row in bundle["exclusions"] if row.get("target_chembl_id") == "CHEMBL900201")
     assert exclusion["reason_code"] == "component_organism_mismatch"
 

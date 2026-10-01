@@ -294,14 +294,51 @@ def resolve_target_components(
     source_sha256: Optional[str] = None,
     source_url: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Resolve every component; only a confirmed human SINGLE PROTEIN is eligible."""
+    """Resolve every component only when its own species evidence agrees with the target."""
     target = _copy_json_object(dict(target_record), "ChEMBL target record")
     source_kind = _source_kind(source_kind)
     target_id = target.get("target_chembl_id")
     target_type = target.get("target_type")
-    organism = target.get("organism")
-    target_taxonomy = _taxonomy_adapter(target.get("tax_id", target.get("target_tax_id")))
-    components = target.get("target_components")
+
+    def normalized_scientific_name(record: Mapping[str, Any], fields: Sequence[str]):
+        present = [field for field in fields if field in record]
+        if not present:
+            return None, None, None
+        normalized = []
+        for field in present:
+            value = record[field]
+            if not isinstance(value, str):
+                return None, "invalid", field
+            value = " ".join(value.split())
+            if not value:
+                return None, "invalid", field
+            normalized.append((value.casefold(), field))
+        if any(value != normalized[0][0] for value, _ in normalized[1:]):
+            return None, "conflict", normalized[-1][1]
+        return normalized[0][0], None, normalized[0][1]
+
+    def explicit_taxonomy(record: Mapping[str, Any], fields: Sequence[str]):
+        present = [field for field in fields if field in record]
+        if not present:
+            return None, None, None
+        parsed = []
+        for field in present:
+            value = _taxonomy_adapter(record[field])
+            if value is None:
+                return None, "invalid", field
+            parsed.append((value, field))
+        if any(value != parsed[0][0] for value, _ in parsed[1:]):
+            return None, "conflict", parsed[-1][1]
+        return parsed[0][0], None, parsed[0][1]
+
+    target_organism = target.get("organism")
+    target_species, target_organism_problem, target_organism_field = normalized_scientific_name(
+        target, ("organism", "target_organism"),
+    )
+    target_taxonomy, target_taxonomy_problem, target_taxonomy_field = explicit_taxonomy(
+        target, ("tax_id", "target_tax_id", "taxonomy_id"),
+    )
+    # Raw target/component mappings stay attached for source-semantic re-derivation.
     target_raw_hash = source_sha256 if _is_sha256(source_sha256) else canonical_json_sha256(target)
     identity_source = _source_provenance_entry(
         source_id=f"chembl_target:{target_id if isinstance(target_id, str) else 'unresolved'}",
@@ -313,14 +350,24 @@ def resolve_target_components(
     base = {
         "target_chembl_id": target_id if isinstance(target_id, str) else None,
         "target_type": target_type if isinstance(target_type, str) else None,
-        "organism": organism if isinstance(organism, str) else None,
+        "organism": target_organism if isinstance(target_organism, str) else None,
+        "normalized_organism": target_species,
         "target_taxonomy_id": target_taxonomy,
         "target_record": target,
         "target_record_sha256": target_raw_hash,
         "target_record_source": identity_source,
         "source_kind": source_kind,
     }
+    components = target.get("target_components")
     if not isinstance(components, list) or not components:
+        if target_taxonomy_problem:
+            status, reason = "excluded", ("invalid_target_taxonomy" if target_taxonomy_problem == "invalid" else "conflicting_target_taxonomy")
+        elif target_organism_problem:
+            status, reason = "excluded", ("invalid_target_organism" if target_organism_problem == "invalid" else "conflicting_target_organism")
+        elif target_species != "homo sapiens" or target_taxonomy != 9606:
+            status, reason = "excluded", "non_human_taxonomy"
+        else:
+            status, reason = "unverified", "missing_target_components"
         return [{
             **base,
             "component_index": None,
@@ -329,9 +376,10 @@ def resolve_target_components(
             "taxonomy_id": None,
             "taxonomy_evidence_path": None,
             "identity_key": None,
-            "resolution_status": "unverified",
-            "reason_code": "missing_target_components",
+            "resolution_status": status,
+            "reason_code": reason,
         }]
+
     target_is_single = target_type == "SINGLE PROTEIN"
     single_component = len(components) == 1
     results: list[dict[str, Any]] = []
@@ -350,45 +398,62 @@ def resolve_target_components(
                 "reason_code": "malformed_target_component",
             })
             continue
+
         accession = component.get("accession")
-        if not isinstance(accession, str) or not accession.strip():
-            status, reason, accession_value = "unverified", "missing_component_accession", None
-        else:
+        if isinstance(accession, str) and accession.strip() and _UNIPROT_ACCESSION.fullmatch(accession.strip()):
             accession_candidate = accession.strip()
-            if _UNIPROT_ACCESSION.fullmatch(accession_candidate):
-                accession_value = accession_candidate
-                status, reason = "verified", None
-            else:
-                accession_value = None
-                status, reason = "unverified", "invalid_component_accession"
-        if not isinstance(accession, str) or not accession.strip():
+            accession_value = accession_candidate
+            accession_status, accession_reason = "verified", None
+        elif isinstance(accession, str) and accession.strip():
+            accession_candidate = accession.strip()
+            accession_value = None
+            accession_status, accession_reason = "unverified", "invalid_component_accession"
+        else:
             accession_candidate = None
+            accession_value = None
+            accession_status, accession_reason = "unverified", "missing_component_accession"
+
+        component_species, component_organism_problem, component_organism_field = normalized_scientific_name(
+            component, ("organism", "component_organism", "organism_scientific", "scientific_name"),
+        )
+        component_taxonomy, component_taxonomy_problem, component_taxonomy_field = explicit_taxonomy(
+            component, ("component_tax_id", "tax_id", "taxonomy_id"),
+        )
         component_type = component.get("component_type")
+        status, reason = accession_status, accession_reason
         if not target_is_single:
             status, reason = "excluded", "target_type_not_single_protein"
         elif not single_component:
             status, reason = "excluded", "single_protein_component_count_not_one"
-        elif organism != "Homo sapiens" or target_taxonomy != 9606:
+        elif target_taxonomy_problem:
+            status, reason = "excluded", ("invalid_target_taxonomy" if target_taxonomy_problem == "invalid" else "conflicting_target_taxonomy")
+        elif target_organism_problem:
+            status, reason = "excluded", ("invalid_target_organism" if target_organism_problem == "invalid" else "conflicting_target_organism")
+        elif target_species != "homo sapiens" or target_taxonomy != 9606:
             status, reason = "excluded", "non_human_taxonomy"
+        elif component_organism_problem == "invalid":
+            status, reason = "excluded", "invalid_component_organism"
+        elif component_organism_problem == "conflict":
+            status, reason = "excluded", "conflicting_component_organism"
+        elif component_species is not None and component_species != target_species:
+            status, reason = "excluded", "component_organism_mismatch"
+        elif component_taxonomy_problem == "invalid":
+            status, reason = "excluded", "invalid_component_taxonomy"
+        elif component_taxonomy_problem == "conflict":
+            status, reason = "excluded", "conflicting_component_taxonomy"
+        elif component_taxonomy is not None and component_taxonomy != target_taxonomy:
+            status, reason = "excluded", "component_taxonomy_mismatch"
         elif component_type != "PROTEIN":
             status, reason = "excluded", "component_type_not_protein"
-        elif accession_value is None and accession_candidate is None:
-            status, reason = "unverified", "missing_component_accession"
-        component_tax = _taxonomy_adapter(
-            component.get("component_tax_id", component.get("tax_id", component.get("taxonomy_id")))
-        )
-        if component_tax is not None and target_taxonomy is not None and component_tax != target_taxonomy:
-            status, reason = "excluded", "component_taxonomy_mismatch"
-        taxonomy = component_tax if component_tax is not None else target_taxonomy
-        taxonomy_path = (
-            f"target_components[{index}].component_tax_id"
-            if component_tax is not None and "component_tax_id" in component
-            else f"target_components[{index}].tax_id"
-            if component_tax is not None and "tax_id" in component
-            else "target.tax_id"
-            if taxonomy is not None
-            else None
-        )
+
+        taxonomy = component_taxonomy if component_taxonomy is not None else target_taxonomy
+        taxonomy_field = component_taxonomy_field or target_taxonomy_field
+        if component_taxonomy is not None:
+            taxonomy_path = f"target_components[{index}].{taxonomy_field}"
+        elif target_taxonomy_field is not None:
+            taxonomy_path = f"target.{target_taxonomy_field}"
+        else:
+            taxonomy_path = None
         if status == "verified" and taxonomy is None:
             status, reason = "unverified", "missing_component_taxonomy"
         identity_key = [taxonomy, accession_value] if taxonomy is not None and accession_value is not None else None
@@ -396,6 +461,9 @@ def resolve_target_components(
             **base,
             "component_index": index,
             "component": component,
+            "component_organism_normalized": component_species,
+            "component_organism_evidence_field": component_organism_field,
+            "component_taxonomy_evidence_field": component_taxonomy_field,
             "accession": accession_value,
             "accession_candidate": accession_candidate,
             "taxonomy_id": taxonomy,
@@ -405,7 +473,6 @@ def resolve_target_components(
             "reason_code": reason,
         })
     return results
-
 
 _UNIPROT_ORIGIN = "https://rest.uniprot.org"
 _UNIPROT_ACCESSION = re.compile(r"^[A-Z0-9]{6}(?:[A-Z0-9]{4})?$")
@@ -666,6 +733,54 @@ def hydrate_protein_record(
         return _uniprot_source_error_record(
             component, source_kind=kind, sequence_status="unverified",
             reason=str(component.get("reason_code") or "component_identity_not_verified"),
+        )
+    target_record = component.get("target_record")
+    component_index = component.get("component_index")
+    target_source = component.get("target_record_source")
+    if not isinstance(target_record, Mapping) or type(component_index) is not int or not isinstance(target_source, Mapping):
+        return _uniprot_source_error_record(
+            component, source_kind=kind, sequence_status="unverified",
+            reason="verified_target_component_source_required", identity_status="unverified",
+        )
+    target_source_kind = component.get("source_kind", kind)
+    try:
+        derived_components = resolve_target_components(
+            target_record,
+            source_kind=target_source_kind,
+            source_path=target_source.get("source_path"),
+            source_sha256=component.get("target_record_sha256"),
+            source_url=target_source.get("source_url"),
+        )
+        derived_component = next((
+            item for item in derived_components
+            if item.get("component_index") == component_index
+        ), None)
+    except Exception as exc:
+        return _uniprot_source_error_record(
+            component, source_kind=kind, sequence_status="unverified",
+            reason=f"target_component_rederivation_failed:{type(exc).__name__}",
+            identity_status="unverified",
+        )
+    if not isinstance(derived_component, Mapping) or derived_component.get("resolution_status") != "verified":
+        return _uniprot_source_error_record(
+            component, source_kind=kind, sequence_status="unverified",
+            reason=(
+                derived_component.get("reason_code")
+                if isinstance(derived_component, Mapping)
+                else "target_component_rederivation_missing"
+            ),
+            identity_status="unverified",
+        )
+    required_component_fields = (
+        "target_chembl_id", "target_type", "organism", "target_taxonomy_id",
+        "component_index", "component", "accession", "taxonomy_id",
+        "taxonomy_evidence_path", "identity_key", "target_record_sha256",
+        "target_record_source",
+    )
+    if any(component.get(field) != derived_component.get(field) for field in required_component_fields):
+        return _uniprot_source_error_record(
+            component, source_kind=kind, sequence_status="unverified",
+            reason="target_component_resolution_mismatch", identity_status="unverified",
         )
     accession = component.get("accession")
     taxonomy = component.get("taxonomy_id")
@@ -1480,13 +1595,14 @@ def _verify_molecule_source_semantics(
 def _verify_protein_component_references(
     protein: Mapping[str, Any], root: Path,
     provenance: Sequence[Mapping[str, Any]],
-) -> None:
+) -> Mapping[str, Any]:
     protein_id = protein.get("accession")
     component_evidence = protein.get("component_evidence")
     references = component_evidence.get("references") if isinstance(component_evidence, Mapping) else None
     if not isinstance(references, list) or not references:
         raise EvidenceInputError(f"verified protein {protein_id} has no target component source references")
     seen_references: set[tuple[Any, Any]] = set()
+    first_resolved = None
     for reference in references:
         if not isinstance(reference, Mapping):
             raise EvidenceInputError(f"verified protein {protein_id} has a malformed target component reference")
@@ -1514,7 +1630,7 @@ def _verify_protein_component_references(
             raise EvidenceInputError(f"protein {protein_id} target ID differs from raw source")
         target_url = target_source.get("source_url")
         if target_url is not None and target_url != f"{CHEMBL_API_ROOT}/target/{target_id}.json":
-            raise EvidenceInputError(f"protein {protein_id} target URL is not its exact ChEMBL endpoint")
+            raise EvidenceInputError(f"protein {protein_id} source URL is not its exact ChEMBL target endpoint")
         resolutions = resolve_target_components(
             target,
             source_kind=receipt.get("source_kind"),
@@ -1552,7 +1668,9 @@ def _verify_protein_component_references(
             ("source_id", "source_kind", "source_path", "raw_sha256"),
             f"protein {protein_id} target source receipt",
         )
-
+        if first_resolved is None:
+            first_resolved = resolved
+    return first_resolved
 
 def _verify_protein_source_semantics(
     proteins: Sequence[Mapping[str, Any]], root: Path,
@@ -1576,7 +1694,9 @@ def _verify_protein_source_semantics(
         json_rows = [row for row in source_rows if row.get("source_id") == f"uniprot:{accession}"]
         fasta_rows = [row for row in source_rows if row.get("source_id") == f"uniprot_fasta:{accession}"]
         metadata_rows = [row for row in source_rows if row.get("source_id") == f"uniprot_taxonomy_metadata:{accession}"]
-        component = {"accession": accession, "taxonomy_id": taxonomy_id, "resolution_status": "verified"}
+        component = _verify_protein_component_references(protein, root, provenance)
+        if not isinstance(component, Mapping):
+            raise EvidenceInputError(f"verified protein {accession} has no rederived target component")
         if len(json_rows) == 1 and len(source_rows) == 1:
             source = json_rows[0]
             receipt, payload, raw_bytes = _bundle_json_source(
@@ -1627,7 +1747,7 @@ def _verify_protein_source_semantics(
         else:
             raise EvidenceInputError(f"verified protein {accession} lacks one exact UniProt JSON or FASTA/metadata source pair")
         _compare_fields(protein, rebuilt, semantic_fields, f"protein {accession} sequence")
-        _verify_protein_component_references(protein, root, provenance)
+        # Component references were source-verified before sequence rehydration.
 
 
 def _activity_linked_json(

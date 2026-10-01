@@ -31,37 +31,22 @@ def _bundle(tmp_path: Path) -> tuple[Path, dict]:
     return path, builder.load_entity_bundle(path)
 
 
-def _synthetic_feature_result(bundle: dict) -> FeatureResult:
-    protein = data_contracts.ProteinRecord(**bundle["proteins"][0])
-    artifact_hash = "d" * 64
-    pooling = "residue-mask-mean-v1:max_tokens=8"
-    cache_key = protein_features.build_feature_cache_key(
-        protein,
-        model_id="mock/esm",
+def _issue_test_feature_result(output_dir: Path, bundle_path: Path, monkeypatch):
+    extractor = protein_features.ProteinFeatureExtractor(
+        output_dir=str(output_dir),
+        esm_model_name="mock/esm",
         model_revision="mock-r1",
-        model_artifact_sha256=artifact_hash,
-        pooling_policy=pooling,
-        entity_version=bundle["entity_version"],
-        entity_bundle_hash=bundle["content_sha256"],
+        model=object(),
+        tokenizer=object(),
+        test_only=True,
     )
-    return FeatureResult(
-        status="test_only",
-        reason="synthetic fixture only",
-        features={"esm_embedding": [1.0, 2.0]},
-        accession=protein.accession,
-        taxonomy_id=protein.taxonomy_id,
-        sequence_length=protein.sequence_length,
-        sequence_sha256=protein.sequence_sha256,
-        entity_version=bundle["entity_version"],
-        entity_bundle_hash=bundle["content_sha256"],
-        source_kind="synthetic_test",
-        model_id="mock/esm",
-        model_revision="mock-r1",
-        model_artifact_sha256=artifact_hash,
-        pooling_policy=pooling,
-        cache_key=cache_key,
-        test_provenance="synthetic entity bundle and deterministic mock embedding",
+    monkeypatch.setattr(
+        extractor,
+        "_extract_residue_embedding",
+        lambda sequence: (np.array([1.0, 2.0], dtype=np.float32), "ready", None),
     )
+    result = extractor.extract_from_bundle(str(bundle_path), test_only=True)[0]
+    return extractor, result
 
 
 def _readiness() -> dict:
@@ -554,9 +539,9 @@ def test_dashboard_escapes_html_text_and_script_json(tmp_path, monkeypatch):
 def test_save_methods_create_configured_parents_and_reject_path_traversal(tmp_path, monkeypatch):
     _install_write_guard(monkeypatch)
     protein_root = tmp_path / "protein-output"
-    protein_extractor = protein_features.ProteinFeatureExtractor(output_dir=str(protein_root))
-    _, bundle = _bundle(tmp_path)
-    protein_path = Path(protein_extractor.save_features(result=_synthetic_feature_result(bundle)))
+    bundle_path, _ = _bundle(tmp_path)
+    protein_extractor, protein_result = _issue_test_feature_result(protein_root, bundle_path, monkeypatch)
+    protein_path = Path(protein_extractor.save_features(result=protein_result))
     assert protein_path.parent == protein_root / "embeddings"
     assert protein_path.is_file()
     with pytest.raises(ValueError, match="filename|path"):
@@ -750,9 +735,9 @@ def test_cnn_and_fusion_savers_do_not_default_to_protected_feature_roots():
 def test_configured_save_methods_create_parents_and_reject_path_traversal(tmp_path, monkeypatch):
     _install_write_guard(monkeypatch)
     protein_root = tmp_path / "protein"
-    extractor = protein_features.ProteinFeatureExtractor(output_dir=str(protein_root))
-    _, bundle = _bundle(tmp_path)
-    protein_path = Path(extractor.save_features(result=_synthetic_feature_result(bundle)))
+    bundle_path, _ = _bundle(tmp_path)
+    extractor, protein_result = _issue_test_feature_result(protein_root, bundle_path, monkeypatch)
+    protein_path = Path(extractor.save_features(result=protein_result))
     assert protein_path.is_file()
     assert protein_path.parent == protein_root / "embeddings"
     with pytest.raises(ValueError, match="filename|path"):

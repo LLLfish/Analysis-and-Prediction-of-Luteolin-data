@@ -254,6 +254,7 @@ class ProteinFeatureExtractor:
             if self.test_only and model is not None and tokenizer is not None else None
         )
         self._cache: Dict[str, FeatureResult] = {}
+        self._issued_feature_result_signatures: set[str] = set()
         self._feature_lock = threading.RLock()
         self._fallback_models = []
         self._modelscope_models = {
@@ -697,6 +698,29 @@ class ProteinFeatureExtractor:
         extractor.features = {}
         extractor.last_result = None
 
+    @staticmethod
+    def _feature_result_signature(result: Any) -> Optional[str]:
+        if not isinstance(result, FeatureResult):
+            return None
+        try:
+            payload = json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError):
+            return None
+        return hashlib.sha256(payload).hexdigest()
+
+    def _remember_feature_result(self, result: FeatureResult) -> FeatureResult:
+        signature = self._feature_result_signature(result)
+        if signature is not None:
+            self._issued_feature_result_signatures.add(signature)
+        self.last_result = result
+        return result
+
     def _result(
         self,
         protein: ProteinRecord,
@@ -729,8 +753,7 @@ class ProteinFeatureExtractor:
             cache_key=cache_key,
             test_provenance=self._test_provenance if status == "test_only" else None,
         )
-        self.last_result = result
-        return result
+        return self._remember_feature_result(result)
 
     def _extract_validated_record(
         self,
@@ -774,9 +797,7 @@ class ProteinFeatureExtractor:
         cached = self._cache.get(cache_key)
         if cached is not None:
             self.features = deepcopy(cached.features)
-            result = deepcopy(cached)
-            self.last_result = result
-            return result
+            return self._remember_feature_result(deepcopy(cached))
 
         embedding, status, reason = self._extract_residue_embedding(sequence)
         if status != "ready" or embedding is None:
@@ -814,10 +835,10 @@ class ProteinFeatureExtractor:
             try:
                 bundle = load_entity_bundle(bundle_path, verify_sources=True)
             except Exception:
-                self.last_result = FeatureResult(
+                self._remember_feature_result(FeatureResult(
                     status="unavailable",
                     reason="entity_bundle_verification_failed",
-                )
+                ))
                 raise
             results = []
             for protein_data in bundle.get("proteins", []):
@@ -831,7 +852,7 @@ class ProteinFeatureExtractor:
                         entity_bundle_hash=bundle.get("content_sha256"),
                         source_kind=protein_data.get("source_kind"),
                     )
-                    self.last_result = result
+                    self._remember_feature_result(result)
                     results.append(result)
                     continue
                 results.append(self._extract_validated_record(
@@ -854,10 +875,10 @@ class ProteinFeatureExtractor:
             try:
                 bundle = load_entity_bundle(bundle_path, verify_sources=True)
             except Exception:
-                self.last_result = FeatureResult(
+                self._remember_feature_result(FeatureResult(
                     status="unavailable",
                     reason="entity_bundle_verification_failed",
-                )
+                ))
                 raise
             return self._extract_validated_record(
                 protein, bundle, test_only=test_only,
@@ -911,6 +932,9 @@ class ProteinFeatureExtractor:
             raise ValueError("save_features requires an explicit FeatureResult")
         if not isinstance(result, FeatureResult):
             raise TypeError("result must be a validated FeatureResult")
+        signature = self._feature_result_signature(result)
+        if signature is None or signature not in self._issued_feature_result_signatures:
+            raise ValueError("result must be an unchanged source-verified FeatureResult emitted by this extractor")
         data = result.to_dict()
         with open(filepath, 'x', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)

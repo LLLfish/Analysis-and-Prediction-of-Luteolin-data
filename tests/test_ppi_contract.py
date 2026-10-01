@@ -163,6 +163,75 @@ def test_online_offline_tracer_reaches_networkx_and_knowledge_graph(tmp_path):
     assert online_features["gnn"]["model_type"] == "network_statistics_only"
 
 
+def test_real_collector_trace_survives_cleaning_network_report_and_kg(tmp_path, monkeypatch):
+    from data_collection import LuteolinDataCollector
+
+    raw_bytes = json.dumps([ONLINE_EDGE], separators=(",", ":")).encode("utf-8")
+
+    class Response:
+        status_code = 200
+        content = raw_bytes
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [ONLINE_EDGE]
+
+    collector = LuteolinDataCollector(
+        output_dir=str(tmp_path / "collector-run"), allow_online=True,
+    )
+    monkeypatch.setattr(
+        "data_collection.requests.post", lambda *args, **kwargs: Response(),
+    )
+    captured = collector.fetch_string_data(["AKT1"])
+    assert captured["request_status"] == "complete"
+    assert captured["source_kind"] == "online_snapshot"
+    assert captured["snapshot_sha256"] == hashlib.sha256(raw_bytes).hexdigest()
+    assert (Path(collector.output_dir) / captured["snapshot_path"]).read_bytes() == raw_bytes
+
+    dataset = collector.clean_and_standardize()
+    expected_trace = {
+        "source_kind": "online_snapshot",
+        "request_status": "complete",
+        "snapshot_path": captured["snapshot_path"],
+        "snapshot_sha256": captured["snapshot_sha256"],
+    }
+    assert dataset["ppi_trace"] == expected_trace
+
+    framework = _framework(tmp_path, "collector-framework")
+    framework.results["data_collection"] = dataset
+    features = framework.run_feature_extraction(dataset)
+    ppi = features["ppi"]
+    assert {key: ppi[key] for key in expected_trace} == expected_trace
+    assert framework.gnn_analyzer.graph.graph["ppi_trace"] == expected_trace
+    kg_results = framework.run_knowledge_graph(dataset)
+    assert kg_results["ppi_contract"]["ppi_trace"] == expected_trace
+    assert framework.kg_module.graph.graph["ppi_trace"] == expected_trace
+
+    class ReportCapture:
+        def generate_summary_report(self, payload):
+            self.payload = payload
+            return {"gnn_summary": payload["gnn"], "feature_readiness": payload["feature_readiness"]}
+
+        def generate_dashboard_html(self, report):
+            self.report = report
+            return "report.html"
+
+        def generate_plots(self, payload):
+            return None
+
+    report_capture = ReportCapture()
+    framework.output_module = report_capture
+    framework.run_output_generation()
+    assert report_capture.report["ppi_trace"] == expected_trace
+
+    saved_path = framework.save_results()
+    saved = json.loads(Path(saved_path).read_text(encoding="utf-8"))
+    assert saved["results"]["feature_extraction"]["ppi"]["ppi_trace"] == expected_trace
+    assert saved["results"]["knowledge_graph"]["ppi_contract"]["ppi_trace"] == expected_trace
+
+
 def test_symbol_only_offline_row_without_mapping_is_unresolved(tmp_path):
     dataset = _dataset(
         [{"protein_a": "AKT1", "protein_b": "PIK3CA", "ncbiTaxonId": 9606, "score": 0.985}],

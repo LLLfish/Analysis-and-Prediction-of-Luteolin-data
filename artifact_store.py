@@ -177,7 +177,8 @@ def _assert_no_reparse_components(path: Path) -> None:
 def _protected_paths(apl_root: Path) -> tuple[Path, ...]:
     return tuple(
         apl_root / relative for relative in (
-            "data", "framework_output", "offline_data.json", ".model_cache", "features", "output_dashboard.html",
+            "data", "framework_output", "offline_data.json", ".model_cache", "model_cache", "features", "history",
+            "output_dashboard.html",
         )
     )
 

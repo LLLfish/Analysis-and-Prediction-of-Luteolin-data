@@ -649,7 +649,8 @@ def _validate_report_output(apl_root: Path, output_dir: Any) -> Path:
     resolved = candidate.resolve(strict=False)
     protected = [
         apl_root / relative for relative in (
-            "data", "framework_output", "offline_data.json", ".model_cache", "features", "output_dashboard.html",
+            "data", "framework_output", "offline_data.json", ".model_cache", "model_cache", "features", "history",
+            "output_dashboard.html",
         )
     ]
     if any(_path_intersects(resolved, path) for path in protected):

@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import evidence_builder
 from data_collection import LuteolinDataCollector
 
 
@@ -167,6 +168,86 @@ def test_collector_output_root_rejects_protected_and_existing_paths(tmp_path):
     marker.write_bytes(b"keep-existing-data")
     with pytest.raises(FileExistsError, match="existing"):
         LuteolinDataCollector(output_dir=str(existing))
+    assert marker.read_bytes() == b"keep-existing-data"
+
+
+@pytest.mark.parametrize(
+    "protected_name",
+    (
+        "data",
+        "framework_output",
+        "offline_data.json",
+        ".model_cache",
+        "model_cache",
+        "features",
+        "history",
+        "output_dashboard.html",
+    ),
+)
+@pytest.mark.parametrize("candidate_kind", ("root", "descendant", "ancestor"))
+def test_evidence_builder_protected_path_rejects_roots_and_intersections(
+    tmp_path, monkeypatch, protected_name, candidate_kind,
+):
+    fake_apl_root = tmp_path / "fake-apl"
+    fake_apl_root.mkdir()
+    monkeypatch.setattr(evidence_builder, "__file__", str(fake_apl_root / "evidence_builder.py"))
+    protected_path = fake_apl_root / protected_name
+    candidate = {
+        "root": protected_path,
+        "descendant": protected_path / "nested-output",
+        "ancestor": fake_apl_root,
+    }[candidate_kind]
+
+    assert evidence_builder._protected_output_path(candidate), (
+        f"{candidate_kind} of protected output {protected_name} must be rejected"
+    )
+
+
+@pytest.mark.parametrize(
+    "protected_name",
+    (
+        "data",
+        "framework_output",
+        "offline_data.json",
+        ".model_cache",
+        "model_cache",
+        "features",
+        "history",
+        "output_dashboard.html",
+    ),
+)
+@pytest.mark.parametrize("nested", (False, True), ids=("root", "descendant"))
+def test_evidence_builder_refuses_protected_output_roots_and_descendants(
+    tmp_path, monkeypatch, protected_name, nested,
+):
+    fake_apl_root = tmp_path / "fake-apl"
+    fake_apl_root.mkdir()
+    monkeypatch.setattr(evidence_builder, "__file__", str(fake_apl_root / "evidence_builder.py"))
+    protected_path = fake_apl_root / protected_name
+    candidate = protected_path / "nested-output" if nested else protected_path
+
+    with pytest.raises(evidence_builder.EvidenceInputError, match="protected"):
+        evidence_builder._create_output_root(candidate)
+    assert not candidate.exists()
+
+
+def test_evidence_builder_output_root_still_accepts_fresh_and_refuses_existing_paths(
+    tmp_path, monkeypatch,
+):
+    fake_apl_root = tmp_path / "fake-apl"
+    fake_apl_root.mkdir()
+    monkeypatch.setattr(evidence_builder, "__file__", str(fake_apl_root / "evidence_builder.py"))
+
+    fresh = tmp_path / "fresh-staging"
+    assert evidence_builder._create_output_root(fresh) == fresh.resolve()
+    assert fresh.is_dir()
+
+    existing = tmp_path / "existing-staging"
+    existing.mkdir()
+    marker = existing / "keep.json"
+    marker.write_bytes(b"keep-existing-data")
+    with pytest.raises(FileExistsError, match="existing"):
+        evidence_builder._create_output_root(existing)
     assert marker.read_bytes() == b"keep-existing-data"
 
 

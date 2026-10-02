@@ -375,6 +375,7 @@ def test_source_readiness_receipt_is_bound_to_canonical_frozen_corpus(tmp_path):
     receipt_bytes = receipt_path.read_bytes()
     receipt = json.loads(receipt_bytes.decode("utf-8"))
 
+    assert type(manifest["source_readiness_contract_version"]) is int
     assert manifest["source_readiness_contract_version"] == 1
     assert receipt_ref["path"] == "source_readiness_receipt.json"
     assert hashlib.sha256(receipt_bytes).hexdigest() == receipt_ref["file_sha256"]
@@ -437,6 +438,20 @@ def test_source_readiness_receipt_missing_and_unsupported_contracts_are_violatio
     unsupported_receipt_report = leak_audit.audit_split(unsupported_receipt_manifest)
     assert unsupported_receipt_report.exit_code == 3
     assert "source_readiness_receipt_unsupported" in {row.code for row in unsupported_receipt_report.findings}
+
+
+@pytest.mark.parametrize("contract_version", [True, 1.0], ids=("boolean-one", "float-one"))
+def test_source_readiness_contract_version_requires_exact_integer_one(tmp_path, contract_version):
+    _bundle_path, _writer_instance, manifest_path = _published_empty_manifest(tmp_path, "receipt-invalid-marker")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_readiness_contract_version"] = contract_version
+    _write_rehashed_manifest(manifest_path, manifest)
+
+    report = leak_audit.audit_split(manifest_path)
+
+    assert report.status == "violation"
+    assert report.exit_code == 3
+    assert "source_readiness_contract_unsupported" in {row.code for row in report.findings}
 
 
 def test_source_readiness_receipt_rejects_rehashed_cross_corpus_metrics(tmp_path):

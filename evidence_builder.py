@@ -2108,6 +2108,10 @@ def _protected_output_path(path: Path) -> bool:
         apl_root / "framework_output",
         apl_root / "offline_data.json",
         apl_root / ".model_cache",
+        apl_root / "model_cache",
+        apl_root / "features",
+        apl_root / "history",
+        apl_root / "output_dashboard.html",
     )
     resolved = path.resolve()
     for protected_path in protected:

@@ -631,15 +631,103 @@ def test_input_change_after_independent_audit_blocks_manifest_commit(tmp_path, m
     assert not (output_root / "changed-input-v1" / "manifest.json").exists()
 
 
-def test_writer_rejects_output_root_inside_protected_history_without_creating_it(tmp_path):
+@pytest.mark.parametrize(
+    "protected_relative",
+    (
+        "data",
+        "framework_output",
+        "offline_data.json",
+        ".model_cache",
+        "model_cache",
+        "features",
+        "history",
+        "output_dashboard.html",
+    ),
+)
+def test_writer_rejects_each_protected_root_and_descendant_before_creation(
+    tmp_path, monkeypatch, protected_relative
+):
+    store = _store()
+    fake_apl_root = tmp_path / "fake-apl"
+    fake_apl_root.mkdir()
+    # Keep every attempted write inside tmp_path. The audit hook still guards
+    # the real APL tree, so only the production validator can reject this path.
+    monkeypatch.setattr(store, "__file__", str(fake_apl_root / "artifact_store.py"))
     bundle_path, bundle = _empty_verified_bundle(tmp_path)
     split = _split_payload(bundle_path, bundle)
-    protected_target = APL_ROOT / "data" / f"p0_01_06_forbidden_{tmp_path.name}"
-    result = _store().FrozenManifestWriter(protected_target, version_id="v1").publish(bundle_path, split=split)
+    protected_root = fake_apl_root / protected_relative
 
-    assert result.exit_code == 2
-    assert result.status == "incomplete"
-    assert not protected_target.exists()
+    for output_root in (protected_root, protected_root / "nested"):
+        result = store.FrozenManifestWriter(
+            output_root, version_id="guard-probe-v1", code_root=tmp_path / "no-git"
+        ).publish(bundle_path, split=split)
+
+        assert result.exit_code == 2, f"{output_root}: {result.error}"
+        assert result.status == "incomplete"
+        assert "intersects protected history" in (result.error or "")
+        assert not output_root.exists()
+        assert not (output_root / "guard-probe-v1").exists()
+
+
+@pytest.mark.parametrize(
+    "protected_relative",
+    (
+        "data",
+        "framework_output",
+        "offline_data.json",
+        ".model_cache",
+        "model_cache",
+        "features",
+        "history",
+        "output_dashboard.html",
+    ),
+)
+def test_source_audit_cli_rejects_each_protected_root_and_descendant_before_creation(
+    tmp_path, protected_relative
+):
+    fake_apl_root = tmp_path / "fake-apl"
+    _fake_legacy_sources(fake_apl_root)
+    protected_root = fake_apl_root / protected_relative
+    env = dict(os.environ)
+    env.update({
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache"),
+    })
+
+    for output_dir in (protected_root, protected_root / "nested"):
+        existed_before = output_dir.exists()
+        completed = subprocess.run(
+            [sys.executable, "-X", "utf8", "-B", str(APL_ROOT / "source_audit.py"),
+             "--apl-root", str(fake_apl_root), "--out", str(output_dir)],
+            cwd=tmp_path, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30, check=False,
+        )
+
+        assert completed.returncode == 2, (completed.stdout or "") + (completed.stderr or "")
+        assert "intersects a protected historical source or output path" in completed.stderr
+        assert output_dir.exists() is existed_before
+
+
+def test_writer_and_source_audit_reject_output_ancestors_of_apl_root(tmp_path, monkeypatch, capsys):
+    fake_apl_root = tmp_path / "fake-apl"
+    _fake_legacy_sources(fake_apl_root)
+    store = _store()
+    monkeypatch.setattr(store, "__file__", str(fake_apl_root / "artifact_store.py"))
+    bundle_path, bundle = _empty_verified_bundle(tmp_path)
+    split = _split_payload(bundle_path, bundle)
+
+    writer_result = store.FrozenManifestWriter(
+        tmp_path, version_id="ancestor-probe-v1", code_root=tmp_path / "no-git"
+    ).publish(bundle_path, split=split)
+    assert writer_result.exit_code == 2
+    assert "intersects protected history" in (writer_result.error or "")
+    assert not (tmp_path / "ancestor-probe-v1").exists()
+
+    source_audit = _source_audit()
+    report_exit = source_audit.main(["--apl-root", str(fake_apl_root), "--out", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert report_exit == 2
+    assert "intersects a protected historical source or output path" in captured.err
 
 
 def test_existing_version_is_immutable_when_input_claim_changes(tmp_path):

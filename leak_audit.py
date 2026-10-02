@@ -1120,17 +1120,12 @@ def _audit_split_core(
             return AuditReport("legacy_unreceipted", 4, (finding,), _empty_support(), False, error=message)
         if receipt_signal:
             contract_version = manifest.get("source_readiness_contract_version")
-            if type(contract_version) is int and contract_version != 1:
-                return _receipt_violation(
-                    "source_readiness_contract_unsupported",
-                    f"unsupported source_readiness_contract_version: {contract_version}",
-                )
             if not contract_signal:
                 return _receipt_violation(
                     "source_readiness_contract_marker_missing",
                     "source readiness receipt signals require source_readiness_contract_version=1",
                 )
-            if contract_version != 1:
+            if type(contract_version) is not int or contract_version != 1:
                 return _receipt_violation(
                     "source_readiness_contract_unsupported",
                     "source_readiness_contract_version must be integer 1",

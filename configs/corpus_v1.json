@@ -42,13 +42,13 @@
   "label_policy": {
     "path": "configs/label_policy_ki_v1.json",
     "path_base": "APL repository root",
-    "sha256": "652fce6f62ffff3b827986cbfa790f2b07939790b30c93c5c8fdb3947449cf66",
+    "sha256": "817587aae18bd85d5986db44d5383b014cc88689a7574eb1479e606c3be92082",
     "loader_compatibility": "Current P0 label_policy.py validator is fixed to Ki/Kd and does not support this Ki-only copy; Phase 02-02 must implement strict non-empty Ki/Kd subset validation, mutually exclusive complete endpoint coverage, and preserve the default policy before this copy can be consumed."
   },
   "support_policy": {
     "path": "configs/support_v1.json",
     "path_base": "APL repository root",
-    "sha256": "24d1841325800fda8d00ecf5106b5ce1126d52f960f2f69d552e04c452b5f1b3",
+    "sha256": "883ab850c3f0f77ccce0dff09dc5a6406445768d57dc21d7749ccc26d5ca7bb5",
     "purpose": "minimal_baseline_attempt",
     "formal_readiness_requires": "all configured per-split class and cluster minima; otherwise blocked"
   },

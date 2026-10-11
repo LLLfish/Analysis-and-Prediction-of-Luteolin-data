@@ -30,6 +30,34 @@ def test_workload_uses_global_unique_pairs_and_full_sequence_cells():
     assert workload["builder_estimated_seconds"] == workload["auditor_estimated_seconds"]
 
 
+def test_workload_counts_long_verified_sequences_even_when_esm_unsupported():
+    caps = {
+        "builder_molecule_pairs": 8128, "builder_protein_pairs": 2016,
+        "builder_alignment_cells": 2_200_000_000, "auditor_alignment_cells": 2_200_000_000,
+        "builder_wall_seconds": 900, "auditor_wall_seconds": 900,
+    }
+    workload = formal_corpus._workload(2, [1280, 1363], caps, 4_764_854.39208085)
+    assert workload["protein_pairs"] == 1
+    assert workload["alignment_cells"] == 1_744_640
+    assert workload["status"] == "within_budget"
+
+
+def test_formal_source_bundle_rejects_mixed_fixture_or_legacy_entity():
+    bundle = {
+        "source_kind": "online_snapshot",
+        "molecules": [{"source_kind": "online_snapshot"}],
+        "proteins": [{"source_kind": "online_snapshot"}],
+        "activities": [{"source_kind": "synthetic_test"}],
+        "source_provenance": [{"source_kind": "online_snapshot"}],
+    }
+    try:
+        formal_corpus._require_formal_online_snapshot(bundle)
+    except formal_corpus.FormalCorpusError as exc:
+        assert "activities[0]" in str(exc)
+    else:
+        raise AssertionError("mixed-source formal bundle accepted")
+
+
 def test_pair_cap_stops_before_expensive_cell_enumeration():
     class HugeLengths:
         def __len__(self):

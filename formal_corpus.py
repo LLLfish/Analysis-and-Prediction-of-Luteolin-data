@@ -142,6 +142,20 @@ def _verify_config(path: Path = CONFIG_PATH) -> tuple[dict[str, Any], dict[str, 
     return config, decision
 
 
+def _require_formal_online_snapshot(bundle: Mapping[str, Any]) -> None:
+    if bundle.get("source_kind") != "online_snapshot":
+        raise FormalCorpusError("formal preflight requires an online_snapshot entity bundle")
+    for collection in ("molecules", "proteins", "activities", "source_provenance"):
+        rows = bundle.get(collection)
+        if not isinstance(rows, list):
+            raise FormalCorpusError(f"formal source bundle omitted {collection}")
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping) or row.get("source_kind") != "online_snapshot":
+                raise FormalCorpusError(f"formal source bundle contains non-online_snapshot {collection}[{index}]")
+    if not bundle["molecules"] or not bundle["proteins"] or not bundle["activities"] or not bundle["source_provenance"]:
+        raise FormalCorpusError("formal source bundle must contain molecules, proteins, activities, and raw receipts")
+
+
 def _sequence_applicability(bundle: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     supported: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
@@ -193,15 +207,19 @@ def preflight(config_path: Any, entities_path: Any, output_dir: Any) -> dict[str
     config, decision = _verify_config(Path(config_path))
     bundle_path = Path(entities_path).expanduser().resolve(strict=True)
     bundle = evidence_builder.load_entity_bundle(bundle_path, verify_sources=True)
-    if bundle.get("source_kind") == "synthetic_test":
-        raise FormalCorpusError("synthetic_test entity bundles cannot satisfy formal preflight")
+    _require_formal_online_snapshot(bundle)
     root = _safe_new_root(output_dir)
     molecules, excluded_molecules = dataset_builder._molecule_entities(bundle)
-    supported_proteins, excluded_proteins = _sequence_applicability(bundle)
+    usable_proteins, excluded_verified_proteins = dataset_builder._protein_entities(bundle)
+    supported_proteins, unsupported_by_length = _sequence_applicability(bundle)
+    excluded_proteins = excluded_verified_proteins + [item for item in unsupported_by_length
+                                                       if item.get("reason") == "unsupported_length_full_sequence_retained"]
     caps = decision["caps"]
-    lengths = [item["sequence_length"] for item in supported_proteins]
+    # The full source bundle is exactly what the strict split builder/auditor would consume.
+    # ESM length applicability never removes a sequence from duplicate/neighbor auditing.
+    lengths = [len(item["full_sequence"]) for item in usable_proteins]
     workload = _workload(len(molecules), lengths, caps, decision["measurement"]["alignment_cells_per_second"])
-    status = "size_limit" if (len(molecules) > caps["molecules"] or len(supported_proteins) > caps["targets"]
+    status = "size_limit" if (len(molecules) > caps["molecules"] or len(usable_proteins) > caps["targets"]
                               or workload["status"] == "size_limit") else "within_budget"
     report = {
         "schema_version": 1, "protocol_version": config["protocol_version"],
@@ -213,6 +231,7 @@ def preflight(config_path: Any, entities_path: Any, output_dir: Any) -> dict[str
                           "source_kind": bundle.get("source_kind")},
         "counts": {"source_molecules": len(bundle.get("molecules", [])), "usable_molecules": len(molecules),
                    "excluded_molecules": len(excluded_molecules), "source_proteins": len(bundle.get("proteins", [])),
+                   "split_usable_full_sequence_proteins": len(usable_proteins),
                    "length_supported_proteins": len(supported_proteins), "unsupported_or_unverified_proteins": len(excluded_proteins)},
         "sequence_applicability": {"max_full_sequence_residues": MAX_SUPPORTED_RESIDUES,
                                    "supported": supported_proteins, "excluded": excluded_proteins},

@@ -2,3 +2,4 @@ configs/corpus_v1.json -text
 configs/support_v1.json -text
 configs/label_policy_ki_v1.json -text
 configs/corpus_formal_v1.json -text
+configs/corpus_formal_budget_decision_v1.json -text

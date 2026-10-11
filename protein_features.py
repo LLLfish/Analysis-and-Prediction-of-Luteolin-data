@@ -253,7 +253,7 @@ class ProteinFeatureExtractor:
             ).hexdigest()
             if self.test_only and model is not None and tokenizer is not None else None
         )
-        self._cache: Dict[str, FeatureResult] = {}
+        self._loading_diagnostics = None; self._cache: Dict[str, FeatureResult] = {}
         self._issued_feature_result_signatures: set[str] = set()
         self._feature_lock = threading.RLock()
         self._fallback_models = []
@@ -413,12 +413,12 @@ class ProteinFeatureExtractor:
         try:
             tokenizer = AutoTokenizer.from_pretrained(str(local_dir), local_files_only=True)
             loaded_model = AutoModel.from_pretrained(
-                str(local_dir), local_files_only=True, output_loading_info=True,
+                str(local_dir), local_files_only=True, output_loading_info=True, add_pooling_layer=False,
             )
             if not isinstance(loaded_model, tuple) or len(loaded_model) != 2:
                 raise ValueError("local model loader did not return loading diagnostics")
             model, loading_info = loaded_model
-            self._assert_complete_esm_weights(loading_info)
+            self._assert_complete_esm_weights(loading_info); self._loading_diagnostics = {"missing_keys": [str(key) for key in loading_info.get("missing_keys", [])], "unexpected_keys": [str(key) for key in loading_info.get("unexpected_keys", [])], "mismatched_keys": [str(key) for key in loading_info.get("mismatched_keys", [])], "error_msgs": [str(message) for message in loading_info.get("error_msgs", [])]}
             loaded_revision = self._model_revision(model)
             if loaded_revision is not None and loaded_revision != provenance["revision"]:
                 raise ValueError("loaded model revision does not match local snapshot config")
@@ -443,7 +443,7 @@ class ProteinFeatureExtractor:
             self.esm_model = None
             self.esm_tokenizer = None
             self.model_revision = None
-            self.model_artifact_sha256 = None
+            self.model_artifact_sha256 = None; self._loading_diagnostics = None
             self._runtime_model_provenance = None
             logger.warning("Local ESM snapshot is unavailable: %s", exc)
             return False
@@ -676,7 +676,7 @@ class ProteinFeatureExtractor:
             }
             model_inputs["input_ids"] = input_ids.to(self.device)
             model_inputs["attention_mask"] = attention_mask.to(self.device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 outputs = self.esm_model(**model_inputs)
             hidden = getattr(outputs, "last_hidden_state", None)
             if hidden is None or hidden.ndim != 3 or hidden.shape[:2] != input_ids.shape:

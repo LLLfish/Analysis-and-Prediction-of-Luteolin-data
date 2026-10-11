@@ -8,6 +8,7 @@ import shutil
 import time
 from urllib.parse import parse_qs, urlparse
 
+import artifact_store
 import corpus_pipeline
 import dataset_builder
 import evidence_builder as builder
@@ -351,6 +352,44 @@ def test_mixed_scoped_and_unscoped_pages_are_rejected():
     with pytest.raises(builder.EvidenceInputError, match="do not share one exact query filter scope"):
         builder.activity_evidence_from_pages("CHEMBL151", pages, source_kind="online_snapshot")
 
+
+def test_formal_preflight_and_expand_cli_delegate_without_changing_pilot_trace(monkeypatch, tmp_path, capsys):
+    import formal_corpus
+
+    calls = []
+
+    def fake_preflight(config, entities, output):
+        calls.append(("preflight", config, entities, output))
+        return {"status": "within_budget", "training_ready": False}
+
+    def fake_expand(config, output, *, allow_online=False, resume_from=None):
+        calls.append(("expand", config, output, allow_online, resume_from))
+        return {"status": "candidate_audited_not_ready", "training_ready": False}
+
+    monkeypatch.setattr(formal_corpus, "preflight", fake_preflight)
+    monkeypatch.setattr(formal_corpus, "expand", fake_expand)
+    output = tmp_path / ("a" * 32)
+    assert corpus_pipeline.main(["preflight", "--config", "formal.json", "--entities", "entities.json",
+                                 "--out", str(output)]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "within_budget"
+    resume = tmp_path / ("b" * 32)
+    assert corpus_pipeline.main(["expand", "--config", "formal.json", "--out", str(output),
+                                 "--allow-online", "--resume-from", str(resume)]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "candidate_audited_not_ready"
+    assert calls == [
+        ("preflight", Path("formal.json"), Path("entities.json"), output),
+        ("expand", Path("formal.json"), output, True, resume),
+    ]
+
+
+def test_formal_expand_cli_offline_default_refuses_before_config_or_output(monkeypatch, tmp_path, capsys):
+    output = tmp_path / ("c" * 32)
+    assert corpus_pipeline.main(["expand", "--config", str(tmp_path / "missing.json"),
+                                 "--out", str(output)]) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["status"] == "error" and "offline by default" in error["reason"]
+    assert not output.exists()
+
 def test_per_request_timeout_option_bounds_each_call_without_changing_default(tmp_path):
     molecule = {"molecule_chembl_id": "CHEMBL151", "molecule_structures": {}}
     page = {"page_meta": {"limit": 100, "next": None, "offset": 0,
@@ -383,7 +422,7 @@ def test_per_request_timeout_option_bounds_each_call_without_changing_default(tm
     assert wall_bounded["budgets"]["total_timeout_seconds"] == 0.06
 
 
-def test_v1_1_runtime_split_copy_preflights_and_audits_test_only_without_readiness(tmp_path):
+def test_v1_1_runtime_split_copy_preflights_and_audits_test_only_without_readiness(tmp_path, monkeypatch):
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     chembl = fixture["chembl"]
     ki_row = next(row for page in chembl["activities_by_molecule"]["CHEMBL151"]["pages"]
@@ -419,6 +458,20 @@ def test_v1_1_runtime_split_copy_preflights_and_audits_test_only_without_readine
     assert runtime["policy"]["split"] == json.loads(Path(dataset_builder._POLICY_PATH).read_text(encoding="utf-8"))["split"]
     assert runtime["policy"]["budgets"]["alignment_cells"] == decision["pilot_split_runtime_caps"]["alignment_cells"]
 
+    audit_calls = {"candidate": 0, "manifest": 0}
+    original_candidate_audit = artifact_store._audit_candidate_split
+    original_manifest_audit = artifact_store.audit_split
+
+    def count_candidate_audit(*args, **kwargs):
+        audit_calls["candidate"] += 1
+        return original_candidate_audit(*args, **kwargs)
+
+    def count_manifest_audit(*args, **kwargs):
+        audit_calls["manifest"] += 1
+        return original_manifest_audit(*args, **kwargs)
+
+    monkeypatch.setattr(artifact_store, "_audit_candidate_split", count_candidate_audit)
+    monkeypatch.setattr(artifact_store, "audit_split", count_manifest_audit)
     frozen = dataset_builder.publish_frozen_dataset(
         bundle_path, tmp_path / "test-only-freeze", version_id="pilot-smoke",
         policy_path=runtime_path,
@@ -430,6 +483,7 @@ def test_v1_1_runtime_split_copy_preflights_and_audits_test_only_without_readine
     assert frozen.status == "complete", frozen.to_dict()
     assert frozen.audit_report["status"] == "clean"
     assert frozen.audit_report["training_ready"] is False
+    assert audit_calls == {"candidate": 2, "manifest": 1}
     assert _sha(decision_raw) == _sha(decision_path.read_bytes())
 
 

@@ -1557,9 +1557,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     rebuild.add_argument("--config", required=True, type=Path)
     rebuild.add_argument("--prior-trace-root", required=True, type=Path)
     rebuild.add_argument("--out", required=True, type=Path, help="new absolute GUID directory")
-    for name in ("expand", "freeze"):
-        gated = commands.add_parser(name, help=f"{name} is blocked until Phase 02-03 versions the formal resource budget")
+    preflight = commands.add_parser("preflight", help="offline formal corpus pair/cell/time resource preflight")
+    preflight.add_argument("--config", required=True, type=Path)
+    preflight.add_argument("--entities", required=True, type=Path)
+    preflight.add_argument("--out", required=True, type=Path, help="new absolute GUID directory")
+    expand = commands.add_parser("expand", help="run the pre-registered bounded formal corpus candidate workflow")
+    expand.add_argument("--config", required=True, type=Path)
+    expand.add_argument("--out", required=True, type=Path, help="new absolute GUID directory")
+    expand.add_argument("--allow-online", action="store_true", help="allow the authorized bounded ChEMBL/UniProt requests")
+    expand.add_argument("--resume-from", type=Path, help="continue this same formal budget batch from its latest registered ledger root")
+    for name in ("freeze",):
+        gated = commands.add_parser(name, help=f"{name} is blocked until a formal source scope is captured and audited")
         gated.add_argument("--config", required=True, type=Path)
+        gated.add_argument("--out", required=True, type=Path)
     return parser
 
 
@@ -1584,12 +1594,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "rebuild-v1.2":
             result = rebuild_v1_2_from_real_capture(args.config, args.prior_trace_root, args.out)
             code = 0 if result.get("status") in {"complete", "not_ready"} else 1
+        elif args.command in {"preflight", "expand"}:
+            import formal_corpus
+            if args.command == "preflight":
+                result = formal_corpus.preflight(args.config, args.entities, args.out)
+                code = 0 if result.get("status") == "within_budget" else 1
+            else:
+                result = formal_corpus.expand(args.config, args.out, allow_online=args.allow_online,
+                                              resume_from=args.resume_from)
+                code = 0 if result.get("status") in {
+                    "candidate_audited_not_ready", "selection_window_exhausted", "size_limit"} else 1
         else:
             config, corpus, _selection, _split, _label = _load_run_config(args.config.resolve(strict=True))
             gate = corpus.get("formal_expansion_budget", {})
             if gate.get("status") != "approved" or gate.get("formal_collection_allowed") is not True:
                 raise CorpusPipelineError(f"{args.command} rejected: formal expansion budget is pending")
-            raise CorpusPipelineError(f"{args.command} is not implemented in this pilot plan")
+            raise CorpusPipelineError(f"{args.command} requires the dedicated formal corpus workflow")
     except Exception as exc:
         print(json.dumps({"status": "error", "reason": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2

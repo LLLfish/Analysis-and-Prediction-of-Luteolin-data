@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 
@@ -495,3 +495,90 @@ def test_invalid_policy_number_fails_closed(tmp_path):
 
     with pytest.raises(label_policy.LabelPolicyInputError):
         apply_label_policy(groups, ledger=ledger, policy_path=policy_path, allow_test_only=True)
+
+
+def test_ki_only_policy_is_accepted_and_kd_remains_independent(tmp_path):
+    policy_path = Path(label_policy.__file__).resolve().parent / "configs" / "label_policy_ki_v1.json"
+    policy, digest, _ = label_policy._load_policy(policy_path)
+    assert policy["endpoints"] == {"labeled": ["Ki"], "independent_only": ["Kd", "IC50"]}
+    assert len(digest) == 64
+
+    base = next(row for row in _producer_evidence() if row.activity_id == 700001)
+    ki = _with_measurement(base, 730001, "Ki", "100", "nM")
+    kd = _with_measurement(base, 730002, "Kd", "100", "nM")
+    result = _apply_test_records([ki, kd], tmp_path, policy_path=policy_path)
+
+    assert [(row.label, row.endpoint) for row in result.test_only_labeled_pairs] == [("active", "Ki")]
+    assert any(row.endpoint == "Kd" and "endpoint_not_label_eligible" in row.reasons for row in result.excluded)
+
+
+@pytest.mark.parametrize("endpoints", [
+    {"labeled": [], "independent_only": ["Ki", "Kd", "IC50"]},
+    {"labeled": ["Ki", "Ki"], "independent_only": ["Kd", "IC50"]},
+    {"labeled": ["Ki", "Kd"], "independent_only": ["Kd", "IC50"]},
+    {"labeled": ["Ki"], "independent_only": ["IC50"]},
+    {"labeled": ["Ki", "bad"], "independent_only": ["Kd", "IC50"]},
+    {"labeled": ["Ki"], "independent_only": ["Kd", "IC50", "IC50"]},
+])
+def test_endpoint_policy_requires_nonempty_unique_disjoint_complete_partition(tmp_path, endpoints):
+    policy_path = _test_policy(tmp_path)
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    policy["endpoints"] = endpoints
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+    with pytest.raises(label_policy.LabelPolicyInputError):
+        label_policy._load_policy(policy_path)
+
+
+def test_pair_identity_derives_omitted_component_species_from_human_parent_without_mutation():
+    record = asdict(_producer_evidence()[0])
+    component = record["target_components"][0]
+    for field in ("organism", "tax_id", "taxonomy_id", "target_taxonomy_id"):
+        component.pop(field, None)
+    before = copy.deepcopy(record)
+    identity, disposition, _reason = label_policy._pair_identity(record)
+    assert disposition == "retained"
+    assert identity == (record["molecule_chembl_id"], 9606, component["accession"])
+    assert record == before
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("organism", "Mus musculus", "component_species_not_human"),
+    ("tax_id", 10090, "component_taxonomy_mismatch"),
+])
+def test_parent_species_never_overrides_explicit_component_conflicts(field, value, reason):
+    record = asdict(_producer_evidence()[0])
+    record["target_components"][0][field] = value
+    before = copy.deepcopy(record)
+    identity, disposition, actual_reason = label_policy._pair_identity(record)
+    assert identity is None
+    assert (disposition, actual_reason) == ("excluded", reason)
+    assert record == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("component_organism", "Mus musculus"),
+    ("organism_scientific", "Mus musculus"),
+    ("scientific_name", "Mus musculus"),
+    ("component_tax_id", 10090),
+    ("component_tax_id", None),
+])
+def test_component_alias_conflicts_cannot_be_hidden_by_parent_species(field, value):
+    record = asdict(_producer_evidence()[0])
+    component = record["target_components"][0]
+    for key in ("organism", "tax_id", "taxonomy_id", "target_taxonomy_id"):
+        component.pop(key, None)
+    component[field] = value
+    before = copy.deepcopy(record)
+    identity, disposition, _reason = label_policy._pair_identity(record)
+    assert identity is None
+    assert disposition == "excluded"
+    assert record == before
+
+
+def test_disagreeing_primary_and_alias_component_species_are_rejected():
+    record = asdict(_producer_evidence()[0])
+    record["target_components"][0]["component_organism"] = "Mus musculus"
+    identity, disposition, reason = label_policy._pair_identity(record)
+    assert identity is None
+    assert (disposition, reason) == ("excluded", "conflicting_component_organism")

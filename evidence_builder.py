@@ -1101,6 +1101,40 @@ def activity_evidence_from_pages(
         all_rows.extend(rows)
         expected_offset += len(rows)
     pagination_status = _page_chain_status(copied_pages, len(all_rows))
+    page_scopes = [_normalize_activity_filters(page.get("query_scope") or None) for page in copied_pages]
+    if page_scopes and any(scope != page_scopes[0] for scope in page_scopes[1:]):
+        raise EvidenceInputError("activity pages do not share one exact query filter scope")
+    query_filters = page_scopes[0] if page_scopes else {}
+    if not query_filters and any(
+        _has_activity_scope_markers(page.get("source_url"))
+        or _has_activity_scope_markers(page.get("page_meta", {}).get("next"))
+        for page in copied_pages
+    ):
+        pagination_status = "incomplete"
+    if query_filters:
+        for page_obj, rows, _response_hash in page_rows:
+            meta = page_obj["page_meta"]
+            try:
+                _validate_activity_request_scope(
+                    page_obj.get("source_url"), molecule_id=molecule_chembl_id,
+                    filters=query_filters, offset=meta.get("offset"), limit=meta.get("limit", 100),
+                )
+            except EvidenceInputError:
+                pagination_status = "incomplete"
+            if any(not _activity_row_matches_filters(row, query_filters) for row in rows):
+                pagination_status = "incomplete"
+            next_value = meta.get("next")
+            if next_value is not None:
+                expected_next_offset = meta.get("offset") + len(rows)
+                try:
+                    absolute_next = _validate_chembl_next(next_value, page_obj.get("source_url"))
+                    _validate_activity_request_scope(
+                        absolute_next, molecule_id=molecule_chembl_id,
+                        filters=query_filters, offset=expected_next_offset,
+                        limit=meta.get("limit", 100),
+                    )
+                except EvidenceInputError:
+                    pagination_status = "incomplete"
 
     evidence: list[ActivityEvidence] = []
     for index, (page_obj, rows, response_hash) in enumerate(page_rows):
@@ -1173,6 +1207,8 @@ def activity_evidence_from_pages(
                 "limit": page_meta.get("limit"),
                 "offset": page_meta.get("offset"),
             }
+            if query_filters:
+                query["filters"] = deepcopy(query_filters)
             evidence.append(ActivityEvidence(
                 schema_version=ACTIVITY_SCHEMA_VERSION,
                 source_id="chembl_activity",
@@ -1838,13 +1874,42 @@ def _verify_activity_source_semantics(
             raise EvidenceInputError(f"activity {activity.get('activity_id')} raw row differs from its source page")
         if activity.get("page_status") != "complete":
             raise EvidenceInputError(f"activity {activity.get('activity_id')} page status differs from source page")
+        query_filters = _normalize_activity_filters(query.get("filters") if isinstance(query, Mapping) and "filters" in query else None)
         expected_query = {
             "molecule_chembl_id": query_molecule_id,
             "limit": metadata.get("limit"),
             "offset": metadata.get("offset"),
         }
+        if query_filters:
+            expected_query["filters"] = query_filters
         if not _same_json_value(query, expected_query):
             raise EvidenceInputError(f"activity {activity.get('activity_id')} query metadata differs from source page")
+        page_request_url = activity.get("source_url")
+        receipt_request_url = receipt.get("source_url")
+        query_scope_marker = (
+            _has_activity_scope_markers(page_request_url)
+            or _has_activity_scope_markers(receipt_request_url)
+            or _has_activity_scope_markers(metadata.get("next"))
+        )
+        if not query_filters and query_scope_marker:
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} query scope marker is missing from query metadata")
+        if (receipt_request_url is not None and page_request_url != receipt_request_url):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} source URL differs from its raw receipt")
+        if query_filters and not _same_json_value(page_request_url, receipt_request_url):
+            raise EvidenceInputError(f"activity {activity.get('activity_id')} scoped request URL differs from its receipt")
+        if query_filters:
+            _validate_activity_request_scope(
+                activity.get("source_url"), molecule_id=query_molecule_id,
+                filters=query_filters, offset=metadata.get("offset"), limit=metadata.get("limit", 100),
+            )
+            if any(not _activity_row_matches_filters(row, query_filters) for row in raw_rows):
+                raise EvidenceInputError(f"activity {activity.get('activity_id')} raw page contains an out-of-scope row")
+            if metadata.get("next") is not None:
+                next_url = _validate_chembl_next(metadata.get("next"), activity.get("source_url"))
+                _validate_activity_request_scope(
+                    next_url, molecule_id=query_molecule_id, filters=query_filters,
+                    offset=metadata.get("offset") + len(raw_rows), limit=metadata.get("limit", 100),
+                )
         if activity.get("page_offset") != metadata.get("offset") or activity.get("pagination_next") != metadata.get("next"):
             raise EvidenceInputError(f"activity {activity.get('activity_id')} pagination metadata differs from source page")
         raw_activity = activity.get("raw_activity_record")
@@ -2576,6 +2641,56 @@ def ingest_local_manifest(
         raise
 
 
+def _has_activity_scope_markers(url: Any) -> bool:
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        query = parse_qs(urlparse(url).query, keep_blank_values=True)
+    except (TypeError, ValueError):
+        return False
+    return "standard_type" in query or "target_organism" in query or "target_chembl_id__in" in query
+
+
+def _normalize_activity_filters(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or not {"standard_type", "target_organism"}.issubset(value) or set(value) - {"standard_type", "target_organism", "target_chembl_id__in"}:
+        raise EvidenceInputError("activity_filters must be the reviewed Ki and human-organism scope, optionally with target IDs")
+    if value.get("standard_type") != "Ki" or value.get("target_organism") != "Homo sapiens":
+        raise EvidenceInputError("only standard_type=Ki and target_organism=Homo sapiens are supported for scoped capture")
+    normalized: dict[str, Any] = {"standard_type": "Ki", "target_organism": "Homo sapiens"}
+    if "target_chembl_id__in" in value:
+        targets = value["target_chembl_id__in"]
+        if (not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)) or not targets
+                or any(not isinstance(target, str) or not re.fullmatch(r"CHEMBL[0-9]+", target) for target in targets)
+                or list(targets) != sorted(set(targets))):
+            raise EvidenceInputError("target_chembl_id__in must be a sorted unique non-empty list of native target IDs")
+        normalized["target_chembl_id__in"] = list(targets)
+    return normalized
+
+
+def _activity_row_matches_filters(row: Mapping[str, Any], filters: Mapping[str, Any]) -> bool:
+    return all(
+        row.get("target_chembl_id") in expected if key == "target_chembl_id__in" else row.get(key) == expected
+        for key, expected in filters.items()
+    )
+
+
+def _validate_activity_request_scope(
+    url: Any, *, molecule_id: str, filters: Mapping[str, Any], offset: int, limit: int = 100,
+) -> str:
+    absolute = _validate_chembl_next(url, f"{CHEMBL_API_ROOT}/activity.json")
+    if absolute is None:
+        raise EvidenceInputError("activity request URL must not be null")
+    parsed = urlparse(absolute)
+    query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    expected_filters = {key: (",".join(value) if key == "target_chembl_id__in" else value) for key, value in filters.items()}
+    expected = {"molecule_chembl_id": molecule_id, "limit": str(limit), "offset": str(offset), **expected_filters}
+    if set(query) != set(expected) or any(query.get(key) != [value] for key, value in expected.items()):
+        raise EvidenceInputError("activity request URL does not preserve the exact molecule, page, and filter scope")
+    return absolute
+
+
 def _validate_chembl_next(next_url: Any, current_url: str) -> Optional[str]:
     if next_url is None:
         return None
@@ -2688,6 +2803,9 @@ def _collect_chembl(
     max_response_bytes: int,
     http_get: Optional[Callable[..., Any]] = None,
     interruption: Optional[Callable[[], bool]] = None,
+    per_request_timeout: bool = False,
+    total_timeout_seconds: Optional[float] = None,
+    activity_filters: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     if not isinstance(molecule_ids, Sequence) or isinstance(molecule_ids, (str, bytes)) or not molecule_ids:
         raise ValueError("molecule_ids must be a non-empty sequence")
@@ -2697,13 +2815,25 @@ def _collect_chembl(
             raise ValueError(f"invalid ChEMBL molecule id: {value!r}")
         if value not in unique_ids:
             unique_ids.append(value)
+    filters = _normalize_activity_filters(activity_filters)
     max_pages = _validate_budget("max_pages", max_pages)
     max_records = _validate_budget("max_records", max_records)
     max_requests = _validate_budget("max_requests", max_requests)
     max_response_bytes = _validate_budget("max_response_bytes", max_response_bytes)
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
         raise ValueError("timeout must be a positive number of seconds")
-    deadline = time.monotonic() + float(timeout)
+    if type(per_request_timeout) is not bool:
+        raise ValueError("per_request_timeout must be bool")
+    if total_timeout_seconds is not None:
+        if (not per_request_timeout or not isinstance(total_timeout_seconds, (int, float))
+                or isinstance(total_timeout_seconds, bool) or total_timeout_seconds <= 0):
+            raise ValueError("total_timeout_seconds requires per_request_timeout=True and a positive value")
+    deadline = (
+        time.monotonic() + float(total_timeout_seconds)
+        if per_request_timeout and total_timeout_seconds is not None
+        else float("inf") if per_request_timeout
+        else time.monotonic() + float(timeout)
+    )
     request_count = 0
     page_count = 0
     activity_count = 0
@@ -2721,11 +2851,21 @@ def _collect_chembl(
         nonlocal request_count
         if interruption is not None and interruption():
             raise BoundedFetchError("interrupted")
-        if time.monotonic() >= deadline:
+        if not per_request_timeout and time.monotonic() >= deadline:
             raise BoundedFetchError("timeout budget exhausted")
         if request_count >= max_requests:
             raise BoundedFetchError("max_requests reached")
         request_count += 1
+        if per_request_timeout:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BoundedFetchError("total timeout budget exhausted")
+            request_timeout = min(float(timeout), remaining)
+            request_deadline = None if deadline == float("inf") else min(deadline, time.monotonic() + request_timeout)
+            return _bounded_get_json(
+                url, timeout=request_timeout, max_response_bytes=max_response_bytes,
+                http_get=http_get, deadline=request_deadline,
+            )
         remaining = deadline - time.monotonic()
         return _bounded_get_json(
             url,
@@ -2757,7 +2897,14 @@ def _collect_chembl(
             page_statuses[molecule_id] = "incomplete"
             continue
 
-        next_url: Optional[str] = f"{CHEMBL_API_ROOT}/activity.json?{urlencode({'molecule_chembl_id': molecule_id, 'limit': 100, 'offset': 0})}"
+        activity_query = {
+            "molecule_chembl_id": molecule_id,
+            **{key: (",".join(value) if key == "target_chembl_id__in" else value) for key, value in filters.items()},
+            "limit": 100, "offset": 0,
+        }
+        next_url: Optional[str] = f"{CHEMBL_API_ROOT}/activity.json?{urlencode(activity_query)}"
+        if filters:
+            next_url = _validate_activity_request_scope(next_url, molecule_id=molecule_id, filters=filters, offset=0)
         expected_offset = 0
         local_pages: list[dict[str, Any]] = []
         local_row_count = 0
@@ -2769,11 +2916,21 @@ def _collect_chembl(
             try:
                 payload, body, response_hash = request(next_url)
                 normalized_page, rows, advertised_next = _validate_activity_page(payload, expected_offset)
+                scope_mismatch = False
                 for row in rows:
                     if row.get("molecule_chembl_id") != molecule_id:
                         reason = f"activity:{row.get('activity_id')}:molecule_identity_mismatch"
                         metadata_failures.append(reason)
                         incomplete_reasons.append(reason)
+                    for field_name, expected_value in filters.items():
+                        valid = row.get("target_chembl_id") in expected_value if field_name == "target_chembl_id__in" else row.get(field_name) == expected_value
+                        if not valid:
+                            reason = f"activity:{row.get('activity_id')}:activity_filter_mismatch:{field_name}"
+                            metadata_failures.append(reason)
+                            incomplete_reasons.append(reason)
+                            scope_mismatch = True
+                if scope_mismatch:
+                    page_statuses[molecule_id] = "incomplete"
                 request_counted = len(rows)
                 remaining_records = max_records - activity_count
                 if remaining_records <= 0:
@@ -2792,6 +2949,7 @@ def _collect_chembl(
                     "molecule_chembl_id": molecule_id,
                     "source_kind": "online_snapshot",
                     "source_url": next_url,
+                    "query_scope": deepcopy(filters),
                     "response_sha256": response_hash,
                     "page_meta": deepcopy(normalized_page["page_meta"]),
                     "activities": deepcopy(rows[:remaining_records]),
@@ -2817,6 +2975,10 @@ def _collect_chembl(
                 else:
                     try:
                         next_url = _validate_chembl_next(advertised_next, next_url)
+                        if filters:
+                            next_url = _validate_activity_request_scope(
+                                next_url, molecule_id=molecule_id, filters=filters, offset=expected_offset,
+                            )
                     except EvidenceInputError as exc:
                         incomplete_reasons.append(f"invalid next URL for {molecule_id}: {exc}")
                         page_statuses[molecule_id] = "incomplete"
@@ -2947,6 +3109,7 @@ def _collect_chembl(
         "source_kind": "online_snapshot",
         "source_version": None,
         "molecule_ids": unique_ids,
+        "activity_filters": deepcopy(filters),
         "molecule_records": molecule_records,
         "target_records": target_records,
         "assay_records": assay_records,
@@ -2966,6 +3129,8 @@ def _collect_chembl(
             "max_requests": max_requests,
             "max_response_bytes": max_response_bytes,
             "timeout_seconds": float(timeout),
+            "per_request_timeout": per_request_timeout,
+            "total_timeout_seconds": total_timeout_seconds,
         },
     }
 
@@ -2994,6 +3159,7 @@ def _persist_fetch_result(result: Mapping[str, Any], root: Path) -> tuple[list[A
             "source_kind": "online_snapshot",
             "source_path": saved_path,
             "raw_sha256": saved_hash,
+            "source_url": page.get("source_url"),
         }
         provenance.append(source)
         evidence_receipts.append({
@@ -3001,6 +3167,7 @@ def _persist_fetch_result(result: Mapping[str, Any], root: Path) -> tuple[list[A
             "source_path": saved_path,
             "source_sha256": saved_hash,
             "response_sha256": page.get("response_sha256") or _sha256_bytes(content),
+            "source_url": page.get("source_url"),
         })
         raw_pages.append({**deepcopy(dict(page)), "_molecule_id": molecule_id})
     for receipt in result.get("page_receipts", []):
@@ -3037,6 +3204,7 @@ def _persist_fetch_result(result: Mapping[str, Any], root: Path) -> tuple[list[A
             "activities": deepcopy(page.get("activities", [])),
             "raw_response": deepcopy(source_page),
             "source_url": page.get("source_url"),
+            "query_scope": deepcopy(page.get("query_scope") or {}),
         }
         pages_by_molecule.setdefault(molecule_id, []).append({
             **page_obj,
@@ -3071,6 +3239,10 @@ def _persist_fetch_result(result: Mapping[str, Any], root: Path) -> tuple[list[A
 def _entities_from_chembl_capture(
     result: Mapping[str, Any],
     provenance: Sequence[Mapping[str, Any]],
+    *,
+    uniprot_root: Optional[Path] = None,
+    uniprot_budget: Optional[dict[str, int]] = None,
+    uniprot_http_get: Optional[Callable[..., Any]] = None,
 ) -> tuple[list[MoleculeRecord], list[ProteinRecord], list[dict[str, Any]]]:
     source_by_id = {
         item.get("source_id"): item
@@ -3131,17 +3303,64 @@ def _entities_from_chembl_capture(
 
     proteins: list[ProteinRecord] = []
     for (taxonomy_id, accession), references in sorted(component_refs.items()):
-        protein = hydrate_protein_record(references[0], source_kind="online_snapshot")
+        if uniprot_budget is not None and uniprot_root is not None:
+            remaining_requests = uniprot_budget["max_requests"] - uniprot_budget["request_count"]
+            remaining_bytes = uniprot_budget["max_total_bytes"] - uniprot_budget["response_bytes"]
+            wall_deadline = uniprot_budget.get("wall_deadline")
+            remaining_wall = None if wall_deadline is None else wall_deadline - time.monotonic()
+            if remaining_requests < 1:
+                protein = _uniprot_source_error_record(
+                    references[0], source_kind="online_snapshot", sequence_status="missing",
+                    reason="uniprot_request_budget_exhausted",
+                )
+            elif remaining_bytes < 1:
+                protein = _uniprot_source_error_record(
+                    references[0], source_kind="online_snapshot", sequence_status="missing",
+                    reason="uniprot_total_response_byte_budget_exhausted",
+                )
+            elif remaining_wall is not None and remaining_wall <= 0:
+                protein = _uniprot_source_error_record(
+                    references[0], source_kind="online_snapshot", sequence_status="missing",
+                    reason="pilot_wall_budget_exhausted",
+                )
+            else:
+                protein_root = uniprot_root / accession
+                uniprot_budget["request_count"] += 1
+                request_timeout = min(uniprot_budget["timeout"], remaining_wall) if remaining_wall is not None else uniprot_budget["timeout"]
+                protein = hydrate_protein_record(
+                    references[0], source_kind="online_snapshot", online=True,
+                    output_root=protein_root,
+                    timeout=request_timeout, max_requests=1,
+                    max_response_bytes=min(uniprot_budget["max_response_bytes"], remaining_bytes),
+                    http_get=uniprot_http_get,
+                )
+                for source in protein.source_provenance:
+                    raw_path = _safe_relative_file(protein_root, source.get("source_path"))
+                    raw_bytes = raw_path.read_bytes()
+                    if _sha256_bytes(raw_bytes) != source.get("raw_sha256"):
+                        raise EvidenceInputError("hydrated UniProt raw bytes failed source hash verification")
+                    uniprot_budget["response_bytes"] += len(raw_bytes)
+                    saved_path, saved_hash = _write_raw_bytes(
+                        uniprot_root.parent, source["source_path"], raw_bytes,
+                    )
+                    if saved_hash != source["raw_sha256"]:
+                        raise EvidenceInputError("copied UniProt raw bytes changed during staging")
+                    provenance.append({**dict(source), "source_path": saved_path})
+        else:
+            protein = hydrate_protein_record(references[0], source_kind="online_snapshot")
         protein = replace(protein, component_evidence={
             "references": [
                 {
                     "target_chembl_id": reference.get("target_chembl_id"),
-                    "target_record_sha256": reference.get("target_record_sha256"),
-                    "target_record_source": deepcopy(reference.get("target_record_source")),
+                    "target_type": reference.get("target_type"),
+                    "organism": reference.get("organism"),
                     "taxonomy_id": taxonomy_id,
+                    "taxonomy_evidence_path": reference.get("taxonomy_evidence_path"),
                     "accession": accession,
                     "component_index": reference.get("component_index"),
                     "component": deepcopy(reference.get("component")),
+                    "target_record_sha256": reference.get("target_record_sha256"),
+                    "target_record_source": deepcopy(reference.get("target_record_source")),
                 }
                 for reference in references
             ]
@@ -3162,8 +3381,19 @@ def fetch_chembl_bounded(
     max_response_bytes: int = 8_000_000,
     http_get: Optional[Callable[..., Any]] = None,
     interruption: Optional[Callable[[], bool]] = None,
+    per_request_timeout: bool = False,
+    total_timeout_seconds: Optional[float] = None,
+    activity_filters: Optional[Mapping[str, Any]] = None,
+    hydrate_uniprot: bool = False,
+    max_uniprot_requests: int = 64,
+    uniprot_max_response_bytes: int = 8_000_000,
+    uniprot_total_response_bytes: int = 67_108_864,
 ) -> dict[str, Any]:
     """Fetch a bounded, multi-molecule ChEMBL evidence set into a new root."""
+    attempt_deadline = (
+        time.monotonic() + float(total_timeout_seconds)
+        if per_request_timeout and total_timeout_seconds is not None else None
+    )
     root = _create_output_root(output_dir)
     result = _collect_chembl(
         molecule_ids,
@@ -3174,10 +3404,36 @@ def fetch_chembl_bounded(
         max_response_bytes=max_response_bytes,
         http_get=http_get,
         interruption=interruption,
+        per_request_timeout=per_request_timeout,
+        total_timeout_seconds=total_timeout_seconds,
+        activity_filters=activity_filters,
     )
     activities, provenance = _persist_fetch_result(result, root)
+    uniprot_budget = None
+    if hydrate_uniprot:
+        uniprot_budget = {
+            "max_requests": _validate_budget("max_uniprot_requests", max_uniprot_requests),
+            "request_count": 0,
+            "max_response_bytes": _validate_budget("uniprot_max_response_bytes", uniprot_max_response_bytes),
+            "max_total_bytes": _validate_budget("uniprot_total_response_bytes", uniprot_total_response_bytes),
+            "response_bytes": 0,
+            "timeout": timeout,
+            "wall_deadline": attempt_deadline,
+        }
     if result["pagination_status"] == "complete" and result.get("metadata_status") == "complete":
-        molecules, proteins, exclusions = _entities_from_chembl_capture(result, provenance)
+        molecules, proteins, exclusions = _entities_from_chembl_capture(
+            result, provenance,
+            uniprot_root=(root / "uniprot-fetch") if hydrate_uniprot else None,
+            uniprot_budget=uniprot_budget,
+            uniprot_http_get=http_get,
+        )
+        if uniprot_budget is not None:
+            result["uniprot_budget"] = {
+                "requests": uniprot_budget["request_count"],
+                "response_bytes": uniprot_budget["response_bytes"],
+                "max_requests": uniprot_budget["max_requests"],
+                "max_total_response_bytes": uniprot_budget["max_total_bytes"],
+            }
         bundle = write_entity_bundle(
             root, activities=activities, source_provenance=provenance,
             molecules=molecules,
@@ -3227,6 +3483,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--timeout", type=float, default=30)
     fetch.add_argument("--max-requests", type=int, default=128)
     fetch.add_argument("--max-response-bytes", type=int, default=8_000_000)
+    fetch.add_argument("--ki-human-scope", action="store_true", help="capture only Ki rows for Homo sapiens, with scoped pagination verification")
     verify = subparsers.add_parser("verify-bundle", help="verify entity bundle hash and raw source files")
     verify.add_argument("bundle", type=Path)
     return parser
@@ -3246,6 +3503,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 timeout=args.timeout,
                 max_requests=args.max_requests,
                 max_response_bytes=args.max_response_bytes,
+                activity_filters=(
+                    {"standard_type": "Ki", "target_organism": "Homo sapiens"}
+                    if args.ki_human_scope else None
+                ),
             )
         elif args.command == "verify-bundle":
             bundle = load_entity_bundle(args.bundle)

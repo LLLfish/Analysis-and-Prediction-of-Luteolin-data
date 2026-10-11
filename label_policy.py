@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Optional
 
-from evidence_builder import ActivityEvidence, load_entity_bundle
+from evidence_builder import ActivityEvidence, load_entity_bundle, resolve_target_components
 
 
 _ACCESSION = re.compile(r"^[A-Z0-9]{6}(?:[A-Z0-9]{4})?$")
@@ -240,6 +240,16 @@ def _pair_identity(record: Mapping[str, Any]) -> tuple[
     component = components[0]
     if not isinstance(component, Mapping):
         return None, "unverified", "invalid_target_component"
+    component = dict(component)
+    # ChEMBL stores species and taxonomy on the parent target. Derive absent
+    # component facts for eligibility while preserving the raw component as-is
+    # for _linked_metadata_error's exact source snapshot comparison.
+    if component.get("organism") is None:
+        component["organism"] = organism
+    if taxonomy is not None:
+        for tax_key in ("tax_id", "taxonomy_id", "target_taxonomy_id"):
+            if component.get(tax_key) is None:
+                component[tax_key] = taxonomy
     if component.get("component_type") != "PROTEIN":
         return None, "excluded", "component_type_not_protein"
     if component.get("organism") != "Homo sapiens":
@@ -254,6 +264,27 @@ def _pair_identity(record: Mapping[str, Any]) -> tuple[
     accession = component.get("accession")
     if not isinstance(accession, str) or not _ACCESSION.fullmatch(accession):
         return None, "unverified", "missing_or_invalid_protein_accession"
+
+    # Use the producer's canonical identity resolver for every species/taxonomy
+    # alias, so an omitted primary field cannot hide an explicit conflicting alias.
+    native_target = record.get("target_record")
+    resolution_target = dict(native_target) if isinstance(native_target, Mapping) else {}
+    for key, value in (("target_chembl_id", target_id), ("target_type", record["target_type"]),
+                       ("organism", organism), ("tax_id", taxonomy)):
+        resolution_target.setdefault(key, value)
+    resolution_target["target_components"] = components
+    try:
+        resolved = resolve_target_components(
+            resolution_target, source_kind=record.get("source_kind", "legacy_unverified"),
+        )
+    except (TypeError, ValueError):
+        return None, "unverified", "invalid_target_component_evidence"
+    if len(resolved) != 1 or resolved[0].get("resolution_status") != "verified":
+        failed = resolved[0] if resolved else {}
+        disposition = "excluded" if failed.get("resolution_status") == "excluded" else "unverified"
+        return None, disposition, failed.get("reason_code") or "unresolved_target_component"
+    if resolved[0].get("accession") != accession or resolved[0].get("taxonomy_id") != taxonomy:
+        return None, "excluded", "component_identity_mismatch"
 
     raw = record.get("raw_activity_record")
     if not isinstance(raw, Mapping):
@@ -529,9 +560,24 @@ def _load_policy(policy_path: Any = None) -> tuple[dict[str, Any], str, dict[str
     if (not isinstance(policy["entity_eligibility"], dict)
             or _json_text(policy["entity_eligibility"]) != _json_text(_ENTITY_POLICY)):
         raise LabelPolicyInputError("policy entity eligibility must remain human SINGLE PROTEIN")
-    if (not isinstance(policy["endpoints"], dict)
-            or _json_text(policy["endpoints"]) != _json_text(_ENDPOINT_POLICY)):
-        raise LabelPolicyInputError("only Ki/Kd are labeled and IC50 stays independent")
+    endpoints = policy["endpoints"]
+    if not isinstance(endpoints, dict) or set(endpoints) != {"labeled", "independent_only"}:
+        raise LabelPolicyInputError("endpoint policy requires labeled and independent_only lists")
+    labeled = endpoints.get("labeled")
+    independent = endpoints.get("independent_only")
+    allowed = {"Ki", "Kd", "IC50"}
+    if (not isinstance(labeled, list) or not labeled
+            or any(not isinstance(item, str) for item in labeled)
+            or len(labeled) != len(set(labeled))
+            or not set(labeled) <= {"Ki", "Kd"}):
+        raise LabelPolicyInputError("labeled endpoints must be a non-empty unique Ki/Kd subset")
+    if (not isinstance(independent, list) or not independent
+            or any(not isinstance(item, str) for item in independent)
+            or len(independent) != len(set(independent))
+            or "IC50" not in independent):
+        raise LabelPolicyInputError("independent_only must uniquely include IC50 and unlabeled endpoints")
+    if set(labeled) & set(independent) or set(labeled) | set(independent) != allowed:
+        raise LabelPolicyInputError("labeled and independent endpoints must be disjoint and cover Ki/Kd/IC50")
     if policy["exact_relation"] != "=":
         raise LabelPolicyInputError("only exact relation '=' is supported")
     if type(policy["minimum_confidence"]) is not int or policy["minimum_confidence"] != 8:

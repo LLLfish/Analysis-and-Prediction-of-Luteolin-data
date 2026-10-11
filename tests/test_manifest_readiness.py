@@ -331,8 +331,10 @@ def test_source_readiness_receipt_frozen_writer_copies_exact_entities_and_all_ra
     assert (frozen_root / manifest["entities"]["path"]).read_bytes() == bundle_path.read_bytes()
     code_state = manifest["code_version_control"]
     head = subprocess.run(["git", "-C", str(APL_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    branch = subprocess.run(["git", "-C", str(APL_ROOT), "branch", "--show-current"], capture_output=True, text=True, check=True).stdout.strip()
     assert code_state["status"] == "git"
-    assert code_state["branch"] == "codex/p0-data-foundation"
+    assert branch
+    assert code_state["branch"] == branch
     assert code_state["commit"] == head
     assert code_state["dirty"] is True
     assert "output_dashboard.html" in code_state["dirty_paths"]

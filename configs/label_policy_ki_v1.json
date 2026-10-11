@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "policy_version": "chembl-human-single-protein-ki-v1",
+  "entity_bundle_schema_version": 2,
+  "confirmed_source_kinds": [
+    "online_snapshot"
+  ],
+  "test_only_source_kinds": [
+    "synthetic_test"
+  ],
+  "entity_eligibility": {
+    "target_type": "SINGLE PROTEIN",
+    "organism": "Homo sapiens",
+    "taxonomy_id": 9606,
+    "component_type": "PROTEIN",
+    "component_count": 1,
+    "accession_pattern": "^[A-Z0-9]{6}(?:[A-Z0-9]{4})?$"
+  },
+  "endpoints": {
+    "labeled": [
+      "Ki"
+    ],
+    "independent_only": [
+      "Kd",
+      "IC50"
+    ]
+  },
+  "exact_relation": "=",
+  "minimum_confidence": 8,
+  "units_to_nanomolar": {
+    "pM": "0.001",
+    "nM": "1",
+    "uM": "1000",
+    "µM": "1000",
+    "μM": "1000",
+    "mM": "1000000",
+    "M": "1000000000"
+  },
+  "thresholds": {
+    "active_min_p": 6,
+    "inactive_max_p": 5
+  },
+  "assay_compatibility_fields": [
+    "assay_type",
+    "assay_category",
+    "assay_test_type",
+    "assay_organism",
+    "assay_tax_id",
+    "assay_cell_type",
+    "assay_subcellular_fraction",
+    "bao_format",
+    "bao_label"
+  ]
+}

@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "protocol_version": "corpus-v1",
+  "status": "pre_registered_not_ready_for_formal_collection",
+  "task": {
+    "name": "human-single-protein-Ki",
+    "taxonomy_id": 9606,
+    "organism": "Homo sapiens",
+    "target_type": "SINGLE PROTEIN",
+    "primary_endpoint": "Ki",
+    "independent_endpoints": [
+      "Kd",
+      "IC50"
+    ]
+  },
+  "molecule_selection": {
+    "selection_status": "pending_verified_selection",
+    "selected_molecule_chembl_ids": [],
+    "selection_rule": "Select only source-verified ChEMBL molecule records under a documented cutoff and version; resolve and record every real ChEMBL ID before trace. Empty selection must be rejected by trace/expand entry points.",
+    "luteolin_case": {
+      "role": "proposed_unseen_case",
+      "chembl_id": null,
+      "identity_status": "unverified_pending_source_lookup",
+      "holdout_rule": "If selected as an unseen case, exclude its identity, Murcko scaffold, and all connected near-neighbor molecule clusters from development/training; do not inspect holdout labels for protocol choices."
+    }
+  },
+  "source_boundary": {
+    "source": "ChEMBL",
+    "source_kind_allowlist": [
+      "online_snapshot"
+    ],
+    "forbidden_source_kinds": [
+      "synthetic_test",
+      "legacy_unverified",
+      "static_reference"
+    ],
+    "source_release_or_snapshot": "pending_capture_before_trace",
+    "activity_cutoff_utc": "pending_registration_before_trace",
+    "must_record_before_trace": true,
+    "trace_rejects_pending_or_missing_boundary": true
+  },
+  "label_policy": {
+    "path": "configs/label_policy_ki_v1.json",
+    "path_base": "APL repository root",
+    "sha256": "652fce6f62ffff3b827986cbfa790f2b07939790b30c93c5c8fdb3947449cf66",
+    "loader_compatibility": "Current P0 label_policy.py validator is fixed to Ki/Kd and does not support this Ki-only copy; Phase 02-02 must implement strict non-empty Ki/Kd subset validation, mutually exclusive complete endpoint coverage, and preserve the default policy before this copy can be consumed."
+  },
+  "support_policy": {
+    "path": "configs/support_v1.json",
+    "path_base": "APL repository root",
+    "sha256": "24d1841325800fda8d00ecf5106b5ce1126d52f960f2f69d552e04c452b5f1b3",
+    "purpose": "minimal_baseline_attempt",
+    "formal_readiness_requires": "all configured per-split class and cluster minima; otherwise blocked"
+  },
+  "split_policy": {
+    "path": "policies/split_policy.json",
+    "sha256": "7b390e73aa8392bfb0bb53a771b4d938385e34dadc7db86162dfca542bf65fde",
+    "molecule_similarity_threshold": 0.8,
+    "protein_identity_threshold": 0.3,
+    "protein_coverage_threshold": 0.8,
+    "connected_components": "undirected transitive connected components",
+    "split_names": [
+      "train",
+      "val",
+      "test"
+    ],
+    "ratios": {
+      "train": 0.8,
+      "val": 0.1,
+      "test": 0.1
+    },
+    "seed": 42,
+    "selection_rule": "Freeze source, molecule IDs, endpoint, thresholds, seed, holdout identities, and support rules before examining validation/test labels or outcomes; never retune from holdout results."
+  },
+  "pilot": {
+    "status": "bounded_pilot_only",
+    "pilot_data_role": "development_only",
+    "default_included_in_formal_holdout": false,
+    "whole_batch_caps": {
+      "molecules": 10,
+      "chembl_pages": 10,
+      "activity_rows": 1000,
+      "chembl_requests": 128,
+      "request_timeout_seconds": 30,
+      "max_response_bytes": 8388608,
+      "uniprot_requests_total": 64,
+      "uniprot_max_response_bytes": 8388608,
+      "uniprot_total_response_bytes": 67108864
+    },
+    "budget_accounting": "Cumulative across the entire pilot batch; UniProt caps are separately cumulative across the batch."
+  },
+  "formal_expansion_budget": {
+    "status": "pending_resource_trial_in_phase_02_03",
+    "caps": null,
+    "formal_collection_allowed": false,
+    "gate": "Any expand/freeze entry point must reject while status is pending; Phase 02-03 records resource trial evidence and creates a new explicitly versioned budget decision before formal expansion."
+  },
+  "sequence_policy": {
+    "require_source_verified_full_sequence": true,
+    "bind_taxonomy_accession_sequence_hash_and_source_receipts": true,
+    "maximum_length_policy": "pending_phase_02_03_resource_trial_before_freeze",
+    "truncate_overlength_sequences": false,
+    "on_missing_or_overlength": "unsupported_or_blocked_with_reason; never silently truncate or mark ready"
+  },
+  "model_policy": {
+    "allow_model_download": false,
+    "real_local_esm_readiness": "separate_phase_02_04_acceptance_required"
+  },
+  "entry_gates": {
+    "reject_empty_real_molecule_id_list": true,
+    "reject_unverified_or_pending_source_boundary": true,
+    "reject_test_only_or_legacy_sources": true,
+    "reject_pending_formal_expansion_budget": true,
+    "reject_unbound_or_incomplete_label_policy": true,
+    "holdout_labels_unavailable_for_selection_or_tuning": true
+  }
+}

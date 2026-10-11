@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "support_version": "corpus-v1-engineering-support-minimums",
+  "support_purpose": "minimal_baseline_attempt",
+  "interpretation": "工程准入下限；不代表统计功效充分或训练数据已存在。",
+  "minimum_labeled_examples_per_class": {
+    "train": 100,
+    "val": 20,
+    "test": 20
+  },
+  "minimum_distinct_connected_molecule_clusters": {
+    "train": null,
+    "val": 5,
+    "test": 5
+  },
+  "minimum_distinct_connected_protein_clusters": {
+    "train": null,
+    "val": 5,
+    "test": 5
+  },
+  "class_definition": {
+    "positive": "Ki measured under corpus label policy with pActivity >= 6",
+    "negative": "Ki measured under corpus label policy with pActivity <= 5",
+    "other": "unlabeled; never synthesized or backfilled"
+  },
+  "measurement_status": "pending_real_corpus_measurement",
+  "gate": {
+    "require_both_classes_in_every_split": true,
+    "require_all_configured_minima": true,
+    "on_shortfall": "blocked",
+    "allow_lowering_after_protocol_freeze": false,
+    "require_verified_source_and_split_receipts": true
+  },
+  "limitations": [
+    "These minima are engineering admission floors only.",
+    "They do not establish statistical power, external validity, or model performance.",
+    "No current real-corpus counts are asserted."
+  ]
+}

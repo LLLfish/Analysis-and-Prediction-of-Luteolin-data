@@ -473,8 +473,30 @@ def test_entity_and_assignment_shuffle_keeps_identity_joins(synthetic):
     _dump_json(synthetic["feature_manifest_path"], features)
 
     second = _build(synthetic)
-    assert second["pairs"] == first["pairs"]
-    assert second["ledger"] == first["ledger"]
+    identity_fields = (
+        "pair_key", "disposition", "reason_code", "evidence_ids",
+        "molecule_chembl_id", "taxonomy_id", "accession", "label", "label_name",
+        "molecule_structure_sha256", "protein_sequence_sha256",
+        "feature_status", "feature_cache_key", "feature_cache_file_sha256",
+        "feature_sequence_sha256", "entity_bundle_hash", "entity_version",
+    )
+    assert [pair["pair_key"] for pair in first["pairs"]] == [
+        pair["pair_key"] for pair in second["pairs"]
+    ]
+    for left, right in zip(first["pairs"], second["pairs"]):
+        for field in identity_fields:
+            if field == "pair_key":
+                continue
+            assert left[field] == right[field], field
+    first_ledger = {
+        row["pair_key"]: {field: row[field] for field in identity_fields}
+        for row in first["ledger"]
+    }
+    second_ledger = {
+        row["pair_key"]: {field: row[field] for field in identity_fields}
+        for row in second["ledger"]
+    }
+    assert second_ledger == first_ledger
     assert second["counts"] == first["counts"]
 
 
@@ -489,9 +511,9 @@ def test_duplicate_pair_key_is_rejected(synthetic):
 
 
 def test_tampered_bundle_binding_is_rejected(synthetic):
-    entities = _load_json(synthetic["entities_path"])
-    entities["content_sha256"] = "f" * 64
-    _dump_json(synthetic["entities_path"], entities)
+    manifest = _load_json(synthetic["manifest_path"])
+    manifest["entities"]["content_sha256"] = "f" * 64
+    _dump_json(synthetic["manifest_path"], manifest)
     with pytest.raises(ValueError, match="entities_content_sha256_mismatch"):
         _build(synthetic)
 

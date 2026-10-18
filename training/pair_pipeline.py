@@ -62,16 +62,29 @@ EXCLUSION_RULES_VERSION = "phase03-tracer-eligibility-v1"
 FIT_DIAGNOSTIC_PER_CLASS = 8
 FIT_DIAGNOSTIC_SAMPLE_SEED = 42
 
+EXPECTED_FEATURE_MANIFEST_PATH = (
+    PROJECT_ROOT
+    / "P1_02_04_Artifacts_847e7b27ed5942e19af64e2bd65b8d2f"
+    / "01d118a1293346d38a58f116f7c86e2a"
+    / "feature_manifest.json"
+)
 EXPECTED_FEATURE_MANIFEST_SHA256 = (
     "46d13b05db30c15e39cc4b455a5ab3ec1a0faf6265017b32301b08212da0c1c5"
 )
 GPU_PYTHON_DEFAULT = "E:/paper/DDA-Reproduction/.conda/python.exe"
 RUN_ROOT_PATTERN = re.compile(r"P1_03_Artifacts_[0-9a-f]{32}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+# Git object names are 40 hex characters, not SHA-256 digests (CR-01/F1).
+GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 ALLCLOSE_ATOL = 1e-6
 ALLCLOSE_RTOL = 1e-6
 
-assert INPUT_DIM == gpu_model.INPUT_DIM
+# F7/IN-07: explicit check, never a bare assert (asserts vanish under -O).
+if INPUT_DIM != gpu_model.INPUT_DIM:
+    raise RuntimeError(
+        "pair_pipeline_input_dim_mismatch:"
+        + str(INPUT_DIM) + "!=" + str(gpu_model.INPUT_DIM)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +687,23 @@ def validate_gpu_python(gpu_python: os.PathLike[str] | str) -> Path:
     return resolved
 
 
+def _environment_record() -> dict[str, Any]:
+    """Record OS/Python/interpreter/package versions for every run record (F6/WR-06)."""
+    runtime = gpu_model.cuda_runtime_report()
+    return {
+        "python": platform.python_version(),
+        "python_full_version": sys.version,
+        "executable": sys.executable,
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "torch": runtime.get("torch"),
+        "torch_cuda": runtime.get("torch_cuda"),
+        "cuda_available": runtime.get("cuda_available"),
+        "imports": _import_versions(),
+    }
+
+
 def _git_code_version() -> dict[str, Any]:
     try:
         commit_run = subprocess.run(
@@ -683,7 +713,7 @@ def _git_code_version() -> dict[str, Any]:
         if commit_run.returncode != 0:
             return {"git_commit": None, "reason": "git_rev_parse_exit_" + str(commit_run.returncode)}
         commit = commit_run.stdout.strip()
-        if SHA256_PATTERN.fullmatch(commit) is None or len(commit) != 40:
+        if GIT_COMMIT_PATTERN.fullmatch(commit) is None:
             return {"git_commit": None, "reason": "git_commit_format_invalid"}
         status_run = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -768,6 +798,25 @@ def _run_gpu_process(
     }
 
 
+def _validate_training_evidence(gpu_result: Mapping[str, Any]) -> dict[str, Any]:
+    """Shared CPU-side proof that only the head trained on frozen ESM inputs (F4/WR-02)."""
+    training = gpu_result.get("training")
+    if not isinstance(training, Mapping):
+        raise RuntimeError("gpu_training_record_missing")
+    trainable_parameter_names = training.get("trainable_parameter_names")
+    if not isinstance(trainable_parameter_names, list) or not trainable_parameter_names:
+        raise RuntimeError("gpu_trainable_parameter_names_missing")
+    for name in trainable_parameter_names:
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("gpu_trainable_parameter_names_invalid")
+        lowered = name.lower()
+        if "esm" in lowered or "backbone" in lowered:
+            raise RuntimeError("gpu_frozen_esm_has_trainable_parameters:" + name)
+    if training.get("frozen_feature_input") is not True:
+        raise RuntimeError("gpu_frozen_feature_input_not_recorded")
+    return dict(training)
+
+
 def _validate_gpu_result(
     *,
     gpu_result: Mapping[str, Any],
@@ -795,20 +844,7 @@ def _validate_gpu_result(
         raise RuntimeError("gpu_arrays_binding_mismatch")
     if gpu_result.get("input_manifest_sha256") != prepared["input_manifest_sha256"]:
         raise RuntimeError("gpu_input_manifest_binding_mismatch")
-    training = gpu_result.get("training")
-    if not isinstance(training, Mapping):
-        raise RuntimeError("gpu_training_record_missing")
-    trainable_parameter_names = training.get("trainable_parameter_names")
-    if not isinstance(trainable_parameter_names, list) or not trainable_parameter_names:
-        raise RuntimeError("gpu_trainable_parameter_names_missing")
-    for name in trainable_parameter_names:
-        if not isinstance(name, str) or not name:
-            raise RuntimeError("gpu_trainable_parameter_names_invalid")
-        lowered = name.lower()
-        if "esm" in lowered or "backbone" in lowered:
-            raise RuntimeError("gpu_frozen_esm_has_trainable_parameters:" + name)
-    if training.get("frozen_feature_input") is not True:
-        raise RuntimeError("gpu_frozen_feature_input_not_recorded")
+    training = _validate_training_evidence(gpu_result)
     checkpoint_record = gpu_result.get("checkpoint")
     if not isinstance(checkpoint_record, Mapping):
         raise RuntimeError("gpu_checkpoint_record_missing")
@@ -947,6 +983,9 @@ def train_real_pairs(
         raise RuntimeError("gpu_arrays_binding_mismatch")
     if gpu_result.get("input_manifest_sha256") != prepared["input_manifest_sha256"]:
         raise RuntimeError("gpu_input_manifest_binding_mismatch")
+    # F4/WR-02: the legacy tracer path must prove the same frozen-ESM/head-only
+    # evidence as the development path.
+    training_record = _validate_training_evidence(gpu_result)
     checkpoint_record = gpu_result.get("checkpoint")
     if not isinstance(checkpoint_record, Mapping):
         raise RuntimeError("gpu_checkpoint_record_missing")
@@ -1042,12 +1081,7 @@ def train_real_pairs(
             "gpu_python": str(gpu_interpreter),
         },
         "environment": {
-            "preprocess_python": {
-                "python": platform.python_version(),
-                "executable": sys.executable,
-                "torch": cpu_runtime.get("torch"),
-                "cuda_available": cpu_runtime.get("cuda_available"),
-            },
+            "preprocess_python": _environment_record(),
             "gpu_runtime": dict(runtime),
         },
         "diagnostics": {
@@ -1057,7 +1091,7 @@ def train_real_pairs(
             "cpu_cuda_available": cpu_runtime.get("cuda_available"),
         },
         "training": {
-            **dict(gpu_result.get("training") or {}),
+            **training_record,
             "loss_records": loss_records,
             "initial_loss": gpu_result.get("initial_loss"),
             "final_loss": gpu_result.get("final_loss"),
@@ -1129,6 +1163,15 @@ def resolve_new_output_dir(out_dir: os.PathLike[str] | str) -> Path:
     apl_root = APL_ROOT.resolve()
     if resolved == apl_root or str(resolved).startswith(str(apl_root) + os.sep):
         raise ValueError("output_dir_must_not_be_inside_APL_source")
+    # F3/WR-01: inside the project root only a brand-new Phase 03 GUID root (or
+    # a strict child of it) is allowed; frozen P1_02_* roots are rejected.
+    project_root = PROJECT_ROOT.resolve()
+    if resolved == project_root or str(resolved).startswith(str(project_root) + os.sep):
+        relative = resolved.relative_to(project_root)
+        if not relative.parts or RUN_ROOT_PATTERN.fullmatch(relative.parts[0]) is None:
+            raise ValueError(
+                "output_dir_under_project_root_must_be_P1_03_Artifacts_<32 hex>"
+            )
     requested.mkdir()
     return requested
 
@@ -1179,14 +1222,32 @@ def select_fit_diagnostic_sample(
 
 
 def _load_development_sources(dev: Mapping[str, Any]) -> dict[str, Any]:
-    """Re-verify every source binding declared by a development manifest."""
+    """Re-verify every source binding declared by a development manifest.
+
+    F2/WR-03: the ESM feature snapshot is pinned to the module-level canonical
+    path/SHA, never to the development manifest's self-declared source block.
+    """
     declared = dev["source"]
+    if declared.get("feature_manifest_sha256") != EXPECTED_FEATURE_MANIFEST_SHA256:
+        raise ValueError(
+            "development_manifest_feature_manifest_sha256_not_canonical"
+        )
+    try:
+        declared_feature_path = Path(
+            os.path.expanduser(os.fspath(declared.get("feature_manifest_path")))
+        ).resolve(strict=False)
+    except TypeError:
+        declared_feature_path = None
+    if declared_feature_path != EXPECTED_FEATURE_MANIFEST_PATH.resolve(strict=False):
+        raise ValueError(
+            "development_manifest_feature_manifest_path_not_canonical"
+        )
     sources = development_manifest.load_verified_sources(
         declared["frozen_manifest_path"],
         declared["entities_path"],
-        declared["feature_manifest_path"],
-        expected_feature_manifest_sha256=declared["feature_manifest_sha256"],
-        expected_feature_manifest_path=declared["feature_manifest_path"],
+        str(EXPECTED_FEATURE_MANIFEST_PATH),
+        expected_feature_manifest_sha256=EXPECTED_FEATURE_MANIFEST_SHA256,
+        expected_feature_manifest_path=str(EXPECTED_FEATURE_MANIFEST_PATH),
     )
     for field, actual in (
         ("frozen_manifest_sha256", sources["manifest_sha256"]),
@@ -1302,6 +1363,36 @@ def prepare_development_pair_arrays(
         })
     fit_diagnostic = select_fit_diagnostic_sample(pair_records)
 
+    # F8/IN-04: report the development manifest's real exclusion accounting
+    # instead of hard-coding an empty/zero exclusion ledger.
+    development_counts = dict(dev["counts"])
+    development_source = (
+        dev["manifest"].get("source")
+        if isinstance(dev["manifest"].get("source"), Mapping)
+        else {}
+    )
+    exclusion_reason_counts = dict(
+        dev["manifest"].get("exclusion_reason_counts") or {}
+    )
+    exclusion_source = {
+        "source": "development_manifest",
+        "path": str(dev["path"]),
+        "sha256": dev["sha256"],
+        "counts": {
+            "candidates": development_counts.get("candidates"),
+            "included": development_counts.get("included"),
+            "excluded": development_counts.get("excluded"),
+        },
+        "exclusion_reason_counts": exclusion_reason_counts,
+        "skipped_non_train_assignments": development_source.get(
+            "skipped_non_train_assignments",
+        ),
+        "note": (
+            "row-level exclusions are recorded in the referenced development "
+            "manifest ledger, not duplicated here"
+        ),
+    }
+
     source = {
         "frozen_manifest_path": str(sources["manifest_path"]),
         "frozen_manifest_sha256": sources["manifest_sha256"],
@@ -1365,10 +1456,13 @@ def prepare_development_pair_arrays(
         "class_counts": dict(result["class_counts"]),
         "pair_count": result["pair_count"],
         "pairs": pair_records,
-        "exclusions": [],
-        "exclusion_count": 0,
+        "exclusion_source": exclusion_source,
+        "exclusion_count": development_counts.get("excluded"),
+        "exclusion_reason_counts": exclusion_reason_counts,
         "exclusion_rules_version": EXCLUSION_RULES_VERSION,
-        "skipped_non_train_assignments": 0,
+        "skipped_non_train_assignments": development_source.get(
+            "skipped_non_train_assignments",
+        ),
         "sampling": gpu_model.SAMPLING_CLASS_BALANCED,
         "fit_diagnostic": fit_diagnostic,
     }
@@ -1383,8 +1477,12 @@ def prepare_development_pair_arrays(
         "pair_count": result["pair_count"],
         "class_counts": dict(result["class_counts"]),
         "pairs": pair_records,
-        "exclusions": [],
-        "exclusion_count": 0,
+        "exclusion_source": exclusion_source,
+        "exclusion_count": development_counts.get("excluded"),
+        "exclusion_reason_counts": exclusion_reason_counts,
+        "skipped_non_train_assignments": development_source.get(
+            "skipped_non_train_assignments",
+        ),
         "source": source,
         "feature_status_counts": dict(sources["feature_manifest"]["status_counts"]),
         "row_order": list(row_order),
@@ -1548,7 +1646,9 @@ def train_development_pairs(
             "pair_count": prepared["pair_count"],
             "class_counts": dict(prepared["class_counts"]),
             "exclusion_count": prepared["exclusion_count"],
-            "exclusions": [],
+            "exclusion_source": dict(prepared["exclusion_source"]),
+            "exclusion_reason_counts": dict(prepared["exclusion_reason_counts"]),
+            "skipped_non_train_assignments": prepared["skipped_non_train_assignments"],
         },
         "command": {
             "train_cli": [sys.executable, "-m", "training.pair_pipeline", "train"]
@@ -1557,12 +1657,7 @@ def train_development_pairs(
             "gpu_python": str(gpu_interpreter),
         },
         "environment": {
-            "preprocess_python": {
-                "python": platform.python_version(),
-                "executable": sys.executable,
-                "torch": cpu_runtime.get("torch"),
-                "cuda_available": cpu_runtime.get("cuda_available"),
-            },
+            "preprocess_python": _environment_record(),
             "gpu_runtime": dict(runtime),
         },
         "diagnostics": {
@@ -2097,12 +2192,7 @@ def predict_pairs(
             "gpu_python": str(gpu_interpreter),
         },
         "environment": {
-            "preprocess_python": {
-                "python": platform.python_version(),
-                "executable": sys.executable,
-                "imports": _import_versions(),
-                "cuda_available": cpu_runtime.get("cuda_available"),
-            },
+            "preprocess_python": _environment_record(),
             "gpu_runtime": gpu_runtime,
             "checkpoint_training_runtime": dict(payload["runtime"]),
         },

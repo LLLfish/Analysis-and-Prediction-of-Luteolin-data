@@ -24,6 +24,7 @@ import math
 import os
 import platform
 import random
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -59,6 +60,12 @@ FIT_DIAGNOSTIC_SCOPE = (
     "training-only in-sample engineering fit diagnostic; no independent "
     "holdout, no generalisation/AUC/calibration/ranking claim"
 )
+
+# F3/WR-01: output-location guard roots (derived locally so the GPU side can
+# verify its own --out argument without importing the CPU preprocessing half).
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+APL_ROOT = PROJECT_ROOT / "APL"
+RUN_ROOT_PATTERN = re.compile(r"P1_03_Artifacts_[0-9a-f]{32}")
 
 CHECKPOINT_FORMAT_VERSION = 2
 MODEL_ARCHITECTURE = "mlp_relu_logit_v1"
@@ -293,6 +300,54 @@ def cuda_runtime_report() -> dict[str, Any]:
         report["capability"] = list(torch.cuda.get_device_capability(0))
         report["arch_list"] = list(torch.cuda.get_arch_list())
     return report
+
+
+def _environment_record() -> dict[str, Any]:
+    """Record OS/Python/torch/numpy versions for resume_result.json (F6/WR-06).
+
+    Deliberately imports nothing beyond the stdlib/torch/numpy import closure.
+    """
+    return {
+        "python": platform.python_version(),
+        "python_full_version": sys.version,
+        "executable": sys.executable,
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "torch": str(torch.__version__),
+        "torch_cuda": (
+            str(torch.version.cuda) if torch.version.cuda is not None else None
+        ),
+        "numpy": str(np.__version__),
+        "cuda_available": bool(torch.cuda.is_available()),
+    }
+
+
+def _validate_output_location(out_dir: os.PathLike[str] | str) -> Path:
+    """Require an existing output directory that is not a frozen/APL location (F3).
+
+    Inside PROJECT_ROOT only a P1_03_Artifacts_<32 hex> root (or one of its
+    children) is accepted, so a GPU CLI run can never write checkpoint.pt /
+    loss.jsonl / gpu_result.json into the APL source tree or a frozen P1_02_*
+    artifact root.
+    """
+    destination = Path(os.path.expanduser(os.fspath(out_dir)))
+    if not destination.is_absolute():
+        raise ValueError("out_dir_must_be_absolute")
+    if not destination.is_dir():
+        raise ValueError("out_dir_missing:" + str(destination))
+    resolved = destination.resolve(strict=False)
+    apl_root = APL_ROOT.resolve()
+    if resolved == apl_root or str(resolved).startswith(str(apl_root) + os.sep):
+        raise ValueError("out_dir_must_not_be_inside_APL_source")
+    project_root = PROJECT_ROOT.resolve()
+    if resolved == project_root or str(resolved).startswith(str(project_root) + os.sep):
+        relative = resolved.relative_to(project_root)
+        if not relative.parts or RUN_ROOT_PATTERN.fullmatch(relative.parts[0]) is None:
+            raise ValueError(
+                "out_dir_under_project_root_must_be_P1_03_Artifacts_<32 hex>"
+            )
+    return destination
 
 
 # ---------------------------------------------------------------------------
@@ -1661,11 +1716,7 @@ def resume_training(
         raise ValueError("resume_run_must_be_absolute")
     if not source_root.is_dir():
         raise ValueError("resume_run_missing:" + str(source_root))
-    out_root = Path(os.path.expanduser(os.fspath(out_dir)))
-    if not out_root.is_absolute():
-        raise ValueError("out_dir_must_be_absolute")
-    if not out_root.is_dir():
-        raise ValueError("out_dir_missing:" + str(out_root))
+    out_root = _validate_output_location(out_dir)
     destination_checkpoint = out_root / "checkpoint.pt"
     if destination_checkpoint.exists() or destination_checkpoint.is_symlink():
         raise FileExistsError("checkpoint_already_exists:" + str(destination_checkpoint))
@@ -1816,6 +1867,7 @@ def resume_training(
             "sha256": payload["sha256"],
         },
         "input_metadata": payload["input_metadata"],
+        "environment": _environment_record(),
         "gpu_reload": {
             "max_abs_diff": reload_max_abs_diff,
             "atol": ALLCLOSE_ATOL,
@@ -1886,11 +1938,7 @@ def run_prediction(
     out_dir: os.PathLike[str] | str,
 ) -> dict[str, Any]:
     """Consume only a checkpoint plus a bound numeric prediction batch on CUDA."""
-    destination = Path(os.path.expanduser(os.fspath(out_dir)))
-    if not destination.is_absolute():
-        raise ValueError("out_dir_must_be_absolute")
-    if not destination.is_dir():
-        raise ValueError("out_dir_missing:" + str(destination))
+    destination = _validate_output_location(out_dir)
     result_path = destination / "gpu_prediction.json"
     if result_path.exists() or result_path.is_symlink():
         raise FileExistsError("gpu_prediction_already_exists:" + str(result_path))
@@ -2130,11 +2178,7 @@ def run_training(
     hidden_dim: Any = DEFAULT_HIDDEN_DIM,
 ) -> dict[str, Any]:
     """Full GPU-side run: validate inputs, train, checkpoint, reload, record."""
-    out_root = Path(os.path.expanduser(os.fspath(out_dir)))
-    if not out_root.is_absolute():
-        raise ValueError("out_dir_must_be_absolute")
-    if not out_root.is_dir():
-        raise ValueError("out_dir_missing:" + str(out_root))
+    out_root = _validate_output_location(out_dir)
     arrays_file = Path(os.path.expanduser(os.fspath(arrays_path)))
     if not arrays_file.is_file():
         raise ValueError("arrays_missing:" + str(arrays_file))

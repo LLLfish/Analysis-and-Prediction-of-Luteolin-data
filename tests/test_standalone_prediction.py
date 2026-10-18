@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import sys
 from pathlib import Path
 
@@ -212,6 +213,22 @@ def synthetic_dev(tmp_path):
     return _synthetic_dev_sources(tmp_path / "synthetic_dev")
 
 
+@pytest.fixture()
+def canonical_feature_manifest_pin(synthetic_dev, monkeypatch):
+    """Pin pair_pipeline's canonical feature snapshot to the synthetic source (F2)."""
+    monkeypatch.setattr(
+        pair_pipeline,
+        "EXPECTED_FEATURE_MANIFEST_SHA256",
+        _sha256(synthetic_dev["feature_manifest_path"]),
+    )
+    monkeypatch.setattr(
+        pair_pipeline,
+        "EXPECTED_FEATURE_MANIFEST_PATH",
+        Path(synthetic_dev["feature_manifest_path"]),
+    )
+    return synthetic_dev["feature_manifest_path"]
+
+
 def _craft_checkpoint(
     tmp_path: Path,
     name: str,
@@ -314,7 +331,9 @@ def test_predict_cli_rejects_empty_and_duplicate_pair_keys(
     assert not (tmp_path / "prediction_duplicate").exists()
 
 
-def test_predict_rejects_unknown_pair_key_before_output(synthetic_dev, tmp_path):
+def test_predict_rejects_unknown_pair_key_before_output(
+    synthetic_dev, canonical_feature_manifest_pin, tmp_path,
+):
     target = _build_dev_manifest(
         synthetic_dev, tmp_path / "dev_root" / "development_manifest.json",
     )
@@ -342,7 +361,7 @@ def test_predict_rejects_unknown_pair_key_before_output(synthetic_dev, tmp_path)
 
 
 def test_predict_rejects_stale_manifest_and_checkpoint_bindings(
-    synthetic_dev, tmp_path,
+    synthetic_dev, canonical_feature_manifest_pin, tmp_path,
 ):
     target = _build_dev_manifest(
         synthetic_dev, tmp_path / "dev_root" / "development_manifest.json",
@@ -409,7 +428,7 @@ def test_predict_rejects_stale_manifest_and_checkpoint_bindings(
 
 
 def test_predict_rejects_checkpoint_sha_pin_and_unregistered_gpu(
-    synthetic_dev, tmp_path, capsys,
+    synthetic_dev, canonical_feature_manifest_pin, tmp_path, capsys,
 ):
     target = _build_dev_manifest(
         synthetic_dev, tmp_path / "dev_root" / "development_manifest.json",
@@ -472,7 +491,7 @@ def test_gpu_prediction_request_rejects_duplicates_and_bad_hashes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_synthetic_development_train_then_standalone_prediction(
-    synthetic_dev, tmp_path, capsys,
+    synthetic_dev, canonical_feature_manifest_pin, tmp_path, capsys,
 ):
     if not GPU_PYTHON.is_file():
         pytest.fail("registered CUDA interpreter is missing: " + str(GPU_PYTHON))
@@ -498,6 +517,17 @@ def test_synthetic_development_train_then_standalone_prediction(
     assert checkpoint_path.is_file()
     checkpoint_sha256 = _sha256(checkpoint_path)
     training_sha256 = _sha256(train_out / "training_arrays.npz")
+
+    # F6/F8: the training run record of the dev path is auditable.
+    train_run = _load_json(train_out / "run.json")
+    train_preprocess = train_run["environment"]["preprocess_python"]
+    assert train_preprocess["platform"] == platform.platform()
+    assert train_preprocess["system"] == platform.system()
+    assert train_preprocess["imports"]["torch"]["version"] == torch.__version__
+    assert "exclusions" not in train_run["inputs"]
+    assert train_run["inputs"]["exclusion_count"] == dev["counts"]["excluded"]
+    assert train_run["inputs"]["exclusion_source"]["source"] == "development_manifest"
+    assert train_run["inputs"]["exclusion_source"]["sha256"] == dev["sha256"]
 
     requested = [dev["row_order"][0], dev["row_order"][2]]
     prediction_out = tmp_path / "prediction"
@@ -544,6 +574,11 @@ def test_synthetic_development_train_then_standalone_prediction(
     imports = run["environment"]["preprocess_python"]["imports"]
     assert imports["torch"]["version"] == torch.__version__
     assert imports["numpy"]["version"] == np.__version__
+    preprocess = run["environment"]["preprocess_python"]
+    assert preprocess["platform"] == platform.platform()
+    assert preprocess["system"] == platform.system()
+    assert preprocess["machine"] == platform.machine()
+    assert preprocess["python_full_version"] == sys.version
     assert run["portability"]["passed"] is True
     assert run["portability"]["atol"] == 1e-6
     assert run["portability"]["rtol"] == 1e-6

@@ -22,12 +22,14 @@ import hashlib
 import json
 import math
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from training import development_manifest, gpu_model, pair_pipeline
 
@@ -80,8 +82,15 @@ def _synthetic_features(labels, *, seed: int = 3) -> np.ndarray:
     return np.concatenate([morgan, esm], axis=1).astype(np.float32)
 
 
-def _build_synthetic_dev_sources(root: Path) -> dict:
-    """Eight source-bound pairs: four active, four inactive, both classes ready."""
+def _build_synthetic_dev_sources(
+    root: Path, *, with_excluded_pair: bool = False,
+) -> dict:
+    """Eight source-bound pairs: four active, four inactive, both classes ready.
+
+    With with_excluded_pair=True one extra train candidate (unverified molecule
+    structure) is added so the development ledger carries a real exclusion,
+    plus one non-train assignment for the skipped count.
+    """
     active_flags = [True, True, True, True, False, False, False, False]
     smiles = ["CCO", "c1ccccc1", "CCN", "CCC", "CCCl", "CCBr", "CCF", "CC(=O)O"]
     molecules = []
@@ -133,6 +142,35 @@ def _build_synthetic_dev_sources(root: Path) -> dict:
             "labels": ["active" if is_active else "inactive"],
             "split": "train",
             "evidence_ids": ["ev-" + str(index + 1)],
+        })
+    if with_excluded_pair:
+        molecules.append({
+            "molecule_chembl_id": "CHEMBL929999",
+            "canonical_smiles": "CCO",
+            "structure_status": "unverified",
+            "structure_sha256": hashlib.sha256(b"CHEMBL929999").hexdigest(),
+        })
+        proteins.append({
+            "accession": "P92999",
+            "taxonomy_id": 9606,
+            "sequence_status": "verified",
+            "identity_status": "verified",
+            "full_sequence": "MSTNPKPQRKTKRNTNRRPQDVKFPGGGQIVGGVYLLP92999",
+            "sequence_sha256": hashlib.sha256(
+                b"MSTNPKPQRKTKRNTNRRPQDVKFPGGGQIVGGVYLLP92999"
+            ).hexdigest(),
+        })
+        assignments.append({
+            "pair_key": "CHEMBL929999|9606|P92999",
+            "labels": ["inactive"],
+            "split": "train",
+            "evidence_ids": ["ev-excluded-structure"],
+        })
+        assignments.append({
+            "pair_key": "CHEMBL929998|9606|P92998",
+            "labels": ["active"],
+            "split": "val",
+            "evidence_ids": ["ev-non-train"],
         })
     entities = {
         "schema_version": 2,
@@ -209,6 +247,22 @@ def _build_dev_manifest(synthetic: dict, target: Path) -> Path:
 @pytest.fixture()
 def synthetic_dev(tmp_path):
     return _build_synthetic_dev_sources(tmp_path / "synthetic_dev")
+
+
+@pytest.fixture()
+def canonical_feature_manifest_pin(synthetic_dev, monkeypatch):
+    """Pin pair_pipeline's canonical feature snapshot to the synthetic source (F2)."""
+    monkeypatch.setattr(
+        pair_pipeline,
+        "EXPECTED_FEATURE_MANIFEST_SHA256",
+        _sha256(synthetic_dev["feature_manifest_path"]),
+    )
+    monkeypatch.setattr(
+        pair_pipeline,
+        "EXPECTED_FEATURE_MANIFEST_PATH",
+        Path(synthetic_dev["feature_manifest_path"]),
+    )
+    return synthetic_dev["feature_manifest_path"]
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +583,9 @@ def test_run_training_rejects_missing_purpose_and_arrays_hash(tmp_path):
 # Development-manifest consumption (CPU preprocessing before GPU)
 # ---------------------------------------------------------------------------
 
-def test_prepare_development_arrays_consumes_declared_rows(synthetic_dev, tmp_path):
+def test_prepare_development_arrays_consumes_declared_rows(
+    synthetic_dev, canonical_feature_manifest_pin, tmp_path,
+):
     target = _build_dev_manifest(synthetic_dev, tmp_path / "dev_root" / "development_manifest.json")
     prepared = pair_pipeline.prepare_development_pair_arrays(
         development_manifest_path=str(target),
@@ -560,7 +616,9 @@ def test_prepare_development_arrays_consumes_declared_rows(synthetic_dev, tmp_pa
     assert "NaN" not in Path(prepared["input_manifest_path"]).read_text(encoding="utf-8")
 
 
-def test_prepare_development_arrays_rejects_tampered_binding(synthetic_dev, tmp_path):
+def test_prepare_development_arrays_rejects_tampered_binding(
+    synthetic_dev, canonical_feature_manifest_pin, tmp_path,
+):
     target = _build_dev_manifest(synthetic_dev, tmp_path / "dev_root" / "development_manifest.json")
     dev = _load_json(target)
     dev["pairs"][0]["label"] = 1 - dev["pairs"][0]["label"]
@@ -577,11 +635,116 @@ def test_prepare_development_arrays_rejects_tampered_binding(synthetic_dev, tmp_
     dev2 = _load_json(target2)
     dev2["source"]["feature_manifest_sha256"] = "0" * 64
     _dump_json(target2, dev2)
-    with pytest.raises(ValueError, match="feature_manifest_sha256_mismatch"):
+    with pytest.raises(
+        ValueError,
+        match="development_manifest_feature_manifest_sha256_not_canonical",
+    ):
         pair_pipeline.prepare_development_pair_arrays(
             development_manifest_path=str(target2),
             out_dir=str(tmp_path / "fit_run2"),
         )
+
+
+def test_prepare_development_arrays_rejects_noncanonical_feature_manifest(
+    synthetic_dev, tmp_path,
+):
+    """A self-consistent dev manifest for a non-canonical snapshot is rejected (F2)."""
+    target = _build_dev_manifest(
+        synthetic_dev, tmp_path / "dev_root_noncanonical" / "development_manifest.json",
+    )
+    dev = development_manifest.load_development_manifest(target)
+    assert dev["source"]["feature_manifest_sha256"] == _sha256(
+        synthetic_dev["feature_manifest_path"],
+    )
+    assert dev["source"]["feature_manifest_sha256"] != (
+        pair_pipeline.EXPECTED_FEATURE_MANIFEST_SHA256
+    )
+    with pytest.raises(
+        ValueError,
+        match="development_manifest_feature_manifest_sha256_not_canonical",
+    ):
+        pair_pipeline.prepare_development_pair_arrays(
+            development_manifest_path=str(target),
+            out_dir=str(tmp_path / "fit_run_noncanonical"),
+        )
+    assert not (tmp_path / "fit_run_noncanonical").exists()
+
+
+def test_prepare_development_arrays_rejects_noncanonical_feature_manifest_path(
+    synthetic_dev, tmp_path, monkeypatch,
+):
+    """Even with a matching SHA, a non-canonical snapshot path is rejected (F2)."""
+    monkeypatch.setattr(
+        pair_pipeline,
+        "EXPECTED_FEATURE_MANIFEST_SHA256",
+        _sha256(synthetic_dev["feature_manifest_path"]),
+    )
+    target = _build_dev_manifest(
+        synthetic_dev, tmp_path / "dev_root_noncanonical_path"
+        / "development_manifest.json",
+    )
+    with pytest.raises(
+        ValueError,
+        match="development_manifest_feature_manifest_path_not_canonical",
+    ):
+        pair_pipeline.prepare_development_pair_arrays(
+            development_manifest_path=str(target),
+            out_dir=str(tmp_path / "fit_run_noncanonical_path"),
+        )
+
+
+def test_prepare_development_arrays_records_real_exclusion_accounting(
+    tmp_path, monkeypatch,
+):
+    """F8/IN-04: the dev input manifest must not hard-code an empty exclusion ledger."""
+    sources = _build_synthetic_dev_sources(
+        tmp_path / "synthetic_dev_excluded", with_excluded_pair=True,
+    )
+    monkeypatch.setattr(
+        pair_pipeline,
+        "EXPECTED_FEATURE_MANIFEST_SHA256",
+        _sha256(sources["feature_manifest_path"]),
+    )
+    monkeypatch.setattr(
+        pair_pipeline,
+        "EXPECTED_FEATURE_MANIFEST_PATH",
+        Path(sources["feature_manifest_path"]),
+    )
+    target = _build_dev_manifest(
+        sources, tmp_path / "dev_root_excluded" / "development_manifest.json",
+    )
+    dev = development_manifest.load_development_manifest(target)
+    assert dev["counts"]["candidates"] == 9
+    assert dev["counts"]["included"] == 8
+    assert dev["counts"]["excluded"] == 1
+    assert dev["manifest"]["exclusion_reason_counts"] == {
+        "molecule_structure_not_verified": 1,
+    }
+    prepared = pair_pipeline.prepare_development_pair_arrays(
+        development_manifest_path=str(target),
+        out_dir=str(tmp_path / "fit_run_excluded"),
+    )
+    input_manifest = _load_json(prepared["input_manifest_path"])
+    assert "exclusions" not in input_manifest
+    assert input_manifest["exclusion_count"] == 1
+    assert input_manifest["exclusion_reason_counts"] == {
+        "molecule_structure_not_verified": 1,
+    }
+    assert input_manifest["skipped_non_train_assignments"] == 1
+    source_record = input_manifest["exclusion_source"]
+    assert source_record["source"] == "development_manifest"
+    assert source_record["path"] == str(dev["path"])
+    assert source_record["sha256"] == dev["sha256"]
+    assert source_record["counts"] == {
+        "candidates": 9, "included": 8, "excluded": 1,
+    }
+    assert source_record["exclusion_reason_counts"] == {
+        "molecule_structure_not_verified": 1,
+    }
+    assert prepared["exclusion_count"] == 1
+    assert prepared["exclusion_reason_counts"] == {
+        "molecule_structure_not_verified": 1,
+    }
 
 
 def test_blocked_development_manifest_prevents_training(tmp_path):
@@ -616,7 +779,9 @@ def test_blocked_development_manifest_prevents_training(tmp_path):
 # Synthetic end-to-end development fit through the real CUDA interpreter
 # ---------------------------------------------------------------------------
 
-def test_synthetic_development_fit_end_to_end(synthetic_dev, tmp_path, capsys):
+def test_synthetic_development_fit_end_to_end(
+    synthetic_dev, canonical_feature_manifest_pin, tmp_path, capsys,
+):
     if not GPU_PYTHON.is_file():
         pytest.fail("registered CUDA interpreter is missing: " + str(GPU_PYTHON))
     target = _build_dev_manifest(
@@ -682,3 +847,20 @@ def test_synthetic_development_fit_end_to_end(synthetic_dev, tmp_path, capsys):
     assert all(row["device"] == "cpu" for row in prediction_rows)
     assert all(math.isfinite(row["logit"]) for row in prediction_rows)
     assert (out_dir / "gpu_process.log").is_file()
+
+    # F6/WR-06: the development run record carries OS/platform/import versions.
+    preprocess = run["environment"]["preprocess_python"]
+    assert preprocess["platform"] == platform.platform()
+    assert preprocess["system"] == platform.system()
+    assert preprocess["machine"] == platform.machine()
+    assert preprocess["python_full_version"] == sys.version
+    assert preprocess["imports"]["torch"]["version"] == torch.__version__
+    assert preprocess["imports"]["numpy"]["version"] == np.__version__
+    # F8/IN-04: exclusion accounting references the real development ledger.
+    assert "exclusions" not in run["inputs"]
+    assert run["inputs"]["exclusion_count"] == run["inputs"][
+        "exclusion_source"
+    ]["counts"]["excluded"] == 0
+    assert run["inputs"]["exclusion_source"]["source"] == "development_manifest"
+    assert run["inputs"]["exclusion_source"]["path"] == str(target)
+    assert run["inputs"]["exclusion_source"]["sha256"] == _sha256(target)

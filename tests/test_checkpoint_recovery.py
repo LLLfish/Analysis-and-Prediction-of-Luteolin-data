@@ -21,8 +21,10 @@ import hashlib
 import json
 import math
 import os
+import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -87,7 +89,33 @@ def _pair_records(labels) -> list:
     return records
 
 
-def _build_run_template(root: Path, labels) -> dict:
+def _fit_plan(
+    labels, pair_keys, sample_rows, *, seed: int = 42,
+) -> dict:
+    """Legal fit-diagnostic plan so run_training selects class_balanced sampling."""
+    labels_array = np.asarray(labels, dtype=np.int64)
+    sample_labels = [int(labels_array[row]) for row in sample_rows]
+    return {
+        "plan_version": 1,
+        "seed": seed,
+        "per_class": 2,
+        "sample_rows": [int(row) for row in sample_rows],
+        "pair_keys": [pair_keys[row] for row in sample_rows],
+        "labels": sample_labels,
+        "class_counts": {
+            "inactive": sum(1 for value in sample_labels if value == 0),
+            "active": sum(1 for value in sample_labels if value == 1),
+        },
+        "criterion": {
+            "version": gpu_model.FIT_DIAGNOSTIC_CRITERION_VERSION,
+            "max_steps": gpu_model.MAX_STEPS,
+            "min_relative_bce_drop": gpu_model.FIT_DIAGNOSTIC_MIN_RELATIVE_LOSS_DROP,
+            "min_correct_per_class": gpu_model.FIT_DIAGNOSTIC_MIN_CORRECT_PER_CLASS,
+        },
+    }
+
+
+def _build_run_template(root: Path, labels, *, fit_diagnostic=None) -> dict:
     """One run-directory template: numeric arrays plus a bound input manifest."""
     labels_array = np.asarray(labels, dtype=np.int64)
     template = root / "template"
@@ -119,6 +147,8 @@ def _build_run_template(root: Path, labels) -> dict:
         "exclusions": [],
         "exclusion_count": 0,
     }
+    if fit_diagnostic is not None:
+        manifest["fit_diagnostic"] = fit_diagnostic
     _dump_json(template / "input_manifest.json", manifest)
     return {
         "template": template,
@@ -366,6 +396,23 @@ def test_resume_cli_reports_blocked_without_cuda(tmp_path, capsys):
     assert "cuda_unavailable_for_training" in payload["reason"]
 
 
+def test_gpu_environment_record_contains_platform_and_versions():
+    """F6/WR-06: resume_result.json environment is built from stdlib/torch/NumPy only."""
+    record = gpu_model._environment_record()
+    assert record["python"] == platform.python_version()
+    assert record["python_full_version"] == sys.version
+    assert record["executable"] == sys.executable
+    assert record["platform"] == platform.platform()
+    assert record["system"] == platform.system()
+    assert record["machine"] == platform.machine()
+    assert record["torch"] == str(torch.__version__)
+    assert record["numpy"] == str(np.__version__)
+    assert isinstance(record["cuda_available"], bool)
+    serialized = json.dumps(record).lower()
+    assert "rdkit" not in serialized
+    assert "transformers" not in serialized
+
+
 # ---------------------------------------------------------------------------
 # CUDA behavior: uninterrupted two steps versus one step plus resume
 # ---------------------------------------------------------------------------
@@ -468,6 +515,16 @@ def test_cuda_resume_matches_uninterrupted_trajectory(tmp_path):
     assert runtime["torch"] == "2.9.1+cu128"
     assert runtime["torch_cuda"] == "12.8"
 
+    # F6/WR-06: resume_result.json records OS/platform/torch/NumPy versions.
+    # The GPU interpreter may report a different OS build string / NumPy version
+    # than the CPU runner, so only presence/type and the torch pin are asserted.
+    environment = resume_result["environment"]
+    assert environment["system"] == platform.system()
+    assert environment["machine"] == platform.machine()
+    assert isinstance(environment["platform"], str) and environment["platform"]
+    assert environment["torch"] == "2.9.1+cu128"
+    assert isinstance(environment["numpy"], str) and environment["numpy"]
+
     # CPU portable reload of the exact uninterrupted checkpoint bytes.
     features, stored_labels = pair_pipeline.load_training_arrays(
         continuous / "training_arrays.npz",
@@ -480,3 +537,114 @@ def test_cuda_resume_matches_uninterrupted_trajectory(tmp_path):
     assert cpu_logits.shape == continuous_logits.shape
     assert float(np.max(np.abs(cpu_logits.astype(np.float64) - continuous_logits))) <= 1e-6
     assert np.allclose(cpu_logits, continuous_logits, atol=1e-6, rtol=1e-6)
+
+
+def test_cuda_class_balanced_resume_matches_uninterrupted_trajectory(tmp_path):
+    """F5/WR-05: production class_balanced sampling resumes equivalently."""
+    if not GPU_PYTHON.is_file():
+        pytest.fail("registered CUDA interpreter is missing: " + str(GPU_PYTHON))
+    labels = np.asarray([0, 1, 0, 1, 0, 1, 0, 1], dtype=np.int64)
+    plan = _fit_plan(labels, PAIR_KEYS, [0, 1, 2, 3])
+    template = _build_run_template(tmp_path, labels, fit_diagnostic=plan)
+    continuous = _make_run(template, tmp_path / "continuous_cb")
+    interrupted = _make_run(template, tmp_path / "interrupted_cb")
+    resumed = tmp_path / "resumed_cb"
+    resumed.mkdir(parents=True)
+    common = [
+        "--batch-size", "4",
+        "--learning-rate", "0.01",
+        "--hidden-dim", "8",
+        "--seed", "42",
+    ]
+    _assert_process_ok(_gpu_call([
+        "--arrays", str(continuous / "training_arrays.npz"),
+        "--out", str(continuous),
+        "--steps", "2",
+        *common,
+    ]), "class-balanced uninterrupted two-step run")
+    _assert_process_ok(_gpu_call([
+        "--arrays", str(interrupted / "training_arrays.npz"),
+        "--out", str(interrupted),
+        "--steps", "1",
+        *common,
+    ]), "class-balanced first interrupted step")
+    _assert_process_ok(_gpu_call([
+        "--resume-run", str(interrupted),
+        "--out", str(resumed),
+        "--steps", "1",
+    ]), "class-balanced resume step")
+
+    continuous_result = _load_json(continuous / "gpu_result.json")
+    first_result = _load_json(interrupted / "gpu_result.json")
+    resume_result = _load_json(resumed / "resume_result.json")
+    assert continuous_result["device"] == "cuda"
+    assert continuous_result["training"]["sampling"] == gpu_model.SAMPLING_CLASS_BALANCED
+    assert first_result["training"]["sampling"] == gpu_model.SAMPLING_CLASS_BALANCED
+    assert resume_result["status"] == "resumed"
+    assert resume_result["training_config"]["sampling"] == (
+        gpu_model.SAMPLING_CLASS_BALANCED
+    )
+    assert resume_result["start_step"] == 1
+    assert resume_result["additional_steps"] == 1
+    assert resume_result["final_step"] == 2
+    assert resume_result["environment"]["system"] == platform.system()
+    assert resume_result["environment"]["machine"] == platform.machine()
+    assert isinstance(resume_result["environment"]["platform"], str)
+    assert isinstance(resume_result["environment"]["numpy"], str)
+
+    uninterrupted = gpu_model.load_checkpoint(
+        continuous / "checkpoint.pt",
+        expected_sha256=continuous_result["checkpoint"]["sha256"],
+        expect_input_sha256=template["arrays_sha256"],
+    )
+    continued = gpu_model.load_checkpoint(
+        resumed / "checkpoint.pt",
+        expected_sha256=resume_result["checkpoint"]["sha256"],
+    )
+    assert uninterrupted["step"] == continued["step"] == 2
+    assert uninterrupted["global_step"] == continued["global_step"] == 2
+    assert uninterrupted["seed"] == continued["seed"] == 42
+    assert uninterrupted["config"] == continued["config"]
+    assert uninterrupted["optimizer_config"] == continued["optimizer_config"]
+    assert uninterrupted["training_config"] == continued["training_config"] == {
+        "batch_size": 4, "sampling": gpu_model.SAMPLING_CLASS_BALANCED,
+    }
+    for name, tensor in uninterrupted["model_state_dict"].items():
+        other = continued["model_state_dict"][name]
+        assert _tensor_max_abs_diff(tensor, other) <= 1e-6
+        assert torch.allclose(tensor, other, atol=1e-6, rtol=1e-6)
+    for param_id, entry in uninterrupted["optimizer_state_dict"]["state"].items():
+        other_entry = continued["optimizer_state_dict"]["state"][param_id]
+        assert set(entry) == set(other_entry)
+        assert _tensor_max_abs_diff(entry["step"], other_entry["step"]) <= 1e-6
+        for field in ("exp_avg", "exp_avg_sq"):
+            assert _tensor_max_abs_diff(entry[field], other_entry[field]) <= 1e-6
+            assert torch.allclose(entry[field], other_entry[field], atol=1e-6, rtol=1e-6)
+    assert torch.equal(uninterrupted["torch_rng_state"], continued["torch_rng_state"])
+    assert uninterrupted["python_rng_state"] == continued["python_rng_state"]
+    assert uninterrupted["numpy_rng_state"] == continued["numpy_rng_state"]
+    assert torch.equal(
+        uninterrupted["torch_cpu_generator_state"],
+        continued["torch_cpu_generator_state"],
+    )
+
+    # Batch order: the second class-balanced batch of the uninterrupted run is
+    # exactly the batch the resumed run executed (loss values are batch-local).
+    continuous_records = continuous_result["loss_records"]
+    interrupted_records = first_result["loss_records"]
+    resumed_records = resume_result["loss_records"]
+    assert len(continuous_records) == 2
+    assert len(interrupted_records) == len(resumed_records) == 1
+    assert continuous_records[0]["loss"] == pytest.approx(
+        interrupted_records[0]["loss"], abs=1e-6,
+    )
+    assert continuous_records[1]["loss"] == pytest.approx(
+        resumed_records[0]["loss"], abs=1e-6,
+    )
+    assert continuous_records[1]["batch_rows"] == resumed_records[0]["batch_rows"] == 4
+
+    continuous_logits = np.asarray(continuous_result["logits"], dtype=np.float64)
+    resumed_logits = np.asarray(resume_result["logits"], dtype=np.float64)
+    assert continuous_logits.shape == resumed_logits.shape == (len(labels),)
+    assert float(np.max(np.abs(continuous_logits - resumed_logits))) <= 1e-6
+    assert np.allclose(continuous_logits, resumed_logits, atol=1e-6, rtol=1e-6)

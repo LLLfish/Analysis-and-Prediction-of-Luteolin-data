@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -528,6 +529,136 @@ def test_cli_rejects_noncanonical_run_root(synthetic, tmp_path):
     assert exit_code == 2
 
 
+def test_git_code_version_records_real_apl_commit():
+    """F1/CR-01: a 40-hex git commit must be recorded, never null."""
+    record = pair_pipeline._git_code_version()
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(APL_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    expected_commit = completed.stdout.strip()
+    commit = record["git_commit"]
+    assert isinstance(commit, str)
+    assert len(commit) == 40
+    assert all(character in "0123456789abcdef" for character in commit)
+    assert commit == expected_commit
+    assert isinstance(record["dirty_paths"], list)
+    assert all(isinstance(path, str) for path in record["dirty_paths"])
+
+
+def test_environment_record_contains_platform_and_import_versions():
+    """F6/WR-06: OS/platform/Python and package versions are recordable on CPU."""
+    record = pair_pipeline._environment_record()
+    assert record["python"] == platform.python_version()
+    assert record["python_full_version"] == sys.version
+    assert record["executable"] == sys.executable
+    assert record["platform"] == platform.platform()
+    assert record["system"] == platform.system()
+    assert record["machine"] == platform.machine()
+    assert isinstance(record["cuda_available"], bool)
+    imports = record["imports"]
+    for module_name in ("torch", "numpy", "rdkit"):
+        assert module_name in imports
+        assert "version" in imports[module_name]
+        assert "module_path" in imports[module_name]
+
+
+def test_output_location_guards_reject_frozen_and_apl_paths(tmp_path, monkeypatch):
+    """F3/WR-01: new output roots are confined to fresh P1_03 GUID roots."""
+    run_name = "P1_03_Artifacts_" + "0123456789abcdef0123456789abcdef"
+    accepted_tmp = pair_pipeline.resolve_new_output_dir(tmp_path / "accepted_run")
+    assert accepted_tmp.is_dir()
+    with pytest.raises(ValueError, match="output_dir_must_not_be_inside_APL_source"):
+        pair_pipeline.resolve_new_output_dir(pair_pipeline.APL_ROOT / run_name)
+    with pytest.raises(ValueError, match="output_dir_under_project_root_must_be"):
+        pair_pipeline.resolve_new_output_dir(
+            pair_pipeline.PROJECT_ROOT / "not_a_run_root",
+        )
+
+    # Real GPU CLI entry points must reject the APL source tree before CUDA.
+    with pytest.raises(ValueError, match="out_dir_must_not_be_inside_APL_source"):
+        gpu_model.run_training(
+            arrays_path=tmp_path / "missing.npz",
+            out_dir=pair_pipeline.APL_ROOT,
+            steps=1,
+            batch_size=2,
+        )
+    with pytest.raises(ValueError, match="out_dir_must_not_be_inside_APL_source"):
+        gpu_model.run_prediction(
+            checkpoint_path=tmp_path / "missing.pt",
+            arrays_path=tmp_path / "missing.npz",
+            request_path=tmp_path / "missing.json",
+            out_dir=pair_pipeline.APL_ROOT,
+        )
+
+    fake_project = tmp_path / "fake_project"
+    fake_apl = fake_project / "APL"
+    fake_apl.mkdir(parents=True)
+    monkeypatch.setattr(gpu_model, "PROJECT_ROOT", fake_project)
+    monkeypatch.setattr(gpu_model, "APL_ROOT", fake_apl)
+    p1_03_root = fake_project / run_name
+    p1_03_child = p1_03_root / "fit"
+    p1_03_child.mkdir(parents=True)
+    frozen_child = fake_project / "P1_02_03_Artifacts_frozen" / "child"
+    frozen_child.mkdir(parents=True)
+    assert gpu_model._validate_output_location(p1_03_root) == p1_03_root
+    assert gpu_model._validate_output_location(p1_03_child) == p1_03_child
+    with pytest.raises(ValueError, match="out_dir_must_not_be_inside_APL_source"):
+        gpu_model._validate_output_location(fake_apl)
+    with pytest.raises(ValueError, match="out_dir_under_project_root_must_be"):
+        gpu_model._validate_output_location(fake_project)
+    with pytest.raises(ValueError, match="out_dir_under_project_root_must_be"):
+        gpu_model._validate_output_location(frozen_child)
+    with pytest.raises(ValueError, match="out_dir_must_be_absolute"):
+        gpu_model._validate_output_location("relative/out")
+    with pytest.raises(ValueError, match="out_dir_missing"):
+        gpu_model._validate_output_location(fake_project / "missing_dir")
+
+
+def test_shared_training_evidence_validation_rejects_tampered_records():
+    """F4/WR-02: the shared evidence gate proves head-only training and frozen ESM."""
+    good = {
+        "training": {
+            "trainable_parameter_names": [
+                "input_layer.weight", "input_layer.bias",
+                "output_layer.weight", "output_layer.bias",
+            ],
+            "frozen_feature_input": True,
+        },
+    }
+    validated = pair_pipeline._validate_training_evidence(good)
+    assert validated["frozen_feature_input"] is True
+    with pytest.raises(RuntimeError, match="gpu_training_record_missing"):
+        pair_pipeline._validate_training_evidence({"training": None})
+    with pytest.raises(RuntimeError, match="gpu_trainable_parameter_names_missing"):
+        pair_pipeline._validate_training_evidence({
+            "training": {
+                "trainable_parameter_names": [],
+                "frozen_feature_input": True,
+            },
+        })
+    for forbidden_name in ("esm.encoder.weight", "backbone.head.weight"):
+        with pytest.raises(
+            RuntimeError, match="gpu_frozen_esm_has_trainable_parameters",
+        ):
+            pair_pipeline._validate_training_evidence({
+                "training": {
+                    "trainable_parameter_names": [forbidden_name],
+                    "frozen_feature_input": True,
+                },
+            })
+    with pytest.raises(RuntimeError, match="gpu_frozen_feature_input_not_recorded"):
+        pair_pipeline._validate_training_evidence({
+            "training": {
+                "trainable_parameter_names": ["output_layer.weight"],
+                "frozen_feature_input": False,
+            },
+        })
+
+
 # ---------------------------------------------------------------------------
 # CUDA behavior: synthetic fixture through the real GPU entry point
 # ---------------------------------------------------------------------------
@@ -596,6 +727,13 @@ def test_synthetic_cuda_train_checkpoint_cpu_reload(synthetic, tmp_path):
     assert all(math.isfinite(value) for value in gpu_result["logits"])
     assert gpu_result["gpu_reload"]["passed"] is True
     assert gpu_result["gpu_reload"]["max_abs_diff"] <= 1e-6
+    # F4/WR-02: the legacy tracer path records the frozen-ESM/head-only evidence.
+    assert gpu_result["training"]["frozen_feature_input"] is True
+    assert gpu_result["training"]["trainable_parameter_names"]
+    assert all(
+        "esm" not in name.lower() and "backbone" not in name.lower()
+        for name in gpu_result["training"]["trainable_parameter_names"]
+    )
 
     checkpoint_path = run_dir / "checkpoint.pt"
     assert checkpoint_path.is_file()

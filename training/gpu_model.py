@@ -23,6 +23,7 @@ import json
 import math
 import os
 import platform
+import random
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -59,22 +60,37 @@ FIT_DIAGNOSTIC_SCOPE = (
     "holdout, no generalisation/AUC/calibration/ranking claim"
 )
 
-CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_FORMAT_VERSION = 2
 MODEL_ARCHITECTURE = "mlp_relu_logit_v1"
+OPTIMIZER_NAME = "adam"
 ALLCLOSE_ATOL = 1e-6
 ALLCLOSE_RTOL = 1e-6
 
+# The v2 checkpoint schema is the reproducible-resume contract: weights-only
+# state dicts plus primitive/tensor recovery fields.  Nothing else is accepted.
 _CHECKPOINT_KEYS = (
     "format_version",
     "model_state_dict",
     "optimizer_state_dict",
     "step",
+    "global_step",
     "seed",
     "config",
+    "optimizer_config",
+    "training_config",
     "input_metadata",
     "torch_rng_state",
+    "python_rng_state",
+    "numpy_rng_state",
+    "torch_cpu_generator_state",
     "runtime",
     "created_at",
+)
+_OPTIONAL_INPUT_METADATA_KEYS = (
+    "development_manifest_sha256",
+    "feature_manifest_sha256",
+    "frozen_manifest_sha256",
+    "entities_sha256",
 )
 _SHA256_PATTERN_LENGTH = 64
 
@@ -346,10 +362,13 @@ class PairHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _seed_everything(seed: int) -> None:
+    # Python, NumPy and CPU-Torch global RNGs are all seeded so the recovery
+    # state saved in a checkpoint is reproducible across processes.
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed % (2 ** 32))
 
 
 def _snapshot_parameters(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -569,6 +588,86 @@ def summarize_full_manifest_fit(
     }
 
 
+def _execute_optimizer_steps(
+    model: "PairHead",
+    optimizer: torch.optim.Optimizer,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    row_count: int,
+    labels_array: np.ndarray,
+    params: Mapping[str, Any],
+    sampling: str,
+    start_step: int,
+    total_steps: int,
+    generator: torch.Generator | None = None,
+) -> tuple[list[dict[str, Any]], torch.Generator]:
+    """Run optimizer steps (start_step, total_steps] with reproducible CPU sampling.
+
+    Legacy sampling draws one CPU-generator permutation per step; the generator
+    state is part of the checkpoint so a resumed run draws exactly the batches
+    the uninterrupted run would have drawn.  Class-balanced diagnostic sampling
+    is a pure deterministic function of (seed, labels, steps, batch) and is
+    therefore regenerated identically on resume.
+    """
+    if type(start_step) is not int or type(total_steps) is not int:
+        raise ValueError("training_step_range_invalid")
+    if start_step < 0 or total_steps <= start_step or total_steps > MAX_STEPS:
+        raise ValueError("training_step_range_invalid")
+    if sampling not in VALID_SAMPLING_MODES:
+        raise ValueError("invalid_sampling_mode:" + repr(sampling))
+    device_object = torch.device("cuda")
+    loss_function = nn.BCEWithLogitsLoss()
+    if sampling == SAMPLING_CLASS_BALANCED:
+        balanced_batches = class_balanced_batch_indices(
+            labels_array,
+            seed=params["seed"],
+            steps=total_steps,
+            batch_size=params["batch_size"],
+        )
+    else:
+        balanced_batches = []
+        if generator is None:
+            generator = _make_cpu_generator(params["seed"])
+    previous_snapshot = _snapshot_parameters(model)
+    loss_records: list[dict[str, Any]] = []
+    for step_index in range(start_step + 1, total_steps + 1):
+        if sampling == SAMPLING_CLASS_BALANCED:
+            indices = balanced_batches[step_index - 1]
+            batch_rows = len(indices)
+        else:
+            order = torch.randperm(row_count, generator=generator)
+            batch_rows = min(int(params["batch_size"]), row_count)
+            indices = order[:batch_rows].tolist()
+        batch_index = torch.tensor(indices, dtype=torch.long, device=device_object)
+        batch_inputs = inputs.index_select(0, batch_index)
+        batch_targets = targets.index_select(0, batch_index)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(batch_inputs)
+        loss = loss_function(logits, batch_targets)
+        loss_value = float(loss.detach().cpu().item())
+        if not math.isfinite(loss_value):
+            raise RuntimeError("non_finite_loss_at_step:" + str(step_index))
+        loss.backward()
+        gradient_norm = _gradient_norm(model)
+        if not math.isfinite(gradient_norm):
+            raise RuntimeError("non_finite_gradient_norm_at_step:" + str(step_index))
+        if gradient_norm <= 0.0:
+            raise RuntimeError("zero_gradient_at_step:" + str(step_index))
+        optimizer.step()
+        parameter_delta = _parameter_delta(model, previous_snapshot)
+        previous_snapshot = _snapshot_parameters(model)
+        loss_records.append({
+            "step": step_index,
+            "batch_rows": batch_rows,
+            "loss": loss_value,
+            "gradient_norm": gradient_norm,
+            "parameter_delta": parameter_delta,
+        })
+    return loss_records, generator
+
+
 def train_arrays(
     features: Any,
     labels: Any,
@@ -601,6 +700,7 @@ def train_arrays(
     diagnostics = configure_runtime()
     runtime = cuda_runtime_report()
     runtime["tf32"] = diagnostics
+    runtime["training_device"] = "cuda"
 
     features_array, labels_array = validate_arrays(features, labels)
     _seed_everything(params["seed"])
@@ -613,66 +713,25 @@ def train_arrays(
     model = PairHead(hidden_dim=params["hidden_dim"]).to(device_object)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=params["learning_rate"])
-    loss_function = nn.BCEWithLogitsLoss()
 
     row_count = int(features_array.shape[0])
-    if sampling == SAMPLING_CLASS_BALANCED:
-        balanced_batches = class_balanced_batch_indices(
-            labels_array,
-            seed=params["seed"],
-            steps=params["steps"],
-            batch_size=params["batch_size"],
-        )
-        order: list[int] = []
-    else:
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(params["seed"])
-        order = torch.randperm(row_count, generator=generator).tolist()
-
     initial_logits = predict_arrays(model, features_array, device="cuda")
     initial_evaluation_bce = _mean_bce_from_logits(initial_logits, labels_array)
     model.train()
 
     initial_snapshot = _snapshot_parameters(model)
-    previous_snapshot = initial_snapshot
-    loss_records: list[dict[str, Any]] = []
-
-    for step_index in range(1, params["steps"] + 1):
-        if sampling == SAMPLING_CLASS_BALANCED:
-            indices = balanced_batches[step_index - 1]
-            batch_rows = len(indices)
-        else:
-            batch_rows = min(params["batch_size"], row_count)
-            indices = [
-                order[((step_index - 1) * params["batch_size"] + offset) % row_count]
-                for offset in range(batch_rows)
-            ]
-        batch_index = torch.tensor(indices, dtype=torch.long, device=device_object)
-        batch_inputs = inputs.index_select(0, batch_index)
-        batch_targets = targets.index_select(0, batch_index)
-
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(batch_inputs)
-        loss = loss_function(logits, batch_targets)
-        loss_value = float(loss.detach().cpu().item())
-        if not math.isfinite(loss_value):
-            raise RuntimeError("non_finite_loss_at_step:" + str(step_index))
-        loss.backward()
-        gradient_norm = _gradient_norm(model)
-        if not math.isfinite(gradient_norm):
-            raise RuntimeError("non_finite_gradient_norm_at_step:" + str(step_index))
-        if gradient_norm <= 0.0:
-            raise RuntimeError("zero_gradient_at_step:" + str(step_index))
-        optimizer.step()
-        parameter_delta = _parameter_delta(model, previous_snapshot)
-        previous_snapshot = _snapshot_parameters(model)
-        loss_records.append({
-            "step": step_index,
-            "batch_rows": batch_rows,
-            "loss": loss_value,
-            "gradient_norm": gradient_norm,
-            "parameter_delta": parameter_delta,
-        })
+    loss_records, sampling_generator = _execute_optimizer_steps(
+        model,
+        optimizer,
+        inputs,
+        targets,
+        row_count=row_count,
+        labels_array=labels_array,
+        params=params,
+        sampling=sampling,
+        start_step=0,
+        total_steps=params["steps"],
+    )
 
     torch.cuda.synchronize()
     total_parameter_delta = _parameter_delta(model, initial_snapshot)
@@ -694,6 +753,8 @@ def train_arrays(
         "optimizer": optimizer,
         "config": model.config(),
         "runtime": runtime,
+        "sampling_generator": sampling_generator,
+        "training_params": dict(params),
         "logits": [float(value) for value in logits],
         "records": {
             "loss_records": loss_records,
@@ -925,6 +986,327 @@ def predict_arrays(
 
 
 # ---------------------------------------------------------------------------
+# Reproducible recovery state (weights-only compatible primitives/tensors)
+# ---------------------------------------------------------------------------
+
+def _make_cpu_generator(seed: int) -> torch.Generator:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def _serialize_numpy_rng_state() -> dict[str, Any]:
+    algorithm, keys, position, has_gauss, cached_gaussian = np.random.get_state()
+    if algorithm != "MT19937":
+        raise RuntimeError("numpy_rng_algorithm_unexpected:" + repr(algorithm))
+    return {
+        "algorithm": "MT19937",
+        "keys": [int(value) for value in keys],
+        "pos": int(position),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached_gaussian),
+    }
+
+
+def _validate_numpy_rng_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("checkpoint_numpy_rng_state_invalid")
+    if value.get("algorithm") != "MT19937":
+        raise ValueError("checkpoint_numpy_rng_state_invalid:algorithm")
+    keys = value.get("keys")
+    if (
+        not isinstance(keys, list)
+        or len(keys) != 624
+        or any(type(item) is not int or item < 0 or item > 2 ** 32 - 1 for item in keys)
+    ):
+        raise ValueError("checkpoint_numpy_rng_state_invalid:keys")
+    position = value.get("pos")
+    if type(position) is not int or not 0 <= position <= 624:
+        raise ValueError("checkpoint_numpy_rng_state_invalid:pos")
+    has_gauss = value.get("has_gauss")
+    if type(has_gauss) is not int or has_gauss not in (0, 1):
+        raise ValueError("checkpoint_numpy_rng_state_invalid:has_gauss")
+    cached = value.get("cached_gaussian")
+    if (
+        isinstance(cached, bool)
+        or not isinstance(cached, (int, float))
+        or not math.isfinite(float(cached))
+    ):
+        raise ValueError("checkpoint_numpy_rng_state_invalid:cached_gaussian")
+    return {
+        "algorithm": "MT19937",
+        "keys": [int(item) for item in keys],
+        "pos": position,
+        "has_gauss": has_gauss,
+        "cached_gaussian": float(cached),
+    }
+
+
+def _validate_python_rng_state(value: Any) -> tuple[Any, ...]:
+    if not isinstance(value, tuple) or len(value) != 3:
+        raise ValueError("checkpoint_python_rng_state_invalid")
+    version, internal, gauss = value
+    if type(version) is not int or version != 3:
+        raise ValueError("checkpoint_python_rng_state_invalid:version")
+    if (
+        not isinstance(internal, tuple)
+        or not internal
+        or any(type(item) is not int or item < 0 for item in internal)
+    ):
+        raise ValueError("checkpoint_python_rng_state_invalid:internal")
+    if gauss is not None and (
+        isinstance(gauss, bool)
+        or not isinstance(gauss, (int, float))
+        or not math.isfinite(float(gauss))
+    ):
+        raise ValueError("checkpoint_python_rng_state_invalid:gauss")
+    return value
+
+
+def _validate_rng_tensor(value: Any, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor) or value.dtype != torch.uint8:
+        raise ValueError("checkpoint_" + name + "_invalid")
+    tensor = value.detach().to("cpu")
+    if tensor.ndim != 1 or tensor.numel() < 1:
+        raise ValueError("checkpoint_" + name + "_invalid:shape")
+    return tensor
+
+
+def _capture_recovery_rng_states(generator: "torch.Generator | None" = None) -> dict[str, Any]:
+    """Capture Python/NumPy/CPU-Torch RNG state as weights-only-safe values."""
+    if generator is None:
+        generator = torch.Generator(device="cpu")
+    return {
+        "torch_rng_state": torch.get_rng_state(),
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": _serialize_numpy_rng_state(),
+        "torch_cpu_generator_state": generator.get_state(),
+    }
+
+
+def _validate_recovery_rng_states(states: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(states, Mapping):
+        raise ValueError("checkpoint_rng_states_invalid")
+    if set(states) != {
+        "torch_rng_state",
+        "python_rng_state",
+        "numpy_rng_state",
+        "torch_cpu_generator_state",
+    }:
+        raise ValueError("checkpoint_rng_states_invalid:keys")
+    return {
+        "torch_rng_state": _validate_rng_tensor(
+            states["torch_rng_state"], "torch_rng_state",
+        ),
+        "python_rng_state": _validate_python_rng_state(states["python_rng_state"]),
+        "numpy_rng_state": _validate_numpy_rng_state(states["numpy_rng_state"]),
+        "torch_cpu_generator_state": _validate_rng_tensor(
+            states["torch_cpu_generator_state"], "torch_cpu_generator_state",
+        ),
+    }
+
+
+def apply_recovery_rng_states(
+    payload: Mapping[str, Any], *, generator: "torch.Generator | None" = None,
+) -> dict[str, Any]:
+    """Restore Python/NumPy/CPU-Torch RNG state from a loaded checkpoint."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("checkpoint_rng_payload_not_mapping")
+    states = _validate_recovery_rng_states({
+        "torch_rng_state": payload.get("torch_rng_state"),
+        "python_rng_state": payload.get("python_rng_state"),
+        "numpy_rng_state": payload.get("numpy_rng_state"),
+        "torch_cpu_generator_state": payload.get("torch_cpu_generator_state"),
+    })
+    torch.set_rng_state(states["torch_rng_state"])
+    random.setstate(states["python_rng_state"])
+    numpy_state = states["numpy_rng_state"]
+    np.random.set_state((
+        numpy_state["algorithm"],
+        np.asarray(numpy_state["keys"], dtype=np.uint32),
+        numpy_state["pos"],
+        numpy_state["has_gauss"],
+        numpy_state["cached_gaussian"],
+    ))
+    if generator is not None:
+        generator.set_state(states["torch_cpu_generator_state"])
+    return states
+
+
+# ---------------------------------------------------------------------------
+# Optimizer / training configuration contracts
+# ---------------------------------------------------------------------------
+
+def _build_optimizer_config(optimizer: Any) -> dict[str, Any]:
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        raise TypeError("optimizer_required")
+    if not isinstance(optimizer, torch.optim.Adam):
+        raise ValueError("optimizer_must_be_adam")
+    groups = optimizer.param_groups
+    if len(groups) != 1:
+        raise ValueError("optimizer_param_group_count_unsupported")
+    group = groups[0]
+    return {
+        "name": OPTIMIZER_NAME,
+        "learning_rate": float(group["lr"]),
+        "betas": [float(value) for value in group["betas"]],
+        "eps": float(group["eps"]),
+        "weight_decay": float(group["weight_decay"]),
+    }
+
+
+def _validate_optimizer_config(config: Any) -> dict[str, Any]:
+    if not isinstance(config, Mapping):
+        raise ValueError("checkpoint_optimizer_config_invalid")
+    if config.get("name") != OPTIMIZER_NAME:
+        raise ValueError("checkpoint_optimizer_config_invalid:name")
+    learning_rate = config.get("learning_rate")
+    if (
+        isinstance(learning_rate, bool)
+        or not isinstance(learning_rate, (int, float))
+        or not math.isfinite(float(learning_rate))
+        or float(learning_rate) <= 0.0
+    ):
+        raise ValueError("checkpoint_optimizer_config_invalid:learning_rate")
+    betas = config.get("betas")
+    if (
+        not isinstance(betas, list)
+        or len(betas) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not 0.0 <= float(value) < 1.0
+            for value in betas
+        )
+    ):
+        raise ValueError("checkpoint_optimizer_config_invalid:betas")
+    eps = config.get("eps")
+    if (
+        isinstance(eps, bool)
+        or not isinstance(eps, (int, float))
+        or not math.isfinite(float(eps))
+        or float(eps) <= 0.0
+    ):
+        raise ValueError("checkpoint_optimizer_config_invalid:eps")
+    weight_decay = config.get("weight_decay")
+    if (
+        isinstance(weight_decay, bool)
+        or not isinstance(weight_decay, (int, float))
+        or not math.isfinite(float(weight_decay))
+        or float(weight_decay) < 0.0
+    ):
+        raise ValueError("checkpoint_optimizer_config_invalid:weight_decay")
+    return {
+        "name": OPTIMIZER_NAME,
+        "learning_rate": float(learning_rate),
+        "betas": [float(value) for value in betas],
+        "eps": float(eps),
+        "weight_decay": float(weight_decay),
+    }
+
+
+def _validate_training_config(config: Any) -> dict[str, Any]:
+    if not isinstance(config, Mapping):
+        raise ValueError("checkpoint_training_config_invalid")
+    batch_size = _require_int(
+        config.get("batch_size"), "batch_size", MIN_BATCH_SIZE, MAX_BATCH_SIZE,
+    )
+    sampling = config.get("sampling")
+    if sampling not in VALID_SAMPLING_MODES:
+        raise ValueError("checkpoint_training_config_invalid:sampling")
+    return {"batch_size": batch_size, "sampling": sampling}
+
+
+def _expected_model_state_shapes(config: Mapping[str, Any]) -> dict[str, tuple[int, ...]]:
+    model = build_model(config)
+    return {
+        name: tuple(tensor.shape) for name, tensor in model.state_dict().items()
+    }
+
+
+def _validate_model_state_dict(
+    model_state: Any, config: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    if not isinstance(model_state, Mapping) or not model_state:
+        raise ValueError("checkpoint_model_state_invalid")
+    if not all(
+        isinstance(name, str) and isinstance(tensor, torch.Tensor)
+        for name, tensor in model_state.items()
+    ):
+        raise ValueError("checkpoint_model_state_invalid")
+    expected = _expected_model_state_shapes(config)
+    if set(model_state) != set(expected):
+        raise ValueError("checkpoint_model_state_keys_mismatch")
+    normalized: dict[str, torch.Tensor] = {}
+    for name, shape in expected.items():
+        tensor = model_state[name]
+        if tuple(tensor.shape) != shape:
+            raise ValueError("checkpoint_model_state_shape_mismatch:" + name)
+        if not bool(torch.isfinite(tensor.detach()).all().item()):
+            raise ValueError("checkpoint_model_state_non_finite:" + name)
+        normalized[name] = tensor
+    return normalized
+
+
+def _validate_optimizer_state_dict(
+    optimizer_state: Any, config: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(optimizer_state, Mapping):
+        raise ValueError("checkpoint_optimizer_state_invalid")
+    if set(optimizer_state) != {"state", "param_groups"}:
+        raise ValueError("checkpoint_optimizer_state_invalid:keys")
+    param_groups = optimizer_state["param_groups"]
+    if not isinstance(param_groups, list) or len(param_groups) != 1:
+        raise ValueError("checkpoint_optimizer_state_invalid:param_groups")
+    group = param_groups[0]
+    if not isinstance(group, Mapping):
+        raise ValueError("checkpoint_optimizer_state_invalid:param_group")
+    model = build_model(config)
+    expected_shapes = [tuple(parameter.shape) for parameter in model.parameters()]
+    params = group.get("params")
+    if not isinstance(params, list) or params != list(range(len(expected_shapes))):
+        raise ValueError("checkpoint_optimizer_state_invalid:params")
+    learning_rate = group.get("lr")
+    if (
+        isinstance(learning_rate, bool)
+        or not isinstance(learning_rate, (int, float))
+        or not math.isfinite(float(learning_rate))
+        or float(learning_rate) <= 0.0
+    ):
+        raise ValueError("checkpoint_optimizer_state_invalid:lr")
+    entries = optimizer_state["state"]
+    if not isinstance(entries, Mapping) or not entries:
+        raise ValueError("checkpoint_optimizer_state_invalid:state")
+    required_entry_keys = {"step", "exp_avg", "exp_avg_sq"}
+    normalized_entries: dict[int, dict[str, torch.Tensor]] = {}
+    for param_id, entry in entries.items():
+        if type(param_id) is not int or not 0 <= param_id < len(expected_shapes):
+            raise ValueError("checkpoint_optimizer_state_invalid:param_id")
+        if not isinstance(entry, Mapping) or set(entry) != required_entry_keys:
+            raise ValueError("checkpoint_optimizer_state_invalid:entry")
+        step_tensor = entry["step"]
+        if not isinstance(step_tensor, torch.Tensor) or step_tensor.numel() != 1:
+            raise ValueError("checkpoint_optimizer_state_invalid:step")
+        if not bool(torch.isfinite(step_tensor.detach()).all().item()):
+            raise ValueError("checkpoint_optimizer_state_invalid:step:non_finite")
+        normalized_entry: dict[str, torch.Tensor] = {"step": step_tensor}
+        for name in ("exp_avg", "exp_avg_sq"):
+            tensor = entry[name]
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError("checkpoint_optimizer_state_invalid:" + name)
+            if tuple(tensor.shape) != expected_shapes[param_id]:
+                raise ValueError("checkpoint_optimizer_state_invalid:" + name + ":shape")
+            if not bool(torch.isfinite(tensor.detach()).all().item()):
+                raise ValueError("checkpoint_optimizer_state_invalid:" + name + ":non_finite")
+            normalized_entry[name] = tensor
+        normalized_entries[param_id] = normalized_entry
+    return {
+        "state": normalized_entries,
+        "param_groups": [dict(group)],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Safe, atomic checkpoint
 # ---------------------------------------------------------------------------
 
@@ -948,13 +1330,45 @@ def _validate_input_metadata(metadata: Any) -> dict[str, Any]:
     rows = metadata.get("rows")
     if type(rows) is not int or rows != len(pair_keys):
         raise ValueError("input_metadata_rows_invalid")
-    return {
+    validated = {
         "arrays_sha256": arrays_sha256,
         "input_manifest_sha256": input_manifest_sha256,
         "pair_keys": list(pair_keys),
         "purpose": purpose,
         "rows": rows,
     }
+    for name in _OPTIONAL_INPUT_METADATA_KEYS:
+        value = metadata.get(name)
+        if value is None:
+            continue
+        validated[name] = _require_sha256(value, name)
+    return validated
+
+
+def _validate_cuda_training_runtime(runtime: Any) -> dict[str, Any]:
+    if not isinstance(runtime, Mapping):
+        raise ValueError("checkpoint_runtime_not_mapping")
+    if runtime.get("training_device") != "cuda":
+        raise ValueError("checkpoint_runtime_training_device_must_be_cuda")
+    if runtime.get("cuda_available") is not True:
+        raise ValueError("checkpoint_runtime_cuda_not_available")
+    device_name = runtime.get("device_name")
+    if not isinstance(device_name, str) or not device_name:
+        raise ValueError("checkpoint_runtime_device_name_missing")
+    capability = runtime.get("capability")
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or any(type(value) is not int for value in capability)
+    ):
+        raise ValueError("checkpoint_runtime_capability_invalid")
+    torch_version = runtime.get("torch")
+    if not isinstance(torch_version, str) or not torch_version:
+        raise ValueError("checkpoint_runtime_torch_version_missing")
+    cuda_version = runtime.get("torch_cuda")
+    if cuda_version is not None and not isinstance(cuda_version, str):
+        raise ValueError("checkpoint_runtime_cuda_version_invalid")
+    return dict(runtime)
 
 
 def save_checkpoint(
@@ -967,8 +1381,16 @@ def save_checkpoint(
     config: Any,
     input_metadata: Any,
     runtime: Mapping[str, Any] | None = None,
+    training_config: Mapping[str, Any] | None = None,
+    optimizer_config: Mapping[str, Any] | None = None,
+    recovery_rng_states: Mapping[str, Any] | None = None,
+    require_cuda_runtime: bool = False,
 ) -> dict[str, Any]:
-    """Atomically save model/optimizer state plus primitive and tensor metadata."""
+    """Atomically save the reproducible-resume checkpoint contract.
+
+    The payload is intentionally restricted to state dicts plus primitive and
+    tensor values so the restricted weights-only unpickler can always read it.
+    """
     destination = Path(os.path.expanduser(os.fspath(path)))
     if not destination.is_absolute():
         raise ValueError("checkpoint_path_must_be_absolute")
@@ -980,6 +1402,25 @@ def save_checkpoint(
     checked_seed = _require_int(seed, "seed", 0, 2 ** 63 - 1)
     checked_config = _validate_model_config(config)
     checked_metadata = _validate_input_metadata(input_metadata)
+    checked_optimizer_config = (
+        _build_optimizer_config(optimizer)
+        if optimizer_config is None
+        else _validate_optimizer_config(optimizer_config)
+    )
+    optimizer_learning_rate = float(optimizer.param_groups[0]["lr"])
+    if checked_optimizer_config["learning_rate"] != optimizer_learning_rate:
+        raise ValueError("optimizer_config_learning_rate_mismatch")
+    checked_training_config = (
+        {"batch_size": DEFAULT_BATCH_SIZE, "sampling": SAMPLING_LEGACY}
+        if training_config is None
+        else _validate_training_config(training_config)
+    )
+    if recovery_rng_states is None:
+        recovery_rng_states = _capture_recovery_rng_states()
+    checked_rng_states = _validate_recovery_rng_states(recovery_rng_states)
+    checked_runtime = dict(runtime) if runtime is not None else {}
+    if require_cuda_runtime:
+        _validate_cuda_training_runtime(checked_runtime)
     if not destination.parent.is_dir():
         raise ValueError("checkpoint_parent_missing:" + str(destination.parent))
     if destination.exists() or destination.is_symlink():
@@ -990,11 +1431,17 @@ def save_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "step": checked_step,
+        "global_step": checked_step,
         "seed": checked_seed,
         "config": checked_config,
+        "optimizer_config": checked_optimizer_config,
+        "training_config": checked_training_config,
         "input_metadata": checked_metadata,
-        "torch_rng_state": torch.get_rng_state(),
-        "runtime": dict(runtime) if runtime is not None else {},
+        "torch_rng_state": checked_rng_states["torch_rng_state"],
+        "python_rng_state": checked_rng_states["python_rng_state"],
+        "numpy_rng_state": checked_rng_states["numpy_rng_state"],
+        "torch_cpu_generator_state": checked_rng_states["torch_cpu_generator_state"],
+        "runtime": checked_runtime,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1012,6 +1459,8 @@ def save_checkpoint(
         "sha256": sha256_file(destination),
         "bytes": destination.stat().st_size,
         "format_version": CHECKPOINT_FORMAT_VERSION,
+        "step": checked_step,
+        "global_step": checked_step,
     }
 
 
@@ -1030,6 +1479,10 @@ def load_checkpoint(
     source = Path(os.path.expanduser(os.fspath(path)))
     if not source.is_file():
         raise ValueError("checkpoint_missing:" + str(source))
+    if expected_sha256 is not None:
+        _require_sha256(expected_sha256, "expected_checkpoint_sha256")
+    if expect_input_sha256 is not None:
+        _require_sha256(expect_input_sha256, "expect_input_sha256")
     actual_sha256 = sha256_file(source)
     if expected_sha256 is not None and actual_sha256 != expected_sha256:
         raise ValueError("checkpoint_sha256_mismatch")
@@ -1042,28 +1495,507 @@ def load_checkpoint(
     missing = [key for key in _CHECKPOINT_KEYS if key not in payload]
     if missing:
         raise ValueError("checkpoint_missing_keys:" + ",".join(missing))
+    unknown = sorted(set(payload) - set(_CHECKPOINT_KEYS))
+    if unknown:
+        raise ValueError("checkpoint_unknown_keys:" + ",".join(unknown))
     if payload["format_version"] != CHECKPOINT_FORMAT_VERSION:
         raise ValueError("checkpoint_format_unsupported")
-    if not isinstance(payload["model_state_dict"], Mapping):
-        raise ValueError("checkpoint_model_state_invalid")
-    if not all(
-        isinstance(name, str) and isinstance(tensor, torch.Tensor)
-        for name, tensor in payload["model_state_dict"].items()
-    ):
-        raise ValueError("checkpoint_model_state_invalid")
-    if not isinstance(payload["optimizer_state_dict"], Mapping):
-        raise ValueError("checkpoint_optimizer_state_invalid")
     checked_config = _validate_model_config(payload["config"])
     checked_metadata = _validate_input_metadata(payload["input_metadata"])
-    _require_int(payload["step"], "step", 1, MAX_STEPS)
+    checked_step = _require_int(payload["step"], "step", 1, MAX_STEPS)
+    checked_global_step = _require_int(payload["global_step"], "global_step", 1, MAX_STEPS)
+    if checked_global_step != checked_step:
+        raise ValueError("checkpoint_global_step_mismatch")
     _require_int(payload["seed"], "seed", 0, 2 ** 63 - 1)
-    if expect_input_sha256 is not None and checked_metadata["arrays_sha256"] != expect_input_sha256:
+    checked_model_state = _validate_model_state_dict(
+        payload["model_state_dict"], checked_config,
+    )
+    checked_optimizer_state = _validate_optimizer_state_dict(
+        payload["optimizer_state_dict"], checked_config,
+    )
+    checked_optimizer_config = _validate_optimizer_config(payload["optimizer_config"])
+    group_learning_rate = checked_optimizer_state["param_groups"][0].get("lr")
+    if (
+        isinstance(group_learning_rate, bool)
+        or not isinstance(group_learning_rate, (int, float))
+        or float(group_learning_rate) != checked_optimizer_config["learning_rate"]
+    ):
+        raise ValueError("checkpoint_optimizer_config_mismatch")
+    checked_training_config = _validate_training_config(payload["training_config"])
+    checked_rng_states = _validate_recovery_rng_states({
+        "torch_rng_state": payload["torch_rng_state"],
+        "python_rng_state": payload["python_rng_state"],
+        "numpy_rng_state": payload["numpy_rng_state"],
+        "torch_cpu_generator_state": payload["torch_cpu_generator_state"],
+    })
+    if not isinstance(payload["runtime"], Mapping):
+        raise ValueError("checkpoint_runtime_not_mapping")
+    if not isinstance(payload["created_at"], str) or not payload["created_at"]:
+        raise ValueError("checkpoint_created_at_invalid")
+    if expect_input_sha256 is not None and (
+        checked_metadata["arrays_sha256"] != expect_input_sha256
+    ):
         raise ValueError("checkpoint_input_binding_mismatch")
+    payload["model_state_dict"] = checked_model_state
+    payload["optimizer_state_dict"] = checked_optimizer_state
+    payload["optimizer_config"] = checked_optimizer_config
+    payload["training_config"] = checked_training_config
     payload["config"] = checked_config
     payload["input_metadata"] = checked_metadata
+    payload["step"] = checked_step
+    payload["global_step"] = checked_global_step
+    payload["torch_rng_state"] = checked_rng_states["torch_rng_state"]
+    payload["python_rng_state"] = checked_rng_states["python_rng_state"]
+    payload["numpy_rng_state"] = checked_rng_states["numpy_rng_state"]
+    payload["torch_cpu_generator_state"] = checked_rng_states["torch_cpu_generator_state"]
     payload["sha256"] = actual_sha256
     return payload
 
+
+# ---------------------------------------------------------------------------
+# Resume and standalone checkpoint prediction
+# ---------------------------------------------------------------------------
+
+def _load_run_arrays(
+    arrays_file: Path, *, expected_sha256: str, expected_rows: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    actual_sha256 = sha256_file(arrays_file)
+    if actual_sha256 != expected_sha256:
+        raise ValueError("resume_arrays_sha256_mismatch")
+    try:
+        with np.load(arrays_file, allow_pickle=False) as arrays:
+            if set(arrays.files) != {"features", "labels"}:
+                raise ValueError("arrays_keys_invalid:" + ",".join(sorted(arrays.files)))
+            features = arrays["features"]
+            labels = arrays["labels"]
+    except ValueError as exc:
+        raise ValueError("arrays_require_pickle_rejected:" + type(exc).__name__) from exc
+    features_array, labels_array = validate_arrays(features, labels)
+    if int(features_array.shape[0]) != expected_rows:
+        raise ValueError("resume_arrays_rows_mismatch")
+    return features_array, labels_array
+
+
+def _validate_resume_source_bindings(
+    payload: Mapping[str, Any],
+    input_manifest: Mapping[str, Any],
+    input_manifest_sha256: str,
+) -> None:
+    metadata = payload["input_metadata"]
+    if input_manifest_sha256 != metadata["input_manifest_sha256"]:
+        raise ValueError("resume_input_manifest_sha256_mismatch")
+    if input_manifest.get("purpose") != metadata["purpose"]:
+        raise ValueError("resume_input_manifest_purpose_mismatch")
+    pairs = input_manifest.get("pairs")
+    if not isinstance(pairs, list):
+        raise ValueError("resume_input_manifest_pairs_missing")
+    _validate_pair_metadata(pairs)
+    pair_keys = [pair["pair_key"] for pair in pairs]
+    if pair_keys != metadata["pair_keys"]:
+        raise ValueError("resume_input_manifest_pair_keys_mismatch")
+    development_record = input_manifest.get("development_manifest")
+    if "development_manifest_sha256" in metadata:
+        if not isinstance(development_record, Mapping) or (
+            development_record.get("sha256") != metadata["development_manifest_sha256"]
+        ):
+            raise ValueError("resume_development_manifest_binding_mismatch")
+    source_record = input_manifest.get("source")
+    for binding in (
+        "frozen_manifest_sha256",
+        "entities_sha256",
+        "feature_manifest_sha256",
+    ):
+        if binding not in metadata:
+            continue
+        if not isinstance(source_record, Mapping):
+            raise ValueError("resume_source_binding_missing:" + binding)
+        if source_record.get(binding) != metadata[binding]:
+            raise ValueError("resume_source_binding_mismatch:" + binding)
+
+
+def _move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer, device: Any,
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def _assert_optimizer_matches_config(
+    optimizer: torch.optim.Optimizer, config: Mapping[str, Any],
+) -> None:
+    checked = _validate_optimizer_config(config)
+    groups = optimizer.param_groups
+    if len(groups) != 1:
+        raise RuntimeError("resume_optimizer_param_group_count_mismatch")
+    group = groups[0]
+    if float(group["lr"]) != checked["learning_rate"]:
+        raise RuntimeError("checkpoint_optimizer_config_mismatch:learning_rate")
+    if [float(value) for value in group["betas"]] != checked["betas"]:
+        raise RuntimeError("checkpoint_optimizer_config_mismatch:betas")
+    if float(group["eps"]) != checked["eps"]:
+        raise RuntimeError("checkpoint_optimizer_config_mismatch:eps")
+    if float(group["weight_decay"]) != checked["weight_decay"]:
+        raise RuntimeError("checkpoint_optimizer_config_mismatch:weight_decay")
+
+
+def resume_training(
+    *,
+    resume_run: os.PathLike[str] | str,
+    out_dir: os.PathLike[str] | str,
+    additional_steps: Any,
+    expected_checkpoint_sha256: Any = None,
+) -> dict[str, Any]:
+    """Continue a CUDA optimizer trajectory from a weights-only checkpoint.
+
+    The prior run directory supplies its checkpoint, numeric arrays and input
+    manifest.  The new directory receives a v2 checkpoint at the final step plus
+    resume_result.json proving the continuation.  There is deliberately no
+    CPU fallback: any missing CUDA capability raises.
+    """
+    if not bool(torch.cuda.is_available()):
+        raise RuntimeError("cuda_unavailable_for_training")
+    source_root = Path(os.path.expanduser(os.fspath(resume_run)))
+    if not source_root.is_absolute():
+        raise ValueError("resume_run_must_be_absolute")
+    if not source_root.is_dir():
+        raise ValueError("resume_run_missing:" + str(source_root))
+    out_root = Path(os.path.expanduser(os.fspath(out_dir)))
+    if not out_root.is_absolute():
+        raise ValueError("out_dir_must_be_absolute")
+    if not out_root.is_dir():
+        raise ValueError("out_dir_missing:" + str(out_root))
+    destination_checkpoint = out_root / "checkpoint.pt"
+    if destination_checkpoint.exists() or destination_checkpoint.is_symlink():
+        raise FileExistsError("checkpoint_already_exists:" + str(destination_checkpoint))
+    source_checkpoint = source_root / "checkpoint.pt"
+    arrays_file = source_root / "training_arrays.npz"
+    input_manifest_path = source_root / "input_manifest.json"
+    for path, code in (
+        (source_checkpoint, "resume_checkpoint_missing"),
+        (arrays_file, "resume_arrays_missing"),
+        (input_manifest_path, "resume_input_manifest_missing"),
+    ):
+        if not path.is_file():
+            raise ValueError(code + ":" + str(path))
+    additional = _require_int(additional_steps, "additional_steps", 1, MAX_STEPS)
+    arrays_sha256 = sha256_file(arrays_file)
+    payload = load_checkpoint(
+        source_checkpoint,
+        map_location="cpu",
+        expected_sha256=expected_checkpoint_sha256,
+        expect_input_sha256=arrays_sha256,
+    )
+    start_step = payload["global_step"]
+    total_steps = start_step + additional
+    if total_steps > MAX_STEPS:
+        raise ValueError("resume_total_steps_exceed_max")
+    runtime = payload["runtime"]
+    _validate_cuda_training_runtime(runtime)
+    diagnostics = configure_runtime()
+    current_runtime = cuda_runtime_report()
+    current_runtime["tf32"] = diagnostics
+    current_runtime["training_device"] = "cuda"
+    for field in ("device_name", "capability", "torch", "torch_cuda"):
+        if runtime.get(field) != current_runtime.get(field):
+            raise RuntimeError("checkpoint_runtime_identity_mismatch:" + field)
+
+    input_manifest = _read_json(input_manifest_path)
+    _validate_resume_source_bindings(
+        payload,
+        input_manifest,
+        sha256_file(input_manifest_path),
+    )
+    features_array, labels_array = _load_run_arrays(
+        arrays_file,
+        expected_sha256=arrays_sha256,
+        expected_rows=payload["input_metadata"]["rows"],
+    )
+    if int(features_array.shape[0]) != len(payload["input_metadata"]["pair_keys"]):
+        raise ValueError("resume_pair_key_count_mismatch")
+
+    device_object = torch.device("cuda")
+    model = build_model(payload["config"]).to(device_object)
+    model.load_state_dict(payload["model_state_dict"])
+    model.train()
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=payload["optimizer_config"]["learning_rate"],
+    )
+    optimizer.load_state_dict(payload["optimizer_state_dict"])
+    _move_optimizer_state_to_device(optimizer, device_object)
+    _assert_optimizer_matches_config(optimizer, payload["optimizer_config"])
+
+    inputs = torch.from_numpy(features_array).to(device=device_object)
+    inputs.requires_grad_(False)
+    targets = torch.from_numpy(labels_array.astype(np.float32)).to(device_object)
+    sampling_generator = _make_cpu_generator(payload["seed"])
+    apply_recovery_rng_states(payload, generator=sampling_generator)
+
+    loss_records, sampling_generator = _execute_optimizer_steps(
+        model,
+        optimizer,
+        inputs,
+        targets,
+        row_count=int(features_array.shape[0]),
+        labels_array=labels_array,
+        params={
+            "seed": payload["seed"],
+            "batch_size": payload["training_config"]["batch_size"],
+        },
+        sampling=payload["training_config"]["sampling"],
+        start_step=start_step,
+        total_steps=total_steps,
+        generator=sampling_generator,
+    )
+    torch.cuda.synchronize()
+    logits = predict_arrays(model, features_array, device="cuda")
+    if not bool(np.isfinite(logits).all()):
+        raise RuntimeError("resume_non_finite_logits")
+
+    resumed_runtime = dict(current_runtime)
+    resumed_runtime["resumed_from"] = {
+        "run": str(source_root),
+        "checkpoint_path": str(source_checkpoint),
+        "checkpoint_sha256": payload["sha256"],
+        "start_step": start_step,
+        "additional_steps": additional,
+    }
+    checkpoint = save_checkpoint(
+        destination_checkpoint,
+        model=model,
+        optimizer=optimizer,
+        step=total_steps,
+        seed=payload["seed"],
+        config=payload["config"],
+        input_metadata=payload["input_metadata"],
+        runtime=resumed_runtime,
+        training_config=payload["training_config"],
+        optimizer_config=payload["optimizer_config"],
+        recovery_rng_states=_capture_recovery_rng_states(sampling_generator),
+        require_cuda_runtime=True,
+    )
+
+    reloaded = load_checkpoint(
+        destination_checkpoint,
+        map_location="cuda",
+        expected_sha256=checkpoint["sha256"],
+        expect_input_sha256=arrays_sha256,
+    )
+    reloaded_model = build_model(reloaded["config"]).to("cuda")
+    reloaded_model.load_state_dict(reloaded["model_state_dict"])
+    reloaded_logits = predict_arrays(reloaded_model, features_array, device="cuda")
+    reload_max_abs_diff = float(np.max(np.abs(
+        np.asarray(reloaded_logits, dtype=np.float64)
+        - np.asarray(logits, dtype=np.float64)
+    )))
+    reload_passed = bool(np.allclose(
+        reloaded_logits, logits, atol=ALLCLOSE_ATOL, rtol=ALLCLOSE_RTOL,
+    ))
+    if not reload_passed:
+        raise RuntimeError("resume_checkpoint_reload_logit_mismatch:" + repr(reload_max_abs_diff))
+
+    result = {
+        "schema_version": 1,
+        "status": "resumed",
+        "device": "cuda",
+        "runtime": resumed_runtime,
+        "config": payload["config"],
+        "optimizer_config": payload["optimizer_config"],
+        "training_config": payload["training_config"],
+        "seed": payload["seed"],
+        "start_step": start_step,
+        "additional_steps": additional,
+        "final_step": total_steps,
+        "loss_records": loss_records,
+        "final_loss": loss_records[-1]["loss"],
+        "logits": [float(value) for value in logits],
+        "checkpoint": checkpoint,
+        "source_checkpoint": {
+            "path": str(source_checkpoint),
+            "sha256": payload["sha256"],
+        },
+        "input_metadata": payload["input_metadata"],
+        "gpu_reload": {
+            "max_abs_diff": reload_max_abs_diff,
+            "atol": ALLCLOSE_ATOL,
+            "rtol": ALLCLOSE_RTOL,
+            "passed": reload_passed,
+        },
+    }
+    _write_json_new(out_root / "resume_result.json", result)
+    return {
+        "status": "resumed",
+        "out": str(out_root),
+        "device": "cuda",
+        "start_step": start_step,
+        "additional_steps": additional,
+        "final_step": total_steps,
+        "final_loss": result["final_loss"],
+        "checkpoint_sha256": checkpoint["sha256"],
+        "gpu_reload_max_abs_diff": reload_max_abs_diff,
+    }
+
+
+def _validate_prediction_request(request: Any) -> dict[str, Any]:
+    if not isinstance(request, Mapping):
+        raise ValueError("prediction_request_not_mapping")
+    if request.get("schema_version") != 1:
+        raise ValueError("prediction_request_schema_unsupported")
+    purpose = request.get("purpose")
+    if not isinstance(purpose, str) or not purpose:
+        raise ValueError("prediction_request_purpose_invalid")
+    pair_keys = request.get("pair_keys")
+    if not isinstance(pair_keys, list) or not pair_keys:
+        raise ValueError("prediction_pair_keys_empty")
+    if any(not isinstance(key, str) or not key for key in pair_keys):
+        raise ValueError("prediction_pair_key_invalid")
+    if len(set(pair_keys)) != len(pair_keys):
+        raise ValueError("prediction_pair_key_duplicate")
+    row_indices = request.get("training_row_indices")
+    if (
+        not isinstance(row_indices, list)
+        or len(row_indices) != len(pair_keys)
+        or any(type(value) is not int or value < 0 for value in row_indices)
+    ):
+        raise ValueError("prediction_training_row_indices_invalid")
+    if len(set(row_indices)) != len(row_indices):
+        raise ValueError("prediction_training_row_indices_duplicate")
+    validated = {
+        "schema_version": 1,
+        "purpose": purpose,
+        "pair_keys": list(pair_keys),
+        "training_row_indices": list(row_indices),
+    }
+    for name in (
+        "checkpoint_sha256",
+        "training_arrays_sha256",
+        "prediction_arrays_sha256",
+        "development_manifest_sha256",
+        "feature_manifest_sha256",
+    ):
+        validated[name] = _require_sha256(request.get(name), name)
+    return validated
+
+
+def run_prediction(
+    *,
+    checkpoint_path: os.PathLike[str] | str,
+    arrays_path: os.PathLike[str] | str,
+    request_path: os.PathLike[str] | str,
+    out_dir: os.PathLike[str] | str,
+) -> dict[str, Any]:
+    """Consume only a checkpoint plus a bound numeric prediction batch on CUDA."""
+    destination = Path(os.path.expanduser(os.fspath(out_dir)))
+    if not destination.is_absolute():
+        raise ValueError("out_dir_must_be_absolute")
+    if not destination.is_dir():
+        raise ValueError("out_dir_missing:" + str(destination))
+    result_path = destination / "gpu_prediction.json"
+    if result_path.exists() or result_path.is_symlink():
+        raise FileExistsError("gpu_prediction_already_exists:" + str(result_path))
+    checkpoint_file = Path(os.path.expanduser(os.fspath(checkpoint_path)))
+    arrays_file = Path(os.path.expanduser(os.fspath(arrays_path)))
+    request_file = Path(os.path.expanduser(os.fspath(request_path)))
+    for path, code in (
+        (checkpoint_file, "prediction_checkpoint_missing"),
+        (arrays_file, "prediction_arrays_missing"),
+        (request_file, "prediction_request_missing"),
+    ):
+        if not path.is_file():
+            raise ValueError(code + ":" + str(path))
+    request = _validate_prediction_request(_read_json(request_file))
+    actual_checkpoint_sha256 = sha256_file(checkpoint_file)
+    if actual_checkpoint_sha256 != request["checkpoint_sha256"]:
+        raise ValueError("prediction_checkpoint_sha256_mismatch")
+    actual_arrays_sha256 = sha256_file(arrays_file)
+    if actual_arrays_sha256 != request["prediction_arrays_sha256"]:
+        raise ValueError("prediction_arrays_sha256_mismatch")
+    try:
+        with np.load(arrays_file, allow_pickle=False) as arrays:
+            if set(arrays.files) != {"features"}:
+                raise ValueError("prediction_arrays_keys_invalid")
+            features = arrays["features"]
+    except ValueError as exc:
+        raise ValueError("prediction_arrays_load_rejected:" + type(exc).__name__) from exc
+    features_array = validate_feature_blocks(features)
+    if int(features_array.shape[0]) != len(request["pair_keys"]):
+        raise ValueError("prediction_arrays_rows_mismatch")
+    if not bool(torch.cuda.is_available()):
+        raise RuntimeError("cuda_unavailable_for_prediction")
+    payload = load_checkpoint(
+        checkpoint_file,
+        map_location="cpu",
+        expected_sha256=actual_checkpoint_sha256,
+    )
+    metadata = payload["input_metadata"]
+    if metadata["purpose"] != request["purpose"]:
+        raise ValueError("prediction_purpose_mismatch")
+    if metadata["arrays_sha256"] != request["training_arrays_sha256"]:
+        raise ValueError("prediction_training_arrays_binding_mismatch")
+    if metadata.get("development_manifest_sha256") != (
+        request["development_manifest_sha256"]
+    ):
+        raise ValueError("prediction_development_manifest_binding_mismatch")
+    if metadata.get("feature_manifest_sha256") != request["feature_manifest_sha256"]:
+        raise ValueError("prediction_feature_manifest_binding_mismatch")
+    training_pair_keys = metadata["pair_keys"]
+    for pair_key, row_index in zip(
+        request["pair_keys"], request["training_row_indices"],
+    ):
+        if row_index >= len(training_pair_keys):
+            raise ValueError("prediction_training_row_index_out_of_range")
+        if training_pair_keys[row_index] != pair_key:
+            raise ValueError("prediction_pair_key_binding_mismatch:" + pair_key)
+    diagnostics = configure_runtime()
+    runtime = cuda_runtime_report()
+    runtime["tf32"] = diagnostics
+    runtime["prediction_device"] = "cuda"
+    model = build_model(payload["config"]).to("cuda")
+    model.load_state_dict(payload["model_state_dict"])
+    logits = predict_arrays(model, features_array, device="cuda")
+    if not bool(np.isfinite(logits).all()):
+        raise RuntimeError("prediction_non_finite_logits")
+    result = {
+        "schema_version": 1,
+        "status": "predicted",
+        "device": "cuda",
+        "runtime": runtime,
+        "config": payload["config"],
+        "checkpoint": {
+            "path": str(checkpoint_file),
+            "sha256": actual_checkpoint_sha256,
+            "step": payload["step"],
+            "global_step": payload["global_step"],
+            "seed": payload["seed"],
+            "purpose": payload["input_metadata"]["purpose"],
+        },
+        "prediction_arrays": {
+            "path": str(arrays_file),
+            "sha256": actual_arrays_sha256,
+            "rows": int(features_array.shape[0]),
+        },
+        "request": {
+            "path": str(request_file),
+            "sha256": sha256_file(request_file),
+        },
+        "pair_keys": list(request["pair_keys"]),
+        "training_row_indices": list(request["training_row_indices"]),
+        "logits": [float(value) for value in logits],
+        "training_runtime": dict(payload["runtime"]),
+    }
+    _write_json_new(result_path, result)
+    return {
+        "status": "predicted",
+        "out": str(destination),
+        "device": "cuda",
+        "device_name": runtime.get("device_name"),
+        "pair_keys": list(request["pair_keys"]),
+        "logits": result["logits"],
+        "checkpoint_sha256": actual_checkpoint_sha256,
+        "prediction_arrays_sha256": actual_arrays_sha256,
+        "gpu_prediction_path": str(result_path),
+    }
 
 # ---------------------------------------------------------------------------
 # GPU-side CLI used by training.pair_pipeline
@@ -1292,6 +2224,21 @@ def run_training(
         "purpose": purpose,
         "rows": len(pair_keys),
     }
+    development_record = input_manifest.get("development_manifest")
+    if isinstance(development_record, Mapping):
+        input_metadata["development_manifest_sha256"] = _require_sha256(
+            development_record.get("sha256"), "development_manifest_sha256",
+        )
+    source_record = input_manifest.get("source")
+    if isinstance(source_record, Mapping):
+        for binding in (
+            "frozen_manifest_sha256",
+            "entities_sha256",
+            "feature_manifest_sha256",
+        ):
+            value = source_record.get(binding)
+            if value is not None:
+                input_metadata[binding] = _require_sha256(value, binding)
     checkpoint = save_checkpoint(
         out_root / "checkpoint.pt",
         model=model,
@@ -1301,6 +2248,14 @@ def run_training(
         config=config,
         input_metadata=input_metadata,
         runtime=runtime,
+        training_config={
+            "batch_size": params["batch_size"],
+            "sampling": sampling,
+        },
+        recovery_rng_states=_capture_recovery_rng_states(
+            result["sampling_generator"],
+        ),
+        require_cuda_runtime=True,
     )
 
     # GPU-side portable reload: same weights, same device, same logits.
@@ -1422,9 +2377,9 @@ def run_training(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="training.gpu_model",
-        description="CUDA-only pair-head training/checkpoint runner (Phase 03 tracer).",
+        description="CUDA-only pair-head training/checkpoint/prediction runner.",
     )
-    parser.add_argument("--arrays", required=True, help="training_arrays.npz from pair_pipeline")
+    parser.add_argument("--arrays", help="training_arrays.npz from pair_pipeline")
     parser.add_argument("--out", required=True, help="existing new run directory")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
@@ -1432,17 +2387,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LR)
     parser.add_argument("--hidden-dim", type=int, default=DEFAULT_HIDDEN_DIM)
     parser.add_argument("--device", default="cuda", choices=("cuda",))
+    parser.add_argument(
+        "--resume-run",
+        help="existing run directory whose checkpoint.pt is resumed",
+    )
+    parser.add_argument(
+        "--expected-checkpoint-sha256",
+        help="optional sha256 pin for a resumed or predicted checkpoint",
+    )
+    parser.add_argument("--predict-arrays", help="numeric prediction batch NPZ")
+    parser.add_argument("--predict-request", help="prediction request JSON")
+    parser.add_argument("--checkpoint", help="checkpoint.pt for standalone prediction")
     args = parser.parse_args(argv)
     try:
-        summary = run_training(
-            arrays_path=args.arrays,
-            out_dir=args.out,
-            seed=args.seed,
-            steps=args.steps,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            hidden_dim=args.hidden_dim,
-        )
+        if args.resume_run is not None:
+            summary = resume_training(
+                resume_run=args.resume_run,
+                out_dir=args.out,
+                additional_steps=args.steps,
+                expected_checkpoint_sha256=args.expected_checkpoint_sha256,
+            )
+        elif (
+            args.predict_arrays is not None
+            or args.predict_request is not None
+            or args.checkpoint is not None
+        ):
+            if not (args.predict_arrays and args.predict_request and args.checkpoint):
+                raise ValueError("prediction_arguments_incomplete")
+            summary = run_prediction(
+                checkpoint_path=args.checkpoint,
+                arrays_path=args.predict_arrays,
+                request_path=args.predict_request,
+                out_dir=args.out,
+            )
+        else:
+            if not args.arrays:
+                raise ValueError("arrays_argument_required")
+            summary = run_training(
+                arrays_path=args.arrays,
+                out_dir=args.out,
+                seed=args.seed,
+                steps=args.steps,
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                hidden_dim=args.hidden_dim,
+            )
     except Exception as exc:  # noqa: BLE001 - structured blocked report, no CPU fallback
         print(json.dumps({
             "status": "blocked",

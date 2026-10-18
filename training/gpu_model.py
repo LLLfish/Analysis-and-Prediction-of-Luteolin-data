@@ -46,6 +46,19 @@ MAX_STEPS = 1000
 MIN_BATCH_SIZE = 1
 MAX_BATCH_SIZE = 16
 
+SAMPLING_LEGACY = "legacy_permutation"
+SAMPLING_CLASS_BALANCED = "class_balanced"
+VALID_SAMPLING_MODES = (SAMPLING_LEGACY, SAMPLING_CLASS_BALANCED)
+
+FIT_DIAGNOSTIC_CRITERION_VERSION = "phase03-fit-diagnostic-v1"
+FIT_DIAGNOSTIC_MIN_RELATIVE_LOSS_DROP = 0.10
+FIT_DIAGNOSTIC_MIN_CORRECT_PER_CLASS = 1
+FIT_DIAGNOSTIC_RELATIVE_DROP_EPSILON = 1e-12
+FIT_DIAGNOSTIC_SCOPE = (
+    "training-only in-sample engineering fit diagnostic; no independent "
+    "holdout, no generalisation/AUC/calibration/ranking claim"
+)
+
 CHECKPOINT_FORMAT_VERSION = 1
 MODEL_ARCHITECTURE = "mlp_relu_logit_v1"
 ALLCLOSE_ATOL = 1e-6
@@ -169,6 +182,52 @@ def validate_labels(labels: Any, row_count: int) -> np.ndarray:
 def validate_arrays(features: Any, labels: Any, *, expected_dim: int = INPUT_DIM):
     features_array = validate_features(features, expected_dim=expected_dim)
     labels_array = validate_labels(labels, int(features_array.shape[0]))
+    return features_array, labels_array
+
+
+def validate_feature_blocks(features: Any, *, expected_dim: int = INPUT_DIM) -> np.ndarray:
+    """Validate the Morgan(2048)/ESM(320) block contract before tensor creation."""
+    if not isinstance(features, np.ndarray):
+        raise ValueError("features_not_numpy_array")
+    if features.ndim != 2:
+        raise ValueError("features_not_2d")
+    if features.shape[0] < 1:
+        raise ValueError("empty_features")
+    if features.shape[1] != expected_dim:
+        raise ValueError("feature_dim_mismatch:" + str(features.shape[1]))
+    if not np.issubdtype(features.dtype, np.floating):
+        raise ValueError("features_dtype_not_floating:" + str(features.dtype))
+    morgan = features[:, :INPUT_FP_DIM]
+    esm = features[:, INPUT_FP_DIM:]
+    if morgan.shape[1] != INPUT_FP_DIM:
+        raise ValueError("morgan_block_dim_mismatch:" + str(morgan.shape[1]))
+    if not bool(np.isfinite(morgan).all()):
+        raise ValueError("morgan_block_non_finite")
+    if not bool(np.isin(morgan, np.array([0.0, 1.0], dtype=morgan.dtype)).all()):
+        raise ValueError("morgan_block_not_binary")
+    if esm.shape[1] != INPUT_ESM_DIM:
+        raise ValueError("esm_block_dim_mismatch:" + str(esm.shape[1]))
+    if not bool(np.isfinite(esm).all()):
+        raise ValueError("esm_block_non_finite")
+    return np.ascontiguousarray(features, dtype=np.float32)
+
+
+def validate_training_input(
+    features: Any, labels: Any, *, pair_keys: Any = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fail-closed validation shared by legacy and development training runs."""
+    features_array = validate_feature_blocks(features)
+    labels_array = validate_labels(labels, int(features_array.shape[0]))
+    if pair_keys is not None:
+        if not isinstance(pair_keys, (list, tuple)):
+            raise ValueError("pair_keys_not_sequence")
+        keys = list(pair_keys)
+        if len(keys) != int(features_array.shape[0]):
+            raise ValueError("pair_key_count_mismatch")
+        if any(not isinstance(key, str) or not key for key in keys):
+            raise ValueError("pair_key_invalid")
+        if len(set(keys)) != len(keys):
+            raise ValueError("pair_key_duplicate")
     return features_array, labels_array
 
 
@@ -327,6 +386,189 @@ def _predicted_class_counts(logits: np.ndarray) -> dict[str, int]:
     return {"negative": int(logits.shape[0]) - positive, "positive": positive}
 
 
+def class_balanced_batch_indices(
+    labels: Any, *, seed: Any, steps: Any, batch_size: Any,
+) -> list[list[int]]:
+    """Deterministic class-balanced sampling for engineering fit diagnostics.
+
+    Every batch contains both classes whenever both are present in the labels;
+    the leading class alternates each step.  Row labels/order are never changed.
+    """
+    labels_array = validate_labels(labels, int(np.asarray(labels).shape[0]))
+    checked_seed = _require_int(seed, "seed", 0, 2 ** 63 - 1)
+    checked_steps = _require_int(steps, "steps", 1, MAX_STEPS)
+    checked_batch = _require_int(
+        batch_size, "batch_size", MIN_BATCH_SIZE, MAX_BATCH_SIZE,
+    )
+    inactive = np.flatnonzero(labels_array == 0)
+    active = np.flatnonzero(labels_array == 1)
+    if inactive.size == 0 or active.size == 0:
+        raise ValueError("class_balanced_sampling_requires_both_classes")
+    generator = np.random.default_rng(checked_seed)
+    generator.shuffle(inactive)
+    generator.shuffle(active)
+    pools = {
+        0: [int(index) for index in inactive],
+        1: [int(index) for index in active],
+    }
+    positions = {0: 0, 1: 0}
+    batches: list[list[int]] = []
+    for step in range(checked_steps):
+        second_class_count = checked_batch // 2
+        counts = {0: second_class_count, 1: checked_batch - second_class_count}
+        if step % 2 == 1:
+            counts = {0: counts[1], 1: counts[0]}
+        batch: list[int] = []
+        for class_label in (0, 1):
+            pool = pools[class_label]
+            position = positions[class_label]
+            for _ in range(counts[class_label]):
+                batch.append(pool[position % len(pool)])
+                position += 1
+            positions[class_label] = position
+        batches.append(batch)
+    return batches
+
+
+def prediction_metrics(logits: Any, labels: Any) -> dict[str, Any]:
+    """Confusion / per-class correctness for raw logits at the zero threshold."""
+    logits_array = np.asarray(logits, dtype=np.float64).reshape(-1)
+    labels_array = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if logits_array.shape[0] != labels_array.shape[0] or logits_array.size == 0:
+        raise ValueError("prediction_metric_shape_mismatch")
+    if not bool(np.isin(labels_array, np.array([0, 1], dtype=np.int64)).all()):
+        raise ValueError("label_out_of_domain")
+    if not bool(np.isfinite(logits_array).all()):
+        raise ValueError("prediction_metric_non_finite_logits")
+    predicted_positive = logits_array > 0.0
+    inactive = labels_array == 0
+    active = labels_array == 1
+    return {
+        "predicted_class_counts": {
+            "negative": int((~predicted_positive).sum()),
+            "positive": int(predicted_positive.sum()),
+        },
+        "per_class_total": {
+            "inactive": int(inactive.sum()),
+            "active": int(active.sum()),
+        },
+        "per_class_correct": {
+            "inactive": int((inactive & ~predicted_positive).sum()),
+            "active": int((active & predicted_positive).sum()),
+        },
+        "confusion": {
+            "inactive_predicted_inactive": int((inactive & ~predicted_positive).sum()),
+            "inactive_predicted_active": int((inactive & predicted_positive).sum()),
+            "active_predicted_inactive": int((active & ~predicted_positive).sum()),
+            "active_predicted_active": int((active & predicted_positive).sum()),
+        },
+    }
+
+
+def majority_baseline(labels: Any) -> dict[str, Any]:
+    """Majority-class baseline used to expose constant-majority predictions."""
+    labels_array = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if labels_array.size == 0:
+        raise ValueError("empty_labels")
+    if not bool(np.isin(labels_array, np.array([0, 1], dtype=np.int64)).all()):
+        raise ValueError("label_out_of_domain")
+    inactive = int((labels_array == 0).sum())
+    active = int((labels_array == 1).sum())
+    majority_class = "active" if active >= inactive else "inactive"
+    majority_count = max(active, inactive)
+    return {
+        "majority_class": majority_class,
+        "majority_class_count": majority_count,
+        "class_counts": {"inactive": inactive, "active": active},
+        "majority_class_accuracy": majority_count / int(labels_array.size),
+    }
+
+
+def _mean_bce_from_logits(logits: Any, labels: Any) -> float:
+    logits_array = np.asarray(logits, dtype=np.float64).reshape(-1)
+    labels_array = np.asarray(labels, dtype=np.float64).reshape(-1)
+    if logits_array.shape != labels_array.shape or logits_array.size == 0:
+        raise ValueError("prediction_metric_shape_mismatch")
+    if not bool(np.isfinite(logits_array).all()):
+        raise ValueError("prediction_metric_non_finite_logits")
+    values = np.logaddexp(0.0, logits_array) - labels_array * logits_array
+    return float(values.mean())
+
+
+def evaluate_fit_criterion(
+    *,
+    initial_loss: Any,
+    final_loss: Any,
+    initial_logits: Any,
+    final_logits: Any,
+    labels: Any,
+) -> dict[str, Any]:
+    """Falsifiable fixed-sample fit criterion: >=10% BCE drop and each class hit."""
+    if (
+        isinstance(initial_loss, bool) or not isinstance(initial_loss, (int, float))
+        or isinstance(final_loss, bool) or not isinstance(final_loss, (int, float))
+        or not math.isfinite(float(initial_loss))
+        or not math.isfinite(float(final_loss))
+        or float(initial_loss) <= 0.0
+    ):
+        raise ValueError("fit_diagnostic_loss_invalid")
+    metrics = prediction_metrics(final_logits, labels)
+    initial_value = float(initial_loss)
+    final_value = float(final_loss)
+    relative_drop = (initial_value - final_value) / initial_value
+    reasons: list[str] = []
+    if not (relative_drop + FIT_DIAGNOSTIC_RELATIVE_DROP_EPSILON
+            >= FIT_DIAGNOSTIC_MIN_RELATIVE_LOSS_DROP):
+        reasons.append("relative_bce_drop_below_threshold")
+    for label_name in ("inactive", "active"):
+        if metrics["per_class_correct"][label_name] < FIT_DIAGNOSTIC_MIN_CORRECT_PER_CLASS:
+            reasons.append("per_class_correct_below_one")
+            break
+    return {
+        "criterion_version": FIT_DIAGNOSTIC_CRITERION_VERSION,
+        "scope": FIT_DIAGNOSTIC_SCOPE,
+        "status": "failed" if reasons else "passed",
+        "reasons": reasons,
+        "initial_bce": initial_value,
+        "final_bce": final_value,
+        "relative_drop": relative_drop,
+        "min_relative_bce_drop": FIT_DIAGNOSTIC_MIN_RELATIVE_LOSS_DROP,
+        "min_correct_per_class": FIT_DIAGNOSTIC_MIN_CORRECT_PER_CLASS,
+        "per_class_correct": metrics["per_class_correct"],
+        "per_class_total": metrics["per_class_total"],
+        "confusion": metrics["confusion"],
+        "predicted_class_counts": metrics["predicted_class_counts"],
+    }
+
+
+def summarize_full_manifest_fit(
+    *, initial_bce: Any, final_bce: Any, final_logits: Any, labels: Any,
+) -> dict[str, Any]:
+    """In-sample loss/prediction summary used to detect majority-class collapse."""
+    initial_value = float(initial_bce)
+    final_value = float(final_bce)
+    if not (math.isfinite(initial_value) and math.isfinite(final_value)) or initial_value <= 0.0:
+        raise ValueError("fit_diagnostic_loss_invalid")
+    metrics = prediction_metrics(final_logits, labels)
+    baseline = majority_baseline(labels)
+    total = baseline["class_counts"]["inactive"] + baseline["class_counts"]["active"]
+    if baseline["majority_class"] == "active":
+        majority_predictions = metrics["predicted_class_counts"]["positive"]
+    else:
+        majority_predictions = metrics["predicted_class_counts"]["negative"]
+    return {
+        "scope": FIT_DIAGNOSTIC_SCOPE,
+        "initial_bce": initial_value,
+        "final_bce": final_value,
+        "relative_bce_drop": (initial_value - final_value) / initial_value,
+        "class_counts": baseline["class_counts"],
+        "predicted_class_counts": metrics["predicted_class_counts"],
+        "prediction_metrics": metrics,
+        "majority_baseline": baseline,
+        "majority_collapse": bool(majority_predictions == total),
+    }
+
+
 def train_arrays(
     features: Any,
     labels: Any,
@@ -337,6 +579,7 @@ def train_arrays(
     learning_rate: Any = DEFAULT_LR,
     device: Any = "cuda",
     hidden_dim: Any = DEFAULT_HIDDEN_DIM,
+    sampling: Any = SAMPLING_LEGACY,
 ) -> dict[str, Any]:
     """Run the bounded CUDA optimizer update used by the Phase 03 tracer.
 
@@ -352,6 +595,8 @@ def train_arrays(
         raise ValueError("training_device_must_be_cuda:" + repr(device))
     if not bool(torch.cuda.is_available()):
         raise RuntimeError("cuda_unavailable_for_training")
+    if sampling not in VALID_SAMPLING_MODES:
+        raise ValueError("invalid_sampling_mode:" + repr(sampling))
 
     diagnostics = configure_runtime()
     runtime = cuda_runtime_report()
@@ -370,21 +615,38 @@ def train_arrays(
     optimizer = torch.optim.Adam(model.parameters(), lr=params["learning_rate"])
     loss_function = nn.BCEWithLogitsLoss()
 
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(params["seed"])
     row_count = int(features_array.shape[0])
-    order = torch.randperm(row_count, generator=generator).tolist()
+    if sampling == SAMPLING_CLASS_BALANCED:
+        balanced_batches = class_balanced_batch_indices(
+            labels_array,
+            seed=params["seed"],
+            steps=params["steps"],
+            batch_size=params["batch_size"],
+        )
+        order: list[int] = []
+    else:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(params["seed"])
+        order = torch.randperm(row_count, generator=generator).tolist()
+
+    initial_logits = predict_arrays(model, features_array, device="cuda")
+    initial_evaluation_bce = _mean_bce_from_logits(initial_logits, labels_array)
+    model.train()
 
     initial_snapshot = _snapshot_parameters(model)
     previous_snapshot = initial_snapshot
     loss_records: list[dict[str, Any]] = []
 
     for step_index in range(1, params["steps"] + 1):
-        batch_rows = min(params["batch_size"], row_count)
-        indices = [
-            order[((step_index - 1) * params["batch_size"] + offset) % row_count]
-            for offset in range(batch_rows)
-        ]
+        if sampling == SAMPLING_CLASS_BALANCED:
+            indices = balanced_batches[step_index - 1]
+            batch_rows = len(indices)
+        else:
+            batch_rows = min(params["batch_size"], row_count)
+            indices = [
+                order[((step_index - 1) * params["batch_size"] + offset) % row_count]
+                for offset in range(batch_rows)
+            ]
         batch_index = torch.tensor(indices, dtype=torch.long, device=device_object)
         batch_inputs = inputs.index_select(0, batch_index)
         batch_targets = targets.index_select(0, batch_index)
@@ -418,6 +680,13 @@ def train_arrays(
         raise RuntimeError("trainable_head_parameters_did_not_change")
 
     logits = predict_arrays(model, features_array, device="cuda")
+    final_evaluation_bce = _mean_bce_from_logits(logits, labels_array)
+    evaluation = summarize_full_manifest_fit(
+        initial_bce=initial_evaluation_bce,
+        final_bce=final_evaluation_bce,
+        final_logits=logits,
+        labels=labels_array,
+    )
     runtime["synchronize_ok"] = True
 
     return {
@@ -438,7 +707,181 @@ def train_arrays(
             "loss_function": "bce_with_logits",
             "device": "cuda",
             "frozen_feature_input": True,
+            "sampling": sampling,
+            "trainable_parameter_names": [
+                name for name, _ in model.named_parameters()
+            ],
+            "evaluation": evaluation,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training-only fixed two-class fit diagnostic
+# ---------------------------------------------------------------------------
+
+def _validate_sample_rows(sample_rows: Any, row_count: int) -> list[int]:
+    if not isinstance(sample_rows, (list, tuple)) or not sample_rows:
+        raise ValueError("fit_diagnostic_sample_rows_invalid")
+    rows: list[int] = []
+    for value in sample_rows:
+        if type(value) is not int or value < 0 or value >= row_count:
+            raise ValueError("fit_diagnostic_sample_rows_invalid:" + repr(value))
+        rows.append(value)
+    if len(set(rows)) != len(rows):
+        raise ValueError("fit_diagnostic_sample_rows_duplicate")
+    return rows
+
+
+def run_fit_diagnostic(
+    features: Any,
+    labels: Any,
+    *,
+    sample_rows: Any,
+    pair_keys: Any,
+    seed: Any,
+    steps: Any,
+    batch_size: Any,
+    learning_rate: Any = DEFAULT_LR,
+    hidden_dim: Any = DEFAULT_HIDDEN_DIM,
+    device: Any = "cuda",
+) -> dict[str, Any]:
+    """Train a separate small two-class head on a fixed sample (in-sample probe).
+
+    The same fixed sample is evaluated before and after training; the diagnostic
+    passes only when the final BCE drops by at least 10% and every class has at
+    least one correct prediction.  This is a training-engineering diagnostic, not
+    generalisation evidence, and it never mutates source labels or manifests.
+    """
+    params = validate_training_params(
+        seed=seed, steps=steps, batch_size=batch_size,
+        learning_rate=learning_rate, hidden_dim=hidden_dim,
+    )
+    if not isinstance(device, str) or device != "cuda":
+        raise ValueError("fit_diagnostic_device_must_be_cuda:" + repr(device))
+    if not bool(torch.cuda.is_available()):
+        raise RuntimeError("cuda_unavailable_for_fit_diagnostic")
+
+    features_array, labels_array = validate_training_input(features, labels)
+    row_count = int(features_array.shape[0])
+    rows = _validate_sample_rows(sample_rows, row_count)
+    if not isinstance(pair_keys, (list, tuple)) or len(pair_keys) != len(rows):
+        raise ValueError("fit_diagnostic_sample_pair_keys_invalid")
+    sample_pair_keys: list[str] = []
+    for key in pair_keys:
+        if not isinstance(key, str) or not key:
+            raise ValueError("fit_diagnostic_sample_pair_keys_invalid")
+        sample_pair_keys.append(key)
+    sample_labels = labels_array[np.asarray(rows, dtype=np.int64)]
+    sample_class_counts = _class_counts(sample_labels)
+    if sample_class_counts["inactive"] < 1 or sample_class_counts["active"] < 1:
+        raise ValueError("fit_diagnostic_sample_requires_both_classes")
+
+    configure_runtime()
+    _seed_everything(params["seed"])
+    device_object = torch.device("cuda")
+    sample_features = np.ascontiguousarray(features_array[rows], dtype=np.float32)
+    inputs = torch.from_numpy(sample_features).to(device=device_object)
+    inputs.requires_grad_(False)
+    targets = torch.from_numpy(sample_labels.astype(np.float32)).to(device_object)
+
+    model = PairHead(hidden_dim=params["hidden_dim"]).to(device_object)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params["learning_rate"])
+    loss_function = nn.BCEWithLogitsLoss()
+
+    model.eval()
+    with torch.no_grad():
+        initial_logits_tensor = model(inputs)
+        initial_loss = float(loss_function(initial_logits_tensor, targets).item())
+    initial_logits = initial_logits_tensor.detach().to("cpu").to(torch.float32).numpy()
+
+    initial_snapshot = _snapshot_parameters(model)
+    previous_snapshot = initial_snapshot
+    loss_records: list[dict[str, Any]] = []
+    batches = class_balanced_batch_indices(
+        sample_labels,
+        seed=params["seed"],
+        steps=params["steps"],
+        batch_size=params["batch_size"],
+    )
+    model.train()
+    for step_index, indices in enumerate(batches, start=1):
+        batch_index = torch.tensor(indices, dtype=torch.long, device=device_object)
+        batch_inputs = inputs.index_select(0, batch_index)
+        batch_targets = targets.index_select(0, batch_index)
+        optimizer.zero_grad(set_to_none=True)
+        logits_tensor = model(batch_inputs)
+        loss = loss_function(logits_tensor, batch_targets)
+        loss_value = float(loss.detach().cpu().item())
+        if not math.isfinite(loss_value):
+            raise RuntimeError("fit_diagnostic_non_finite_loss_at_step:" + str(step_index))
+        loss.backward()
+        gradient_norm = _gradient_norm(model)
+        if not math.isfinite(gradient_norm):
+            raise RuntimeError(
+                "fit_diagnostic_non_finite_gradient_norm_at_step:" + str(step_index)
+            )
+        if gradient_norm <= 0.0:
+            raise RuntimeError("fit_diagnostic_zero_gradient_at_step:" + str(step_index))
+        optimizer.step()
+        parameter_delta = _parameter_delta(model, previous_snapshot)
+        previous_snapshot = _snapshot_parameters(model)
+        loss_records.append({
+            "step": step_index,
+            "batch_rows": len(indices),
+            "loss": loss_value,
+            "gradient_norm": gradient_norm,
+            "parameter_delta": parameter_delta,
+        })
+
+    torch.cuda.synchronize()
+    total_parameter_delta = _parameter_delta(model, initial_snapshot)
+    if not (math.isfinite(total_parameter_delta) and total_parameter_delta > 0.0):
+        raise RuntimeError("fit_diagnostic_head_parameters_did_not_change")
+
+    model.eval()
+    with torch.no_grad():
+        final_logits_tensor = model(inputs)
+        final_loss = float(loss_function(final_logits_tensor, targets).item())
+    final_logits = final_logits_tensor.detach().to("cpu").to(torch.float32).numpy()
+    if not math.isfinite(initial_loss) or not math.isfinite(final_loss):
+        raise RuntimeError("fit_diagnostic_non_finite_evaluation_loss")
+
+    criterion = evaluate_fit_criterion(
+        initial_loss=initial_loss,
+        final_loss=final_loss,
+        initial_logits=initial_logits,
+        final_logits=final_logits,
+        labels=sample_labels,
+    )
+    return {
+        "status": criterion["status"],
+        "reasons": criterion["reasons"],
+        "scope": FIT_DIAGNOSTIC_SCOPE,
+        "criterion_version": FIT_DIAGNOSTIC_CRITERION_VERSION,
+        "device": "cuda",
+        "sampling": SAMPLING_CLASS_BALANCED,
+        "seed": params["seed"],
+        "steps": params["steps"],
+        "steps_run": params["steps"],
+        "batch_size": params["batch_size"],
+        "learning_rate": params["learning_rate"],
+        "hidden_dim": params["hidden_dim"],
+        "sample_rows": rows,
+        "sample_pair_keys": sample_pair_keys,
+        "sample_labels": [int(value) for value in sample_labels.tolist()],
+        "sample_class_counts": sample_class_counts,
+        "criterion": criterion,
+        "initial_bce": criterion["initial_bce"],
+        "final_bce": criterion["final_bce"],
+        "relative_drop": criterion["relative_drop"],
+        "prediction_metrics": prediction_metrics(final_logits, sample_labels),
+        "total_parameter_delta": total_parameter_delta,
+        "trainable_parameter_names": [
+            name for name, _ in model.named_parameters()
+        ],
+        "frozen_feature_input": True,
+        "loss_records": loss_records,
     }
 
 
@@ -654,6 +1097,96 @@ def _write_json_new(path: Path, value: Mapping[str, Any]) -> str:
     return sha256_file(path)
 
 
+def _validate_pair_metadata(pairs: list[Any]) -> None:
+    """Reject missing identity fields, bad labels and row-order mismatches."""
+    for position, pair in enumerate(pairs):
+        if not isinstance(pair, Mapping):
+            raise ValueError("input_manifest_pair_metadata_invalid:" + str(position))
+        for field in ("pair_key", "molecule_chembl_id", "accession", "label", "label_name"):
+            if field not in pair or pair.get(field) in (None, ""):
+                raise ValueError("input_manifest_pair_metadata_invalid:" + field)
+        row_index = pair.get("row_index")
+        if row_index is not None:
+            if type(row_index) is not int or row_index != position:
+                raise ValueError(
+                    "input_manifest_pair_row_index_mismatch:" + str(position)
+                )
+        label = pair.get("label")
+        if type(label) is not int or label not in (0, 1):
+            raise ValueError("input_manifest_pair_label_invalid:" + str(position))
+        taxonomy_id = pair.get("taxonomy_id")
+        if taxonomy_id is not None and type(taxonomy_id) is not int:
+            raise ValueError("input_manifest_pair_metadata_invalid:taxonomy_id")
+
+
+def _validate_fit_diagnostic_plan(
+    plan: Any, pair_keys: list[str], labels_array: np.ndarray,
+) -> dict[str, Any]:
+    """Validate the declared fixed two-class diagnostic sample before training."""
+    if not isinstance(plan, Mapping):
+        raise ValueError("input_manifest_fit_diagnostic_invalid")
+    if type(plan.get("plan_version")) is not int or plan.get("plan_version") != 1:
+        raise ValueError("input_manifest_fit_diagnostic_invalid:plan_version")
+    checked_seed = _require_int(plan.get("seed"), "seed", 0, 2 ** 63 - 1)
+    checked_per_class = _require_int(
+        plan.get("per_class"), "per_class", 1, MAX_STEPS,
+    )
+    try:
+        rows = _validate_sample_rows(plan.get("sample_rows"), len(pair_keys))
+    except ValueError as exc:
+        raise ValueError(
+            "input_manifest_fit_diagnostic_invalid:" + str(exc),
+        ) from exc
+    declared_keys = plan.get("pair_keys")
+    declared_labels = plan.get("labels")
+    if (
+        not isinstance(declared_keys, list)
+        or not isinstance(declared_labels, list)
+        or len(declared_keys) != len(rows)
+        or len(declared_labels) != len(rows)
+    ):
+        raise ValueError("input_manifest_fit_diagnostic_invalid:sample_metadata")
+    expected_keys = [pair_keys[row] for row in rows]
+    if [value if isinstance(value, str) else None for value in declared_keys] != expected_keys:
+        raise ValueError("fit_diagnostic_sample_binding_mismatch")
+    expected_labels = [int(labels_array[row]) for row in rows]
+    parsed_labels: list[int] = []
+    for value in declared_labels:
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("input_manifest_fit_diagnostic_invalid:labels")
+        parsed_labels.append(value)
+    if parsed_labels != expected_labels:
+        raise ValueError("fit_diagnostic_sample_binding_mismatch")
+    class_counts = {
+        "inactive": sum(1 for value in expected_labels if value == 0),
+        "active": sum(1 for value in expected_labels if value == 1),
+    }
+    if class_counts["inactive"] < 1 or class_counts["active"] < 1:
+        raise ValueError("fit_diagnostic_sample_requires_both_classes")
+    declared_counts = plan.get("class_counts")
+    if declared_counts is not None and dict(declared_counts) != class_counts:
+        raise ValueError("fit_diagnostic_sample_binding_mismatch:class_counts")
+    criterion = plan.get("criterion")
+    if not isinstance(criterion, Mapping):
+        raise ValueError("fit_diagnostic_criterion_mismatch")
+    if criterion.get("version") != FIT_DIAGNOSTIC_CRITERION_VERSION:
+        raise ValueError("fit_diagnostic_criterion_mismatch:version")
+    if criterion.get("max_steps") != MAX_STEPS:
+        raise ValueError("fit_diagnostic_criterion_mismatch:max_steps")
+    if criterion.get("min_relative_bce_drop") != FIT_DIAGNOSTIC_MIN_RELATIVE_LOSS_DROP:
+        raise ValueError("fit_diagnostic_criterion_mismatch:min_relative_bce_drop")
+    if criterion.get("min_correct_per_class") != FIT_DIAGNOSTIC_MIN_CORRECT_PER_CLASS:
+        raise ValueError("fit_diagnostic_criterion_mismatch:min_correct_per_class")
+    return {
+        "seed": checked_seed,
+        "per_class": checked_per_class,
+        "sample_rows": rows,
+        "pair_keys": expected_keys,
+        "labels": expected_labels,
+        "class_counts": class_counts,
+    }
+
+
 def run_training(
     *,
     arrays_path: os.PathLike[str] | str,
@@ -690,26 +1223,52 @@ def run_training(
         raise ValueError("input_manifest_pair_keys_invalid")
     if len(set(pair_keys)) != len(pair_keys):
         raise ValueError("input_manifest_pair_keys_not_unique")
+    _validate_pair_metadata(pairs)
     input_manifest_sha256 = sha256_file(input_manifest_path)
 
+    array_names: tuple[str, ...] | None = None
+    features: Any = None
+    labels: Any = None
+    load_error: ValueError | None = None
     try:
         with np.load(arrays_file, allow_pickle=False) as arrays:
-            if set(arrays.files) != {"features", "labels"}:
-                raise ValueError("arrays_keys_invalid:" + ",".join(sorted(arrays.files)))
-            features = arrays["features"]
-            labels = arrays["labels"]
-    except ValueError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - object arrays cannot be loaded safely
+            array_names = tuple(sorted(arrays.files))
+            if set(array_names) == {"features", "labels"}:
+                features = arrays["features"]
+                labels = arrays["labels"]
+    except ValueError as exc:  # noqa: BLE001 - object pickles are rejected here
+        load_error = exc
+    except Exception as exc:  # noqa: BLE001 - any unreadable payload is rejected
         raise ValueError("arrays_require_pickle_rejected:" + type(exc).__name__) from exc
+    if load_error is not None:
+        message = str(load_error)
+        if "allow_pickle" in message or "Object arrays" in message or "object" in message:
+            raise ValueError(
+                "arrays_require_pickle_rejected:" + type(load_error).__name__,
+            ) from load_error
+        raise ValueError("arrays_load_rejected:" + type(load_error).__name__) from load_error
+    if array_names is None:
+        raise ValueError("arrays_load_rejected:no_arrays")
+    if set(array_names) != {"features", "labels"}:
+        raise ValueError("arrays_keys_invalid:" + ",".join(array_names))
 
     params = validate_training_params(
         seed=seed, steps=steps, batch_size=batch_size,
         learning_rate=learning_rate, hidden_dim=hidden_dim,
     )
-    features_array, labels_array = validate_arrays(features, labels)
+    features_array, labels_array = validate_training_input(
+        features, labels, pair_keys=pair_keys,
+    )
     if int(features_array.shape[0]) != len(pair_keys):
         raise ValueError("input_manifest_rows_mismatch")
+    fit_request = None
+    if input_manifest.get("fit_diagnostic") is not None:
+        fit_request = _validate_fit_diagnostic_plan(
+            input_manifest.get("fit_diagnostic"), pair_keys, labels_array,
+        )
+    sampling = (
+        SAMPLING_CLASS_BALANCED if fit_request is not None else SAMPLING_LEGACY
+    )
 
     result = train_arrays(
         features_array,
@@ -720,6 +1279,7 @@ def run_training(
         learning_rate=params["learning_rate"],
         device="cuda",
         hidden_dim=params["hidden_dim"],
+        sampling=sampling,
     )
     model = result["model"]
     optimizer = result["optimizer"]
@@ -762,6 +1322,45 @@ def run_training(
         raise RuntimeError("gpu_checkpoint_reload_logit_mismatch:" + repr(reload_max_abs_diff))
 
     loss_sha256 = _write_jsonl_new(out_root / "loss.jsonl", result["records"]["loss_records"])
+    training_evaluation = result["records"]["evaluation"]
+    fit_record: dict[str, Any] | None = None
+    fit_diagnostic_sha256: str | None = None
+    if fit_request is not None:
+        diagnostic = run_fit_diagnostic(
+            features_array,
+            labels_array,
+            sample_rows=fit_request["sample_rows"],
+            pair_keys=fit_request["pair_keys"],
+            seed=fit_request["seed"],
+            steps=params["steps"],
+            batch_size=params["batch_size"],
+            learning_rate=params["learning_rate"],
+            hidden_dim=params["hidden_dim"],
+            device="cuda",
+        )
+        reasons = list(diagnostic["criterion"]["reasons"])
+        if training_evaluation["majority_collapse"]:
+            reasons.append("full_manifest_predictions_only_majority_class")
+        fit_record = {
+            "schema_version": 1,
+            "status": "passed" if not reasons else "failed",
+            "reasons": reasons,
+            "criterion_version": FIT_DIAGNOSTIC_CRITERION_VERSION,
+            "scope": FIT_DIAGNOSTIC_SCOPE,
+            "plan": fit_request,
+            "small_sample": diagnostic,
+            "full_manifest": training_evaluation,
+            "data_use": {
+                "evaluation": "none (no independent holdout)",
+                "generalization_claims": "none",
+                "fit_scope": (
+                    "engineering development in-sample fit diagnostic only"
+                ),
+            },
+        }
+        fit_diagnostic_sha256 = _write_json_new(
+            out_root / "fit_diagnostic.json", fit_record,
+        )
     gpu_result = {
         "schema_version": 1,
         "status": "trained",
@@ -780,12 +1379,19 @@ def run_training(
             "frozen_feature_input": True,
             "class_counts": result["records"]["class_counts"],
             "predicted_class_counts": result["records"]["predicted_class_counts"],
+            "sampling": sampling,
+            "trainable_parameter_names": result["records"][
+                "trainable_parameter_names"
+            ],
         },
         "loss_records": result["records"]["loss_records"],
         "initial_loss": result["records"]["initial_loss"],
         "final_loss": result["records"]["final_loss"],
         "total_parameter_delta": result["records"]["total_parameter_delta"],
         "logits": result["logits"],
+        "evaluation": training_evaluation,
+        "fit_diagnostic": fit_record,
+        "fit_diagnostic_sha256": fit_diagnostic_sha256,
         "gpu_reload": {
             "max_abs_diff": reload_max_abs_diff,
             "atol": ALLCLOSE_ATOL,
@@ -808,6 +1414,8 @@ def run_training(
         "total_parameter_delta": gpu_result["total_parameter_delta"],
         "gpu_reload_max_abs_diff": reload_max_abs_diff,
         "checkpoint_sha256": checkpoint["sha256"],
+        "sampling": sampling,
+        "fit_diagnostic_status": fit_record["status"] if fit_record else None,
     }
 
 

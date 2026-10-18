@@ -33,7 +33,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from training import gpu_model
+from training import development_manifest, gpu_model
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -50,8 +50,16 @@ PURPOSE_STATEMENT = (
     "engineering-development tracer fit diagnostics only; no independent "
     "holdout, no AUC/probability calibration/ranking or generalisation claim"
 )
+PURPOSE_DEVELOPMENT = "engineering_development_fit_diagnostic"
+PURPOSE_DEVELOPMENT_STATEMENT = (
+    "manifest-bound engineering-development in-sample fit diagnostics only; no "
+    "independent holdout, no AUC/probability calibration/ranking or "
+    "generalisation claim"
+)
 LABEL_MAPPING = {"inactive": 0, "active": 1}
 EXCLUSION_RULES_VERSION = "phase03-tracer-eligibility-v1"
+FIT_DIAGNOSTIC_PER_CLASS = 8
+FIT_DIAGNOSTIC_SAMPLE_SEED = 42
 
 EXPECTED_FEATURE_MANIFEST_SHA256 = (
     "46d13b05db30c15e39cc4b455a5ab3ec1a0faf6265017b32301b08212da0c1c5"
@@ -690,6 +698,199 @@ def _git_code_version() -> dict[str, Any]:
         return {"git_commit": None, "reason": type(exc).__name__}
 
 
+# ---------------------------------------------------------------------------
+# Shared GPU subprocess / artefact validation helpers
+# ---------------------------------------------------------------------------
+
+def _gpu_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        str(APL_ROOT) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    )
+    environment["PYTHONHASHSEED"] = "0"
+    return environment
+
+
+def _gpu_command(
+    gpu_interpreter: Path,
+    prepared: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> list[str]:
+    return [
+        str(gpu_interpreter), "-B", "-X", "utf8", "-m", "training.gpu_model",
+        "--arrays", str(prepared["arrays_path"]),
+        "--out", str(prepared["out_dir"]),
+        "--seed", str(params["seed"]),
+        "--steps", str(params["steps"]),
+        "--batch-size", str(params["batch_size"]),
+        "--learning-rate", repr(params["learning_rate"]),
+        "--hidden-dim", str(params["hidden_dim"]),
+    ]
+
+
+def _run_gpu_process(gpu_command: list[str], run_root: Path) -> dict[str, Any]:
+    completed = subprocess.run(
+        gpu_command,
+        cwd=str(APL_ROOT),
+        env=_gpu_environment(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=3600,
+    )
+    process_log = (
+        "command: " + json.dumps(gpu_command, ensure_ascii=False) + "\n"
+        + "exit_code: " + str(completed.returncode) + "\n"
+        + "--- stdout ---\n" + completed.stdout + "\n"
+        + "--- stderr ---\n" + completed.stderr + "\n"
+    )
+    process_log_path = run_root / "gpu_process.log"
+    process_log_sha256 = _write_text_new(process_log_path, process_log)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "gpu_training_failed:exit=" + str(completed.returncode)
+            + ":" + completed.stderr.strip()[-2000:]
+        )
+    return {
+        "command": gpu_command,
+        "returncode": completed.returncode,
+        "process_log_path": process_log_path,
+        "process_log_sha256": process_log_sha256,
+    }
+
+
+def _validate_gpu_result(
+    *,
+    gpu_result: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    params: Mapping[str, Any],
+    run_root: Path,
+) -> dict[str, Any]:
+    if gpu_result.get("status") != "trained" or gpu_result.get("device") != "cuda":
+        raise RuntimeError("gpu_result_not_cuda_trained")
+    runtime = gpu_result.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise RuntimeError("gpu_result_runtime_missing")
+    if runtime.get("cuda_available") is not True:
+        raise RuntimeError("gpu_result_cuda_not_available")
+    tf32 = runtime.get("tf32")
+    if (
+        not isinstance(tf32, Mapping)
+        or tf32.get("cudnn_allow_tf32") is not False
+        or tf32.get("cuda_matmul_allow_tf32") is not False
+    ):
+        raise RuntimeError("gpu_tf32_not_disabled")
+    if tf32.get("float32_dtype") != "torch.float32":
+        raise RuntimeError("gpu_float32_not_recorded")
+    if gpu_result.get("arrays_sha256") != prepared["arrays_sha256"]:
+        raise RuntimeError("gpu_arrays_binding_mismatch")
+    if gpu_result.get("input_manifest_sha256") != prepared["input_manifest_sha256"]:
+        raise RuntimeError("gpu_input_manifest_binding_mismatch")
+    training = gpu_result.get("training")
+    if not isinstance(training, Mapping):
+        raise RuntimeError("gpu_training_record_missing")
+    trainable_parameter_names = training.get("trainable_parameter_names")
+    if not isinstance(trainable_parameter_names, list) or not trainable_parameter_names:
+        raise RuntimeError("gpu_trainable_parameter_names_missing")
+    for name in trainable_parameter_names:
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("gpu_trainable_parameter_names_invalid")
+        lowered = name.lower()
+        if "esm" in lowered or "backbone" in lowered:
+            raise RuntimeError("gpu_frozen_esm_has_trainable_parameters:" + name)
+    if training.get("frozen_feature_input") is not True:
+        raise RuntimeError("gpu_frozen_feature_input_not_recorded")
+    checkpoint_record = gpu_result.get("checkpoint")
+    if not isinstance(checkpoint_record, Mapping):
+        raise RuntimeError("gpu_checkpoint_record_missing")
+    checkpoint_path = run_root / "checkpoint.pt"
+    actual_checkpoint_sha256 = sha256_file(checkpoint_path)
+    if checkpoint_record.get("sha256") != actual_checkpoint_sha256:
+        raise RuntimeError("checkpoint_sha256_mismatch")
+    loss_records = gpu_result.get("loss_records")
+    if not isinstance(loss_records, list) or len(loss_records) != params["steps"]:
+        raise RuntimeError("gpu_loss_record_count_mismatch")
+    for record in loss_records:
+        if not isinstance(record, Mapping):
+            raise RuntimeError("gpu_loss_record_invalid")
+        for field in ("loss", "gradient_norm", "parameter_delta"):
+            value = record.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise RuntimeError("gpu_loss_record_non_finite:" + field)
+    total_delta = gpu_result.get("total_parameter_delta")
+    if (
+        isinstance(total_delta, bool)
+        or not isinstance(total_delta, (int, float))
+        or not math.isfinite(float(total_delta))
+        or float(total_delta) <= 0.0
+    ):
+        raise RuntimeError("gpu_trainable_head_did_not_update")
+    if gpu_result.get("gpu_reload", {}).get("passed") is not True:
+        raise RuntimeError("gpu_checkpoint_reload_not_confirmed")
+    return {
+        "runtime": dict(runtime),
+        "tf32": dict(tf32),
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_sha256": actual_checkpoint_sha256,
+        "loss_records": loss_records,
+        "total_delta": float(total_delta),
+        "training": dict(training),
+    }
+
+
+def _cpu_portable_reload(
+    *,
+    checkpoint_path: Path,
+    checkpoint_sha256: str,
+    prepared: Mapping[str, Any],
+    gpu_result: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> dict[str, Any]:
+    cpu_tf32 = gpu_model.configure_runtime()
+    cpu_runtime = gpu_model.cuda_runtime_report()
+    payload = gpu_model.load_checkpoint(
+        checkpoint_path,
+        map_location="cpu",
+        expected_sha256=checkpoint_sha256,
+        expect_input_sha256=prepared["arrays_sha256"],
+    )
+    if payload["step"] != params["steps"] or payload["seed"] != params["seed"]:
+        raise RuntimeError("cpu_checkpoint_step_or_seed_mismatch")
+    if payload["config"] != gpu_result.get("config"):
+        raise RuntimeError("cpu_checkpoint_config_mismatch")
+    if payload["input_metadata"]["pair_keys"] != [
+        pair["pair_key"] for pair in prepared["pairs"]
+    ]:
+        raise RuntimeError("cpu_checkpoint_pair_key_binding_mismatch")
+    features, labels = load_training_arrays(prepared["arrays_path"])
+    cpu_model = gpu_model.build_model(payload["config"])
+    cpu_model.load_state_dict(payload["model_state_dict"])
+    cpu_logits = gpu_model.predict_arrays(cpu_model, features, device="cpu")
+    gpu_logits = np.asarray(gpu_result["logits"], dtype=np.float32)
+    if gpu_logits.shape != cpu_logits.shape:
+        raise RuntimeError("cpu_gpu_logit_shape_mismatch")
+    max_abs_diff = float(np.max(np.abs(cpu_logits - gpu_logits)))
+    agreement = bool(np.allclose(
+        cpu_logits, gpu_logits, atol=ALLCLOSE_ATOL, rtol=ALLCLOSE_RTOL,
+    ))
+    if not agreement:
+        raise RuntimeError("cpu_portability_logit_mismatch:" + repr(max_abs_diff))
+    return {
+        "payload": payload,
+        "cpu_tf32": cpu_tf32,
+        "cpu_runtime": cpu_runtime,
+        "cpu_logits": cpu_logits,
+        "max_abs_diff": max_abs_diff,
+        "agreement": agreement,
+    }
+
+
 def train_real_pairs(
     *,
     manifest_path: os.PathLike[str] | str,
@@ -717,45 +918,9 @@ def train_real_pairs(
         expected_feature_manifest_sha256=EXPECTED_FEATURE_MANIFEST_SHA256,
     )
 
-    gpu_command = [
-        str(gpu_interpreter), "-B", "-X", "utf8", "-m", "training.gpu_model",
-        "--arrays", str(prepared["arrays_path"]),
-        "--out", str(run_root),
-        "--seed", str(params["seed"]),
-        "--steps", str(params["steps"]),
-        "--batch-size", str(params["batch_size"]),
-        "--learning-rate", repr(params["learning_rate"]),
-        "--hidden-dim", str(params["hidden_dim"]),
-    ]
-    environment = os.environ.copy()
-    existing_pythonpath = environment.get("PYTHONPATH", "")
-    environment["PYTHONPATH"] = (
-        str(APL_ROOT) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-    )
-    environment["PYTHONHASHSEED"] = "0"
-    completed = subprocess.run(
-        gpu_command,
-        cwd=str(APL_ROOT),
-        env=environment,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=3600,
-    )
-    process_log = (
-        "command: " + json.dumps(gpu_command, ensure_ascii=False) + "\n"
-        + "exit_code: " + str(completed.returncode) + "\n"
-        + "--- stdout ---\n" + completed.stdout + "\n"
-        + "--- stderr ---\n" + completed.stderr + "\n"
-    )
-    process_log_path = run_root / "gpu_process.log"
-    process_log_sha256 = _write_text_new(process_log_path, process_log)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "gpu_training_failed:exit=" + str(completed.returncode)
-            + ":" + completed.stderr.strip()[-2000:]
-        )
+    gpu_command = _gpu_command(gpu_interpreter, prepared, params)
+    process_log = _run_gpu_process(gpu_command, run_root)
+    process_log_sha256 = process_log["process_log_sha256"]
 
     gpu_result_path = run_root / "gpu_result.json"
     gpu_result = _load_json_object(gpu_result_path, "gpu_result")
@@ -940,6 +1105,519 @@ def train_real_pairs(
 
 
 # ---------------------------------------------------------------------------
+# Development-manifest (train-only) fit pipeline
+# ---------------------------------------------------------------------------
+
+def resolve_new_output_dir(out_dir: os.PathLike[str] | str) -> Path:
+    """Require a brand-new absolute output directory outside the APL source tree."""
+    unresolved = Path(os.path.expanduser(os.fspath(out_dir)))
+    if not unresolved.is_absolute():
+        raise ValueError("out_dir_must_be_absolute")
+    requested = Path(os.path.abspath(unresolved))
+    if requested.exists() or requested.is_symlink():
+        raise FileExistsError("output_directory_already_exists:" + str(requested))
+    if not requested.parent.is_dir():
+        raise ValueError("out_parent_missing:" + str(requested.parent))
+    resolved = requested.resolve(strict=False)
+    apl_root = APL_ROOT.resolve()
+    if resolved == apl_root or str(resolved).startswith(str(apl_root) + os.sep):
+        raise ValueError("output_dir_must_not_be_inside_APL_source")
+    requested.mkdir()
+    return requested
+
+
+def select_fit_diagnostic_sample(
+    pairs: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    *,
+    seed: Any = FIT_DIAGNOSTIC_SAMPLE_SEED,
+    per_class: Any = FIT_DIAGNOSTIC_PER_CLASS,
+) -> dict[str, Any]:
+    """Deterministically select a class-balanced training-only diagnostic sample."""
+    if not isinstance(pairs, (list, tuple)) or not pairs:
+        raise ValueError("fit_diagnostic_requires_pairs")
+    if type(seed) is not int or seed < 0:
+        raise ValueError("invalid_fit_diagnostic_seed:" + repr(seed))
+    if type(per_class) is not int or per_class < 1:
+        raise ValueError("invalid_fit_diagnostic_per_class:" + repr(per_class))
+    inactive = [pair for pair in pairs if pair.get("label") == 0]
+    active = [pair for pair in pairs if pair.get("label") == 1]
+    if not inactive or not active:
+        raise ValueError("fit_diagnostic_requires_both_classes")
+    generator = np.random.default_rng(seed)
+
+    def _pick(records: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        order = generator.permutation(len(records)).tolist()
+        return [records[index] for index in order[: min(per_class, len(records))]]
+
+    selected = _pick(inactive) + _pick(active)
+    selected.sort(key=lambda pair: pair["row_index"])
+    return {
+        "plan_version": 1,
+        "seed": seed,
+        "per_class": per_class,
+        "sample_rows": [int(pair["row_index"]) for pair in selected],
+        "pair_keys": [pair["pair_key"] for pair in selected],
+        "labels": [int(pair["label"]) for pair in selected],
+        "class_counts": {
+            "inactive": sum(1 for pair in selected if pair["label"] == 0),
+            "active": sum(1 for pair in selected if pair["label"] == 1),
+        },
+        "criterion": {
+            "version": gpu_model.FIT_DIAGNOSTIC_CRITERION_VERSION,
+            "max_steps": gpu_model.MAX_STEPS,
+            "min_relative_bce_drop": gpu_model.FIT_DIAGNOSTIC_MIN_RELATIVE_LOSS_DROP,
+            "min_correct_per_class": gpu_model.FIT_DIAGNOSTIC_MIN_CORRECT_PER_CLASS,
+        },
+    }
+
+
+def prepare_development_pair_arrays(
+    *,
+    development_manifest_path: os.PathLike[str] | str,
+    out_dir: os.PathLike[str] | str,
+) -> dict[str, Any]:
+    """Materialise only the manifest's declared included rows with re-verified sources."""
+    dev = development_manifest.load_development_manifest(development_manifest_path)
+    if dev["status"] != "ready":
+        raise ValueError(
+            "development_manifest_training_blocked:"
+            + ",".join(dev["blocking_reasons"])
+        )
+    declared = dev["source"]
+    sources = development_manifest.load_verified_sources(
+        declared["frozen_manifest_path"],
+        declared["entities_path"],
+        declared["feature_manifest_path"],
+        expected_feature_manifest_sha256=declared["feature_manifest_sha256"],
+        expected_feature_manifest_path=declared["feature_manifest_path"],
+    )
+    for field, actual in (
+        ("frozen_manifest_sha256", sources["manifest_sha256"]),
+        ("entities_sha256", sources["entities_sha256"]),
+        ("entity_bundle_hash", sources["content_sha256"]),
+        ("entity_version", sources["entity_version"]),
+        ("feature_manifest_sha256", sources["feature_manifest"]["sha256"]),
+    ):
+        if declared.get(field) != actual:
+            raise ValueError("development_manifest_source_binding_mismatch:" + field)
+
+    declared_pairs = dev["pairs"]
+    row_order = list(dev["row_order"])
+    assignments_by_key: dict[str, Mapping[str, Any]] = {}
+    for assignment in sources["assignments"]:
+        if not isinstance(assignment, Mapping):
+            continue
+        pair_key = assignment.get("pair_key")
+        if isinstance(pair_key, str) and pair_key not in assignments_by_key:
+            assignments_by_key[pair_key] = assignment
+    selected_assignments: list[Mapping[str, Any]] = []
+    for pair_key in row_order:
+        assignment = assignments_by_key.get(pair_key)
+        if assignment is None:
+            raise ValueError("development_manifest_pair_missing_from_source:" + pair_key)
+        selected_assignments.append(assignment)
+
+    out_root = resolve_new_output_dir(out_dir)
+    preprocess_dir = out_root / "preprocess"
+    preprocess_dir.mkdir()
+
+    from ligand_features import LigandFeatureExtractor  # noqa: PLC0415 - CPU-only dependency
+
+    extractor = LigandFeatureExtractor(output_dir=str(preprocess_dir))
+    filtered_sources = dict(sources)
+    filtered_sources["assignments"] = selected_assignments
+    result = build_pair_rows(filtered_sources, sources["feature_manifest"], extractor)
+    if result["exclusions"]:
+        raise ValueError(
+            "development_manifest_included_pair_became_ineligible:"
+            + result["exclusions"][0]["pair_key"]
+        )
+    rows = result["rows"]
+    if len(rows) != len(declared_pairs):
+        raise ValueError("development_manifest_row_count_mismatch")
+    if [row["pair_key"] for row in rows] != row_order:
+        raise ValueError("development_manifest_row_order_mismatch")
+    for row, declared_pair in zip(rows, declared_pairs):
+        checks = (
+            ("label", row["label"], declared_pair["label"]),
+            ("label_name", row["label_name"], declared_pair["label_name"]),
+            ("molecule_chembl_id", row["molecule_chembl_id"], declared_pair["molecule_chembl_id"]),
+            ("taxonomy_id", row["taxonomy_id"], declared_pair["taxonomy_id"]),
+            ("accession", row["accession"], declared_pair["accession"]),
+            ("sequence_sha256", row["sequence_sha256"], declared_pair["feature_sequence_sha256"]),
+            ("cache_key", row["cache_key"], declared_pair["feature_cache_key"]),
+            ("cache_file_sha256", row["cache_file_sha256"], declared_pair["feature_cache_file_sha256"]),
+        )
+        for field, actual, expected in checks:
+            if actual != expected:
+                raise ValueError(
+                    "development_manifest_pair_binding_mismatch:"
+                    + row["pair_key"] + ":" + field
+                )
+
+    matrix = np.stack([
+        np.concatenate([row["morgan"], row["esm_embedding"]])
+        for row in rows
+    ]).astype(np.float32)
+    labels = np.asarray([row["label"] for row in rows], dtype=np.int64)
+    if matrix.shape != (len(rows), INPUT_DIM):
+        raise RuntimeError("combined_feature_shape_mismatch:" + str(matrix.shape))
+    if not bool(np.isfinite(matrix).all()):
+        raise RuntimeError("combined_feature_non_finite")
+
+    arrays_path = out_root / "training_arrays.npz"
+    np.savez_compressed(arrays_path, features=matrix, labels=labels)
+    reloaded_features, reloaded_labels = load_training_arrays(arrays_path)
+    if not np.array_equal(reloaded_features, matrix) or not np.array_equal(reloaded_labels, labels):
+        raise RuntimeError("training_arrays_roundtrip_mismatch")
+    arrays_sha256 = sha256_file(arrays_path)
+
+    pair_records = []
+    for row_index, row in enumerate(rows):
+        pair_records.append({
+            "row_index": row_index,
+            "pair_key": row["pair_key"],
+            "molecule_chembl_id": row["molecule_chembl_id"],
+            "taxonomy_id": row["taxonomy_id"],
+            "accession": row["accession"],
+            "label": row["label"],
+            "label_name": row["label_name"],
+            "evidence_ids": row["evidence_ids"],
+            "sequence_sha256": row["sequence_sha256"],
+            "cache_key": row["cache_key"],
+            "cache_file_sha256": row["cache_file_sha256"],
+        })
+    fit_diagnostic = select_fit_diagnostic_sample(pair_records)
+
+    source = {
+        "frozen_manifest_path": str(sources["manifest_path"]),
+        "frozen_manifest_sha256": sources["manifest_sha256"],
+        "entities_path": str(sources["entities_path"]),
+        "entities_sha256": sources["entities_sha256"],
+        "entity_bundle_hash": sources["content_sha256"],
+        "entity_version": sources["entity_version"],
+        "feature_manifest_path": str(sources["feature_manifest"]["path"]),
+        "feature_manifest_sha256": sources["feature_manifest"]["sha256"],
+        "feature_status_counts": dict(sources["feature_manifest"]["status_counts"]),
+        "esm_model_id": sources["feature_manifest"]["model"].get("model_id"),
+        "esm_model_revision": sources["feature_manifest"]["revision"],
+        "external_revision_verified": sources["feature_manifest"]["model"].get(
+            "external_revision_verified",
+        ),
+        "embedding_dim": sources["feature_manifest"]["embedding_dim"],
+        "label_policy_sha256": sources["split"].get("label_policy_sha256"),
+        "split_policy_sha256": sources["split"].get("split_policy_sha256"),
+        "split_sha256": sources["split"].get("split_sha256"),
+        "frozen_split_training_ready": sources["split"].get("training_ready"),
+        "frozen_pair_assignments": len(sources["assignments"]),
+        "candidate_rule": dev["manifest"].get("candidate_rule"),
+        "eligibility_rules_version": dev["manifest"].get(
+            "eligibility_rules_version",
+        ),
+        "row_order": list(row_order),
+        "morgan": {
+            "radius": MORGAN_RADIUS,
+            "num_bits": MORGAN_NUM_BITS,
+            "dtype": "float32",
+            "source": "LigandFeatureExtractor.compute_fingerprints()['morgan']",
+        },
+        "input_dim": INPUT_DIM,
+        "fingerprint_dim": MORGAN_NUM_BITS,
+        "protein_embedding_dim": ESM_EMBEDDING_DIM,
+    }
+    input_manifest = {
+        "schema_version": 1,
+        "mode": "development-manifest-fit-diagnostic",
+        "purpose": PURPOSE_DEVELOPMENT,
+        "purpose_statement": PURPOSE_DEVELOPMENT_STATEMENT,
+        "created_at": _utc_now(),
+        "development_manifest": {
+            "path": str(dev["path"]),
+            "sha256": dev["sha256"],
+            "status": dev["status"],
+            "counts": dict(dev["counts"]),
+            "purpose": dev["manifest"].get("purpose"),
+        },
+        "source": source,
+        "row_order": list(row_order),
+        "arrays": {
+            "file": "training_arrays.npz",
+            "sha256": arrays_sha256,
+            "bytes": arrays_path.stat().st_size,
+            "dtype": "float32",
+            "shape": [int(matrix.shape[0]), int(matrix.shape[1])],
+            "allow_pickle": False,
+        },
+        "label_mapping": dict(LABEL_MAPPING),
+        "class_counts": dict(result["class_counts"]),
+        "pair_count": result["pair_count"],
+        "pairs": pair_records,
+        "exclusions": [],
+        "exclusion_count": 0,
+        "exclusion_rules_version": EXCLUSION_RULES_VERSION,
+        "skipped_non_train_assignments": 0,
+        "sampling": gpu_model.SAMPLING_CLASS_BALANCED,
+        "fit_diagnostic": fit_diagnostic,
+    }
+    input_manifest_path = out_root / "input_manifest.json"
+    input_manifest_sha256 = _write_json_new(input_manifest_path, input_manifest)
+    return {
+        "out_dir": out_root,
+        "arrays_path": arrays_path,
+        "input_manifest_path": input_manifest_path,
+        "arrays_sha256": arrays_sha256,
+        "input_manifest_sha256": input_manifest_sha256,
+        "pair_count": result["pair_count"],
+        "class_counts": dict(result["class_counts"]),
+        "pairs": pair_records,
+        "exclusions": [],
+        "exclusion_count": 0,
+        "source": source,
+        "feature_status_counts": dict(sources["feature_manifest"]["status_counts"]),
+        "row_order": list(row_order),
+        "fit_diagnostic": fit_diagnostic,
+        "development_manifest_path": dev["path"],
+        "development_manifest_sha256": dev["sha256"],
+        "development_manifest_status": dev["status"],
+        "development_manifest_counts": dict(dev["counts"]),
+    }
+
+
+def _validate_gpu_fit_diagnostic(
+    fit_record: Any, plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(fit_record, Mapping):
+        raise RuntimeError("gpu_fit_diagnostic_missing")
+    status = fit_record.get("status")
+    if status not in ("passed", "failed"):
+        raise RuntimeError("gpu_fit_diagnostic_status_invalid:" + repr(status))
+    reasons = fit_record.get("reasons")
+    if not isinstance(reasons, list) or any(not isinstance(item, str) for item in reasons):
+        raise RuntimeError("gpu_fit_diagnostic_reasons_invalid")
+    if status == "failed" and not reasons:
+        raise RuntimeError("gpu_fit_diagnostic_failure_without_reason")
+    if fit_record.get("criterion_version") != gpu_model.FIT_DIAGNOSTIC_CRITERION_VERSION:
+        raise RuntimeError("gpu_fit_diagnostic_criterion_mismatch")
+    small = fit_record.get("small_sample")
+    if not isinstance(small, Mapping):
+        raise RuntimeError("gpu_fit_diagnostic_small_sample_missing")
+    if (
+        small.get("sample_rows") != list(plan["sample_rows"])
+        or small.get("sample_pair_keys") != list(plan["pair_keys"])
+        or small.get("sample_labels") != list(plan["labels"])
+    ):
+        raise RuntimeError("gpu_fit_diagnostic_sample_binding_mismatch")
+    if small.get("device") != "cuda":
+        raise RuntimeError("gpu_fit_diagnostic_device_not_cuda")
+    if small.get("sampling") != gpu_model.SAMPLING_CLASS_BALANCED:
+        raise RuntimeError("gpu_fit_diagnostic_sampling_mismatch")
+    criterion = small.get("criterion")
+    if not isinstance(criterion, Mapping):
+        raise RuntimeError("gpu_fit_diagnostic_criterion_missing")
+    if criterion.get("criterion_version") != gpu_model.FIT_DIAGNOSTIC_CRITERION_VERSION:
+        raise RuntimeError("gpu_fit_diagnostic_criterion_mismatch")
+    if criterion.get("status") != small.get("status"):
+        raise RuntimeError("gpu_fit_diagnostic_criterion_status_mismatch")
+    if criterion.get("min_relative_bce_drop") != (
+        gpu_model.FIT_DIAGNOSTIC_MIN_RELATIVE_LOSS_DROP
+    ):
+        raise RuntimeError("gpu_fit_diagnostic_criterion_mismatch")
+    if criterion.get("min_correct_per_class") != (
+        gpu_model.FIT_DIAGNOSTIC_MIN_CORRECT_PER_CLASS
+    ):
+        raise RuntimeError("gpu_fit_diagnostic_criterion_mismatch")
+    full = fit_record.get("full_manifest")
+    if not isinstance(full, Mapping):
+        raise RuntimeError("gpu_fit_diagnostic_full_manifest_missing")
+    for field in ("majority_collapse", "class_counts", "prediction_metrics"):
+        if field not in full:
+            raise RuntimeError("gpu_fit_diagnostic_full_manifest_missing:" + field)
+    if not isinstance(full.get("majority_collapse"), bool):
+        raise RuntimeError("gpu_fit_diagnostic_full_manifest_invalid")
+    return dict(fit_record)
+
+
+def train_development_pairs(
+    *,
+    development_manifest_path: os.PathLike[str] | str,
+    out_dir: os.PathLike[str] | str,
+    gpu_python: os.PathLike[str] | str = GPU_PYTHON_DEFAULT,
+    seed: Any = 42,
+    steps: Any = 1000,
+    batch_size: Any = gpu_model.DEFAULT_BATCH_SIZE,
+    learning_rate: Any = gpu_model.DEFAULT_LR,
+    hidden_dim: Any = gpu_model.DEFAULT_HIDDEN_DIM,
+) -> dict[str, Any]:
+    """CPU manifest prep -> bounded CUDA diagnostic -> run record (no CPU fallback)."""
+    params = gpu_model.validate_training_params(
+        seed=seed, steps=steps, batch_size=batch_size,
+        learning_rate=learning_rate, hidden_dim=hidden_dim,
+    )
+    gpu_interpreter = validate_gpu_python(gpu_python)
+    prepared = prepare_development_pair_arrays(
+        development_manifest_path=development_manifest_path,
+        out_dir=out_dir,
+    )
+    run_root = prepared["out_dir"]
+
+    gpu_command = _gpu_command(gpu_interpreter, prepared, params)
+    process_log = _run_gpu_process(gpu_command, run_root)
+    process_log_sha256 = process_log["process_log_sha256"]
+    gpu_result_path = run_root / "gpu_result.json"
+    gpu_result = _load_json_object(gpu_result_path, "gpu_result")
+    validated = _validate_gpu_result(
+        gpu_result=gpu_result, prepared=prepared, params=params, run_root=run_root,
+    )
+    runtime = validated["runtime"]
+    tf32 = validated["tf32"]
+    checkpoint_path = validated["checkpoint_path"]
+    actual_checkpoint_sha256 = validated["checkpoint_sha256"]
+    loss_records = validated["loss_records"]
+    total_delta = validated["total_delta"]
+    fit_record = _validate_gpu_fit_diagnostic(
+        gpu_result.get("fit_diagnostic"), prepared["fit_diagnostic"],
+    )
+    portability = _cpu_portable_reload(
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=actual_checkpoint_sha256,
+        prepared=prepared,
+        gpu_result=gpu_result,
+        params=params,
+    )
+    payload = portability["payload"]
+    cpu_tf32 = portability["cpu_tf32"]
+    cpu_runtime = portability["cpu_runtime"]
+    cpu_logits = portability["cpu_logits"]
+    max_abs_diff = portability["max_abs_diff"]
+    agreement = portability["agreement"]
+
+    prediction_rows = []
+    for row_index, pair in enumerate(prepared["pairs"]):
+        prediction_rows.append({
+            "pair_key": pair["pair_key"],
+            "row_index": row_index,
+            "label": int(pair["label"]),
+            "label_name": pair["label_name"],
+            "logit": float(cpu_logits[row_index]),
+            "device": "cpu",
+            "checkpoint_sha256": actual_checkpoint_sha256,
+            "atol": ALLCLOSE_ATOL,
+            "rtol": ALLCLOSE_RTOL,
+            "purpose": PURPOSE_DEVELOPMENT,
+            "development_manifest_sha256": prepared["development_manifest_sha256"],
+        })
+    predictions_path = run_root / "predictions.jsonl"
+    predictions_sha256 = _write_jsonl_new(predictions_path, prediction_rows)
+    loss_sha256 = sha256_file(run_root / "loss.jsonl")
+    fit_diagnostic_sha256 = sha256_file(run_root / "fit_diagnostic.json")
+
+    run_record = {
+        "schema_version": 1,
+        "status": "trained",
+        "device": "cuda",
+        "device_name": runtime.get("device_name"),
+        "run_id": run_root.name,
+        "created_at": _utc_now(),
+        "purpose": PURPOSE_DEVELOPMENT,
+        "purpose_statement": PURPOSE_DEVELOPMENT_STATEMENT,
+        "inputs": {
+            "mode": "development-manifest-fit-diagnostic",
+            "development_manifest_path": str(prepared["development_manifest_path"]),
+            "development_manifest_sha256": prepared["development_manifest_sha256"],
+            "development_manifest_status": prepared["development_manifest_status"],
+            "development_manifest_counts": dict(prepared["development_manifest_counts"]),
+            "row_order": list(prepared["row_order"]),
+            "source": dict(prepared["source"]),
+            "arrays_path": str(prepared["arrays_path"]),
+            "arrays_sha256": prepared["arrays_sha256"],
+            "input_manifest_path": str(prepared["input_manifest_path"]),
+            "input_manifest_sha256": prepared["input_manifest_sha256"],
+            "pair_count": prepared["pair_count"],
+            "class_counts": dict(prepared["class_counts"]),
+            "exclusion_count": prepared["exclusion_count"],
+            "exclusions": [],
+        },
+        "command": {
+            "train_cli": [sys.executable, "-m", "training.pair_pipeline", "train"]
+            + sys.argv[1:],
+            "gpu_command": gpu_command,
+            "gpu_python": str(gpu_interpreter),
+        },
+        "environment": {
+            "preprocess_python": {
+                "python": platform.python_version(),
+                "executable": sys.executable,
+                "torch": cpu_runtime.get("torch"),
+                "cuda_available": cpu_runtime.get("cuda_available"),
+            },
+            "gpu_runtime": dict(runtime),
+        },
+        "diagnostics": {
+            "gpu_tf32": dict(tf32),
+            "cpu_tf32": dict(cpu_tf32),
+            "float32_dtype": "torch.float32",
+            "cpu_cuda_available": cpu_runtime.get("cuda_available"),
+        },
+        "training": {
+            **dict(gpu_result.get("training") or {}),
+            "loss_records": loss_records,
+            "initial_loss": gpu_result.get("initial_loss"),
+            "final_loss": gpu_result.get("final_loss"),
+            "total_parameter_delta": total_delta,
+            "evaluation": gpu_result.get("evaluation"),
+        },
+        "fit_diagnostic": fit_record,
+        "fit_diagnostic_sha256": fit_diagnostic_sha256,
+        "fit_diagnostic_plan": dict(prepared["fit_diagnostic"]),
+        "portability": {
+            "gpu_load_map_location": "cuda",
+            "cpu_load_map_location": "cpu",
+            "gpu_reload_max_abs_diff": gpu_result.get("gpu_reload", {}).get("max_abs_diff"),
+            "cpu_reload_max_abs_diff": max_abs_diff,
+            "atol": ALLCLOSE_ATOL,
+            "rtol": ALLCLOSE_RTOL,
+            "passed": agreement,
+        },
+        "outputs": {
+            "training_arrays.npz": prepared["arrays_sha256"],
+            "input_manifest.json": prepared["input_manifest_sha256"],
+            "checkpoint.pt": actual_checkpoint_sha256,
+            "loss.jsonl": loss_sha256,
+            "gpu_result.json": sha256_file(gpu_result_path),
+            "predictions.jsonl": predictions_sha256,
+            "gpu_process.log": process_log_sha256,
+            "fit_diagnostic.json": fit_diagnostic_sha256,
+        },
+        "data_use": {
+            "evaluation": "none (no independent holdout)",
+            "generalization_claims": "none",
+            "fit_scope": "engineering development in-sample fit diagnostics only",
+            "checkpoint_resume": "not part of this plan",
+        },
+        "code_version": _git_code_version(),
+    }
+    run_record_path = run_root / "run.json"
+    _write_json_new(run_record_path, run_record)
+    return {
+        "status": "trained",
+        "run_id": run_root.name,
+        "out": str(run_root),
+        "device": "cuda",
+        "device_name": runtime.get("device_name"),
+        "pair_count": prepared["pair_count"],
+        "class_counts": dict(prepared["class_counts"]),
+        "steps": params["steps"],
+        "fit_diagnostic_status": fit_record["status"],
+        "final_loss": gpu_result.get("final_loss"),
+        "total_parameter_delta": total_delta,
+        "cpu_reload_max_abs_diff": max_abs_diff,
+        "checkpoint_sha256": actual_checkpoint_sha256,
+        "predictions_path": str(predictions_path),
+        "run_record_path": str(run_record_path),
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -954,7 +1632,7 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument("--manifest", help="frozen corpus manifest.json (read-only)")
     source.add_argument(
         "--development-manifest",
-        help="engineering-development manifest (plan 03-02; not implemented here)",
+        help="train-only development_manifest.json from training.development_manifest",
     )
     train.add_argument("--features", help="selected feature_manifest.json (read-only)")
     train.add_argument("--out", required=True, help="new P1_03_Artifacts_<32 hex> directory")
@@ -969,22 +1647,30 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "train":
             if args.development_manifest is not None:
-                raise ValueError(
-                    "development_manifest_mode_deferred_to_plan_03_02"
+                summary = train_development_pairs(
+                    development_manifest_path=args.development_manifest,
+                    out_dir=args.out,
+                    gpu_python=args.gpu_python,
+                    seed=args.seed,
+                    steps=args.steps,
+                    batch_size=args.batch_size,
+                    learning_rate=args.learning_rate,
+                    hidden_dim=args.hidden_dim,
                 )
-            if not args.features:
-                raise ValueError("features_argument_required_with_manifest")
-            summary = train_real_pairs(
-                manifest_path=args.manifest,
-                feature_manifest_path=args.features,
-                out_dir=args.out,
-                gpu_python=args.gpu_python,
-                seed=args.seed,
-                steps=args.steps,
-                batch_size=args.batch_size,
-                learning_rate=args.learning_rate,
-                hidden_dim=args.hidden_dim,
-            )
+            else:
+                if not args.features:
+                    raise ValueError("features_argument_required_with_manifest")
+                summary = train_real_pairs(
+                    manifest_path=args.manifest,
+                    feature_manifest_path=args.features,
+                    out_dir=args.out,
+                    gpu_python=args.gpu_python,
+                    seed=args.seed,
+                    steps=args.steps,
+                    batch_size=args.batch_size,
+                    learning_rate=args.learning_rate,
+                    hidden_dim=args.hidden_dim,
+                )
         else:  # pragma: no cover - argparse restricts the command set
             raise ValueError("unsupported_command:" + str(args.command))
     except Exception as exc:  # noqa: BLE001 - structured blocked report, no CPU fallback

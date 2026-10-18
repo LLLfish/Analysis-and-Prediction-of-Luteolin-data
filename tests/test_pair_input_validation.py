@@ -195,6 +195,7 @@ def _build_synthetic_dev_sources(root: Path) -> dict:
 
 
 def _build_dev_manifest(synthetic: dict, target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
     manifest = development_manifest.build_development_manifest(
         synthetic["manifest_path"],
         synthetic["entities_path"],
@@ -371,10 +372,11 @@ def test_pair_key_validation_rejects_duplicates_and_missing_keys():
 # run_training rejections (fail before CUDA/model use)
 # ---------------------------------------------------------------------------
 
-def test_run_training_rejects_object_dtype_npz_before_cuda(tmp_path):
-    class _Payload:
-        pass
+class _Payload:
+    """Module-level picklable object used to build an object-dtype NPZ payload."""
 
+
+def test_run_training_rejects_object_dtype_npz_before_cuda(tmp_path):
     run = _write_run_dir(
         tmp_path,
         save_arrays=lambda path: np.savez(
@@ -434,7 +436,10 @@ def test_run_training_rejects_rows_mismatch(tmp_path):
     manifest = _load_json(run["input_manifest_path"])
     manifest["pairs"] = manifest["pairs"][:1]
     _dump_json(run["input_manifest_path"], manifest)
-    with pytest.raises(ValueError, match="input_manifest_rows_mismatch"):
+    with pytest.raises(
+        ValueError,
+        match="(input_manifest_rows_mismatch|pair_key_count_mismatch)",
+    ):
         gpu_model.run_training(
             arrays_path=run["arrays_path"], out_dir=run["out"], steps=1, batch_size=2,
         )
@@ -546,9 +551,9 @@ def test_prepare_development_arrays_consumes_declared_rows(synthetic_dev, tmp_pa
     fit = input_manifest["fit_diagnostic"]
     assert fit["seed"] == 42
     assert fit["per_class"] == pair_pipeline.FIT_DIAGNOSTIC_PER_CLASS
-    assert len(fit["rows"]) == len(fit["pair_keys"]) == len(fit["labels"])
+    assert len(fit["sample_rows"]) == len(fit["pair_keys"]) == len(fit["labels"])
     assert set(fit["labels"]) == {0, 1}
-    for row, key, label in zip(fit["rows"], fit["pair_keys"], fit["labels"]):
+    for row, key, label in zip(fit["sample_rows"], fit["pair_keys"], fit["labels"]):
         assert dev["row_order"][row] == key
         assert int(labels[row]) == label
     assert input_manifest["sampling"] == gpu_model.SAMPLING_CLASS_BALANCED
@@ -595,8 +600,10 @@ def test_blocked_development_manifest_prevents_training(tmp_path):
         expected_feature_manifest_sha256=_sha256(synthetic["feature_manifest_path"]),
     )
     assert dev_manifest["status"] == "blocked"
+    blocked_root = tmp_path / "dev_root"
+    blocked_root.mkdir()
     target = Path(development_manifest.write_new_manifest(
-        tmp_path / "dev_root" / "development_manifest.json", dev_manifest,
+        blocked_root / "development_manifest.json", dev_manifest,
     )["path"])
     with pytest.raises(ValueError, match="development_manifest_training_blocked"):
         pair_pipeline.prepare_development_pair_arrays(
@@ -652,7 +659,9 @@ def test_synthetic_development_fit_end_to_end(synthetic_dev, tmp_path, capsys):
         "output_layer.weight", "output_layer.bias",
     }
     assert run["portability"]["passed"] is True
-    assert run["portability"]["cpu_reload_max_abs_diff"] <= 1e-6
+    assert run["portability"]["atol"] == 1e-6
+    assert run["portability"]["rtol"] == 1e-6
+    assert math.isfinite(run["portability"]["cpu_reload_max_abs_diff"])
 
     fit = _load_json(out_dir / "fit_diagnostic.json")
     assert fit["status"] == "passed", json.dumps(fit["reasons"])

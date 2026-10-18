@@ -699,19 +699,19 @@ def load_development_manifest(
         raise ValueError("development_manifest_source_missing")
     for field in (
         "frozen_manifest_path",
-        "frozen_manifest_sha256",
         "entities_path",
-        "entities_sha256",
         "feature_manifest_path",
-        "feature_manifest_sha256",
-        "entity_bundle_hash",
         "entity_version",
     ):
-        if field.endswith("_path"):
-            if not _is_text(source_record.get(field)):
-                raise ValueError("development_manifest_source_invalid:" + field)
-        else:
-            _require_sha256(source_record.get(field), "development_manifest_source:" + field)
+        if not _is_text(source_record.get(field)):
+            raise ValueError("development_manifest_source_invalid:" + field)
+    for field in (
+        "frozen_manifest_sha256",
+        "entities_sha256",
+        "feature_manifest_sha256",
+        "entity_bundle_hash",
+    ):
+        _require_sha256(source_record.get(field), "development_manifest_source:" + field)
 
     row_order = manifest.get("row_order")
     pairs = manifest.get("pairs")

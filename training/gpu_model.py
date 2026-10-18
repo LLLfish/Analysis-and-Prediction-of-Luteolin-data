@@ -66,6 +66,8 @@ FIT_DIAGNOSTIC_SCOPE = (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APL_ROOT = PROJECT_ROOT / "APL"
 RUN_ROOT_PATTERN = re.compile(r"P1_03_Artifacts_[0-9a-f]{32}")
+# Official pytest/verify basetemp root; allowed scratch parent inside PROJECT_ROOT.
+PROJECT_SCRATCH_ROOT_NAME = ".task-tmp"
 
 CHECKPOINT_FORMAT_VERSION = 2
 MODEL_ARCHITECTURE = "mlp_relu_logit_v1"
@@ -327,9 +329,9 @@ def _validate_output_location(out_dir: os.PathLike[str] | str) -> Path:
     """Require an existing output directory that is not a frozen/APL location (F3).
 
     Inside PROJECT_ROOT only a P1_03_Artifacts_<32 hex> root (or one of its
-    children) is accepted, so a GPU CLI run can never write checkpoint.pt /
-    loss.jsonl / gpu_result.json into the APL source tree or a frozen P1_02_*
-    artifact root.
+    children) and the project's .task-tmp scratch root are accepted, so a GPU
+    CLI run can never write checkpoint.pt / loss.jsonl / gpu_result.json into
+    the APL source tree or a frozen P1_02_*/P0_* artifact root.
     """
     destination = Path(os.path.expanduser(os.fspath(out_dir)))
     if not destination.is_absolute():
@@ -343,9 +345,13 @@ def _validate_output_location(out_dir: os.PathLike[str] | str) -> Path:
     project_root = PROJECT_ROOT.resolve()
     if resolved == project_root or str(resolved).startswith(str(project_root) + os.sep):
         relative = resolved.relative_to(project_root)
-        if not relative.parts or RUN_ROOT_PATTERN.fullmatch(relative.parts[0]) is None:
+        first_segment = relative.parts[0] if relative.parts else ""
+        if (
+            RUN_ROOT_PATTERN.fullmatch(first_segment) is None
+            and first_segment != PROJECT_SCRATCH_ROOT_NAME
+        ):
             raise ValueError(
-                "out_dir_under_project_root_must_be_P1_03_Artifacts_<32 hex>"
+                "out_dir_under_project_root_must_be_P1_03_Artifacts_<32 hex>_or_.task-tmp"
             )
     return destination
 

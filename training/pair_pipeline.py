@@ -73,6 +73,9 @@ EXPECTED_FEATURE_MANIFEST_SHA256 = (
 )
 GPU_PYTHON_DEFAULT = "E:/paper/DDA-Reproduction/.conda/python.exe"
 RUN_ROOT_PATTERN = re.compile(r"P1_03_Artifacts_[0-9a-f]{32}")
+# The project's official pytest/verify basetemp root lives inside PROJECT_ROOT;
+# it is an allowed scratch parent for output-location guards (F3 re-audit).
+PROJECT_SCRATCH_ROOT_NAME = ".task-tmp"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 # Git object names are 40 hex characters, not SHA-256 digests (CR-01/F1).
 GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -1164,13 +1167,18 @@ def resolve_new_output_dir(out_dir: os.PathLike[str] | str) -> Path:
     if resolved == apl_root or str(resolved).startswith(str(apl_root) + os.sep):
         raise ValueError("output_dir_must_not_be_inside_APL_source")
     # F3/WR-01: inside the project root only a brand-new Phase 03 GUID root (or
-    # a strict child of it) is allowed; frozen P1_02_* roots are rejected.
+    # a strict child of it) and the project's .task-tmp scratch root are allowed;
+    # frozen P1_02_* / P0_* roots are rejected.
     project_root = PROJECT_ROOT.resolve()
     if resolved == project_root or str(resolved).startswith(str(project_root) + os.sep):
         relative = resolved.relative_to(project_root)
-        if not relative.parts or RUN_ROOT_PATTERN.fullmatch(relative.parts[0]) is None:
+        first_segment = relative.parts[0] if relative.parts else ""
+        if (
+            RUN_ROOT_PATTERN.fullmatch(first_segment) is None
+            and first_segment != PROJECT_SCRATCH_ROOT_NAME
+        ):
             raise ValueError(
-                "output_dir_under_project_root_must_be_P1_03_Artifacts_<32 hex>"
+                "output_dir_under_project_root_must_be_P1_03_Artifacts_<32 hex>_or_.task-tmp"
             )
     requested.mkdir()
     return requested

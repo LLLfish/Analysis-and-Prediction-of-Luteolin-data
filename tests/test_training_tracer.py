@@ -20,8 +20,10 @@ import json
 import math
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -567,7 +569,11 @@ def test_environment_record_contains_platform_and_import_versions():
 
 
 def test_output_location_guards_reject_frozen_and_apl_paths(tmp_path, monkeypatch):
-    """F3/WR-01: new output roots are confined to fresh P1_03 GUID roots."""
+    """F3/WR-01: new output roots are confined to fresh P1_03 GUID roots.
+
+    The project's official verify basetemp (PROJECT_ROOT/.task-tmp) must also be
+    accepted as a scratch parent, otherwise the documented pytest command fails.
+    """
     run_name = "P1_03_Artifacts_" + "0123456789abcdef0123456789abcdef"
     accepted_tmp = pair_pipeline.resolve_new_output_dir(tmp_path / "accepted_run")
     assert accepted_tmp.is_dir()
@@ -577,6 +583,27 @@ def test_output_location_guards_reject_frozen_and_apl_paths(tmp_path, monkeypatc
         pair_pipeline.resolve_new_output_dir(
             pair_pipeline.PROJECT_ROOT / "not_a_run_root",
         )
+    with pytest.raises(ValueError, match="output_dir_under_project_root_must_be"):
+        pair_pipeline.resolve_new_output_dir(
+            pair_pipeline.PROJECT_ROOT / ".task-tmp2",
+        )
+
+    # Real PROJECT_ROOT/.task-tmp scratch parent: accepted by both guards, then
+    # cleaned up so the check does not pollute the project scratch root.
+    scratch_root = pair_pipeline.PROJECT_ROOT / ".task-tmp"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    scratch_dir = Path(tempfile.mkdtemp(prefix="phase03-fix-f3-", dir=str(scratch_root)))
+    try:
+        accepted_scratch = pair_pipeline.resolve_new_output_dir(
+            scratch_dir / "accepted_scratch_run",
+        )
+        assert accepted_scratch.is_dir()
+        assert accepted_scratch.parent == scratch_dir
+        assert gpu_model._validate_output_location(scratch_dir) == scratch_dir
+        assert gpu_model._validate_output_location(accepted_scratch) == accepted_scratch
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+    assert not scratch_dir.exists()
 
     # Real GPU CLI entry points must reject the APL source tree before CUDA.
     with pytest.raises(ValueError, match="out_dir_must_not_be_inside_APL_source"):
@@ -604,14 +631,24 @@ def test_output_location_guards_reject_frozen_and_apl_paths(tmp_path, monkeypatc
     p1_03_child.mkdir(parents=True)
     frozen_child = fake_project / "P1_02_03_Artifacts_frozen" / "child"
     frozen_child.mkdir(parents=True)
+    fake_scratch = fake_project / ".task-tmp"
+    fake_scratch.mkdir()
+    fake_scratch_child = fake_scratch / "run"
+    fake_scratch_child.mkdir()
+    not_scratch = fake_project / ".task-tmp2"
+    not_scratch.mkdir()
     assert gpu_model._validate_output_location(p1_03_root) == p1_03_root
     assert gpu_model._validate_output_location(p1_03_child) == p1_03_child
+    assert gpu_model._validate_output_location(fake_scratch) == fake_scratch
+    assert gpu_model._validate_output_location(fake_scratch_child) == fake_scratch_child
     with pytest.raises(ValueError, match="out_dir_must_not_be_inside_APL_source"):
         gpu_model._validate_output_location(fake_apl)
     with pytest.raises(ValueError, match="out_dir_under_project_root_must_be"):
         gpu_model._validate_output_location(fake_project)
     with pytest.raises(ValueError, match="out_dir_under_project_root_must_be"):
         gpu_model._validate_output_location(frozen_child)
+    with pytest.raises(ValueError, match="out_dir_under_project_root_must_be"):
+        gpu_model._validate_output_location(not_scratch)
     with pytest.raises(ValueError, match="out_dir_must_be_absolute"):
         gpu_model._validate_output_location("relative/out")
     with pytest.raises(ValueError, match="out_dir_missing"):
